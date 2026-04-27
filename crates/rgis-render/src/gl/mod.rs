@@ -50,6 +50,10 @@ pub struct GlRenderer {
     /// GL textures keyed by tile coord (z, x, y). Uploaded once, reused every frame.
     /// RefCell allows &self draw_tiles to populate the cache without conflicting with gl borrow.
     tile_textures: std::cell::RefCell<HashMap<(u8, u32, u32), glow::Texture>>,
+    /// Tracks how many consecutive frames each texture has been unused.
+    /// Textures are only deleted once this exceeds EVICT_GRACE_FRAMES, giving
+    /// the fallback-pyramid time to stop referencing a texture before it is freed.
+    tile_age: std::cell::RefCell<HashMap<(u8, u32, u32), u8>>,
 }
 
 impl GlRenderer {
@@ -69,6 +73,7 @@ impl GlRenderer {
             tile_vao,
             tile_vbo,
             tile_textures: std::cell::RefCell::new(HashMap::new()),
+            tile_age: std::cell::RefCell::new(HashMap::new()),
         }
     }
 }
@@ -220,16 +225,36 @@ impl GlRenderer {
             gl.draw_elements(glow::TRIANGLES, 6, glow::UNSIGNED_INT, 0);
         }
 
-        // Evict GPU textures for tiles that are no longer visible.
-        // This is the primary guard against VRAM exhaustion when zooming,
-        // since each zoom level maps to a completely different set of coords.
-        let visible: HashSet<(u8, u32, u32)> = tiles.iter().map(|t| t.coord).collect();
-        tile_textures.retain(|coord, tex| {
-            if visible.contains(coord) {
-                true
+        // Evict GPU textures that have not been referenced for EVICT_GRACE_FRAMES
+        // consecutive frames.  Using a grace window means tiles being used as
+        // fallbacks for their children (or parents) remain alive across the few
+        // frames it takes the correct-zoom tiles to arrive, eliminating flicker.
+        // The grace counter also keeps VRAM bounded: any tile unused for
+        // EVICT_GRACE_FRAMES frames is guaranteed to be deleted.
+        const EVICT_GRACE_FRAMES: u8 = 8;
+        const MAX_GPU_TILES: usize = 512;
+
+        let referenced: HashSet<(u8, u32, u32)> = tiles.iter().map(|t| t.coord).collect();
+
+        let mut ages = self.tile_age.borrow_mut();
+        // Reset age for every referenced coord; increment all others.
+        for coord in tile_textures.keys() {
+            if referenced.contains(coord) {
+                ages.insert(*coord, 0);
             } else {
+                *ages.entry(*coord).or_insert(0) += 1;
+            }
+        }
+        let over_cap = tile_textures.len() > MAX_GPU_TILES;
+        tile_textures.retain(|coord, tex| {
+            let age = ages.get(coord).copied().unwrap_or(0);
+            let evict = age > EVICT_GRACE_FRAMES || over_cap;
+            if evict {
                 gl.delete_texture(*tex);
+                ages.remove(coord);
                 false
+            } else {
+                true
             }
         });
     }

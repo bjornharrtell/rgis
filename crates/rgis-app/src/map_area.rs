@@ -341,13 +341,25 @@ impl MapArea {
     /// subsequent render frames clone the Arc cheaply.
     pub fn on_tile_ready(&self, ready: TileReady) {
         let mut s = self.state.borrow_mut();
-        // Evict tiles from other zoom levels when the cache grows large.
-        // Each zoom level uses a wholly different coord space, so tiles from
-        // previous zoom levels are unlikely to be reused and just waste RAM.
-        const MAX_CPU_TILES: usize = 256;
-        if s.tile_cache.len() >= MAX_CPU_TILES {
+        // Cap the CPU tile cache.  Keep the 2 nearest zoom levels so ancestor
+        // tiles remain available as fallback placeholders.  Only purge when we
+        // significantly exceed the limit so we don't thrash on the boundary.
+        const MAX_CPU_TILES: usize = 512;
+        const PURGE_THRESHOLD: usize = 600;
+        if s.tile_cache.len() >= PURGE_THRESHOLD {
             let z = ready.coord.z;
-            s.tile_cache.retain(|coord, _| coord.z == z);
+            // Retain tiles within 2 zoom levels of the arriving tile.
+            s.tile_cache.retain(|coord, _| coord.z.abs_diff(z) <= 2);
+            // If still too large (very large viewport / many levels), hard-cap by
+            // dropping the farthest zoom level until we are under the limit.
+            while s.tile_cache.len() > MAX_CPU_TILES {
+                // Find the zoom level farthest from z among cached tiles.
+                let worst_z = s.tile_cache.keys()
+                    .map(|c| c.z)
+                    .max_by_key(|&cz| cz.abs_diff(z))
+                    .unwrap();
+                s.tile_cache.retain(|coord, _| coord.z != worst_z);
+            }
         }
         s.tile_cache.entry(ready.coord).or_insert_with(|| {
             let img = ready.image;
