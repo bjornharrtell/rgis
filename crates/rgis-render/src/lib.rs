@@ -13,6 +13,11 @@ pub struct TileImage {
     pub height: u32,
     /// Screen-pixel rectangle [x, y, w, h] where this tile should be drawn.
     pub screen_rect: [f32; 4],
+    /// UV sub-rectangle [u_min, v_min, u_size, v_size] within the texture.
+    /// `[0.0, 0.0, 1.0, 1.0]` for a tile drawn at its own zoom level;
+    /// a sub-rect when this is a parent tile standing in for a not-yet-loaded
+    /// child (the relevant quadrant of the parent image fills the child slot).
+    pub src_rect: [f32; 4],
 }
 
 /// Abstraction over rendering backends.

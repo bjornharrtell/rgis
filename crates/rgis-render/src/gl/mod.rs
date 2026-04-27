@@ -1,6 +1,6 @@
 pub mod tess;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glow::HasContext;
 use rgis_core::{Layer, LayerId, Viewport};
@@ -204,20 +204,34 @@ impl GlRenderer {
 
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
 
-            // Update the quad VBO for this tile's current screen position.
+            // Update the quad VBO for this tile's current screen position and UV sub-rect.
             let [x, y, w, h] = tile.screen_rect;
+            let [u0, v0, du, dv] = tile.src_rect;
             #[rustfmt::skip]
             let quad: [f32; 16] = [
-                x,     y,     0.0, 0.0,
-                x + w, y,     1.0, 0.0,
-                x + w, y + h, 1.0, 1.0,
-                x,     y + h, 0.0, 1.0,
+                x,     y,     u0,      v0,
+                x + w, y,     u0 + du, v0,
+                x + w, y + h, u0 + du, v0 + dv,
+                x,     y + h, u0,      v0 + dv,
             ];
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.tile_vbo));
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytemuck_cast_slice(&quad));
 
             gl.draw_elements(glow::TRIANGLES, 6, glow::UNSIGNED_INT, 0);
         }
+
+        // Evict GPU textures for tiles that are no longer visible.
+        // This is the primary guard against VRAM exhaustion when zooming,
+        // since each zoom level maps to a completely different set of coords.
+        let visible: HashSet<(u8, u32, u32)> = tiles.iter().map(|t| t.coord).collect();
+        tile_textures.retain(|coord, tex| {
+            if visible.contains(coord) {
+                true
+            } else {
+                gl.delete_texture(*tex);
+                false
+            }
+        });
     }
 }
 

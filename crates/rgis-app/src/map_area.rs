@@ -123,17 +123,57 @@ impl MapArea {
             // Build TileImages for visible tiles that are already loaded.
             // Arc::clone is a reference-count bump; no pixel data is copied.
             let visible = visible_tiles(&viewport, &OsmTileSource);
-            let tile_images: Vec<TileImage> = visible.iter()
-                .filter_map(|coord| {
-                    s.tile_cache.get(coord).map(|(rgba, w, h)| TileImage {
+            let mut tile_images: Vec<TileImage> = Vec::with_capacity(visible.len());
+
+            for coord in &visible {
+                if let Some((rgba, w, h)) = s.tile_cache.get(coord) {
+                    // Tile is ready at the correct zoom level.
+                    tile_images.push(TileImage {
                         coord: (coord.z, coord.x, coord.y),
                         rgba: Arc::clone(rgba),
                         width: *w,
                         height: *h,
                         screen_rect: tile_screen_rect(*coord, &viewport),
-                    })
-                })
-                .collect();
+                        src_rect: [0.0, 0.0, 1.0, 1.0],
+                    });
+                } else {
+                    // Walk up the zoom pyramid looking for an ancestor tile.
+                    // Each level up, this tile occupies a 2^k × 2^k sub-grid
+                    // of the ancestor, so the UV sub-rect shrinks by 1/2 per level.
+                    let mut ax = coord.x;
+                    let mut ay = coord.y;
+                    let mut found = false;
+                    for k in 1u8..=4 {
+                        if coord.z < k { break; }
+                        ax >>= 1;
+                        ay >>= 1;
+                        let az = coord.z - k;
+                        let ancestor = rgis_tiles::TileCoord { z: az, x: ax, y: ay };
+                        if let Some((rgba, w, h)) = s.tile_cache.get(&ancestor) {
+                            // Compute the UV sub-rect of the ancestor that
+                            // corresponds to `coord`.
+                            let scale = 1.0_f32 / (1u32 << k) as f32;
+                            let sub_x = coord.x & ((1 << k) - 1);
+                            let sub_y = coord.y & ((1 << k) - 1);
+                            let u0 = sub_x as f32 * scale;
+                            let v0 = sub_y as f32 * scale;
+                            tile_images.push(TileImage {
+                                coord: (ancestor.z, ancestor.x, ancestor.y),
+                                rgba: Arc::clone(rgba),
+                                width: *w,
+                                height: *h,
+                                screen_rect: tile_screen_rect(*coord, &viewport),
+                                src_rect: [u0, v0, scale, scale],
+                            });
+                            found = true;
+                            break;
+                        }
+                    }
+                    // If no ancestor was found just leave a gap; the background
+                    // colour will show until the tile arrives.
+                    let _ = found;
+                }
+            }
 
             // Request any visible tiles not yet in the cache.
             for &coord in &visible {
@@ -301,6 +341,14 @@ impl MapArea {
     /// subsequent render frames clone the Arc cheaply.
     pub fn on_tile_ready(&self, ready: TileReady) {
         let mut s = self.state.borrow_mut();
+        // Evict tiles from other zoom levels when the cache grows large.
+        // Each zoom level uses a wholly different coord space, so tiles from
+        // previous zoom levels are unlikely to be reused and just waste RAM.
+        const MAX_CPU_TILES: usize = 256;
+        if s.tile_cache.len() >= MAX_CPU_TILES {
+            let z = ready.coord.z;
+            s.tile_cache.retain(|coord, _| coord.z == z);
+        }
         s.tile_cache.entry(ready.coord).or_insert_with(|| {
             let img = ready.image;
             let w = img.width();
