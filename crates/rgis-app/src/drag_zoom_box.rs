@@ -54,6 +54,7 @@ impl DragZoomBox {
         gl_area: &gtk4::GLArea,
         drawing_area: &gtk4::DrawingArea,
         project: Rc<RefCell<Project>>,
+        animate_to: Rc<dyn Fn(f64, [f64; 2])>,
     ) {
         if !self.enabled {
             return;
@@ -146,6 +147,8 @@ impl DragZoomBox {
         drag.connect_drag_end(clone!(
             #[strong]
             state,
+            #[strong]
+            animate_to,
             #[weak]
             gl_area,
             #[weak]
@@ -176,17 +179,25 @@ impl DragZoomBox {
                     return;
                 }
 
-                let mut proj = project.borrow_mut();
-                let w0 = proj.viewport.screen_to_world(px0);
-                let w1 = proj.viewport.screen_to_world(px1);
-                proj.viewport.fit_bounds(&rgis_core::Bounds {
-                    min_x: w0.x.min(w1.x),
-                    min_y: w0.y.min(w1.y),
-                    max_x: w0.x.max(w1.x),
-                    max_y: w0.y.max(w1.y),
-                });
-                drop(proj);
-                gl_area.queue_render();
+                // Compute target viewport via fit_bounds on a temporary clone,
+                // then animate toward it with the same easing as scroll-zoom.
+                let (target_zoom, target_cx, target_cy) = {
+                    let proj = project.borrow();
+                    let w0 = proj.viewport.screen_to_world(px0);
+                    let w1 = proj.viewport.screen_to_world(px1);
+                    let mut vp = proj.viewport.clone();
+                    vp.fit_bounds(&rgis_core::Bounds {
+                        min_x: w0.x.min(w1.x),
+                        min_y: w0.y.min(w1.y),
+                        max_x: w0.x.max(w1.x),
+                        max_y: w0.y.max(w1.y),
+                    });
+                    (vp.zoom, vp.center.x, vp.center.y)
+                };
+                animate_to(target_zoom, [target_cx, target_cy]);
+                // The animate_to closure queues renders via its tick-callback;
+                // no direct gl_area.queue_render() needed here.
+                let _ = gl_area;
             }
         ));
 

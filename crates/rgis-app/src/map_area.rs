@@ -52,6 +52,10 @@ struct MapState {
     zoom_anchor: [f64; 2],
     /// The screen-pixel position of the zoom anchor.
     zoom_anchor_screen: [f32; 2],
+    /// When `Some`, the tick-callback eases both zoom and center toward the
+    /// target values (used by the drag-zoom-box interaction).
+    /// When `None`, anchor-based zoom is used (scroll wheel).
+    zoom_center_target: Option<[f64; 2]>,
     /// Whether a zoom tick-callback is currently registered and running.
     zoom_animating: bool,
 }
@@ -99,6 +103,7 @@ impl MapArea {
             zoom_target: initial_zoom,
             zoom_anchor: [0.0, 0.0],
             zoom_anchor_screen: [0.0, 0.0],
+            zoom_center_target: None,
             zoom_animating: false,
         }));
 
@@ -234,18 +239,25 @@ impl MapArea {
             // gesture has full control from the very first drag event.
             if s.zoom_animating {
                 let target = s.zoom_target;
-                let anchor = s.zoom_anchor;
-                let anchor_screen = s.zoom_anchor_screen;
                 let mut proj = s.project.borrow_mut();
                 proj.viewport.zoom = target;
-                // Recompute center for the settled zoom so the anchor stays put.
-                let res = (2.0 * rgis_core::EARTH_HALF_CIRC) / (256.0 * 2_f64.powf(target));
-                proj.viewport.center.x =
-                    anchor[0] - (anchor_screen[0] as f64 - proj.viewport.width_px as f64 * 0.5) * res;
-                proj.viewport.center.y =
-                    anchor[1] + (anchor_screen[1] as f64 - proj.viewport.height_px as f64 * 0.5) * res;
+                if let Some([tcx, tcy]) = s.zoom_center_target {
+                    // Fit-zoom animation: settle at target center.
+                    proj.viewport.center.x = tcx;
+                    proj.viewport.center.y = tcy;
+                } else {
+                    // Anchor-based zoom: recompute center so anchor stays put.
+                    let anchor = s.zoom_anchor;
+                    let anchor_screen = s.zoom_anchor_screen;
+                    let res = (2.0 * rgis_core::EARTH_HALF_CIRC) / (256.0 * 2_f64.powf(target));
+                    proj.viewport.center.x =
+                        anchor[0] - (anchor_screen[0] as f64 - proj.viewport.width_px as f64 * 0.5) * res;
+                    proj.viewport.center.y =
+                        anchor[1] + (anchor_screen[1] as f64 - proj.viewport.height_px as f64 * 0.5) * res;
+                }
                 drop(proj);
                 s.zoom_animating = false;
+                s.zoom_center_target = None;
             }
             s.drag_start = Some((x, y));
             s.drag_last = Some((x, y));
@@ -302,6 +314,8 @@ impl MapArea {
             };
             s.zoom_anchor = anchor_world;
             s.zoom_anchor_screen = cursor;
+            // Switching back to anchor-based mode; cancel any fit-zoom animation.
+            s.zoom_center_target = None;
 
             // If no animation is running, sync zoom_target with the actual
             // viewport zoom first (handles external zoom changes like fit_bounds).
@@ -318,38 +332,44 @@ impl MapArea {
                 // zoom toward zoom_target with exponential decay (~20 % per
                 // frame at 60 fps, giving a snappy ~150 ms feel).
                 gl_area.add_tick_callback(clone!(#[strong] state, move |area, _clock| {
-                    // Read current animation state.
                     let animating = state.borrow().zoom_animating;
                     if !animating {
                         return glib::ControlFlow::Break;
                     }
 
-                    let (target, anchor, anchor_screen) = {
+                    let (target, anchor, anchor_screen, center_target) = {
                         let s = state.borrow();
-                        (s.zoom_target, s.zoom_anchor, s.zoom_anchor_screen)
+                        (s.zoom_target, s.zoom_anchor, s.zoom_anchor_screen, s.zoom_center_target)
                     };
 
-                    // Compute the next zoom value and the corresponding center
-                    // that keeps `anchor` fixed under `anchor_screen`.
                     let (new_zoom, new_cx, new_cy, settled) = {
                         let s = state.borrow();
                         let proj = s.project.borrow();
                         let vp = &proj.viewport;
                         let z = vp.zoom + (target - vp.zoom) * 0.2;
-                        let settled = (z - target).abs() < 1e-4;
-                        let z = if settled { target } else { z };
-                        // Compute metres-per-pixel at the candidate zoom.
-                        let res = (2.0 * rgis_core::EARTH_HALF_CIRC)
-                            / (256.0 * 2_f64.powf(z));
-                        // Center such that anchor_world maps to anchor_screen.
-                        let cx = anchor[0]
-                            - (anchor_screen[0] as f64 - vp.width_px as f64 * 0.5) * res;
-                        let cy = anchor[1]
-                            + (anchor_screen[1] as f64 - vp.height_px as f64 * 0.5) * res;
-                        (z, cx, cy, settled)
+                        if let Some([tcx, tcy]) = center_target {
+                            // Fit-to-bounds: ease both zoom and center independently.
+                            let settled_z = (z - target).abs() < 1e-4;
+                            let z = if settled_z { target } else { z };
+                            let cx = vp.center.x + (tcx - vp.center.x) * 0.2;
+                            let cy = vp.center.y + (tcy - vp.center.y) * 0.2;
+                            let settled_c = (cx - tcx).abs() < 1.0 && (cy - tcy).abs() < 1.0;
+                            let (cx, cy) = if settled_c { (tcx, tcy) } else { (cx, cy) };
+                            (z, cx, cy, settled_z && settled_c)
+                        } else {
+                            // Anchor-based: keep a world point fixed under the cursor.
+                            let settled = (z - target).abs() < 1e-4;
+                            let z = if settled { target } else { z };
+                            let res = (2.0 * rgis_core::EARTH_HALF_CIRC)
+                                / (256.0 * 2_f64.powf(z));
+                            let cx = anchor[0]
+                                - (anchor_screen[0] as f64 - vp.width_px as f64 * 0.5) * res;
+                            let cy = anchor[1]
+                                + (anchor_screen[1] as f64 - vp.height_px as f64 * 0.5) * res;
+                            (z, cx, cy, settled)
+                        }
                     };
 
-                    // Apply.
                     {
                         let s = state.borrow();
                         let mut proj = s.project.borrow_mut();
@@ -359,11 +379,11 @@ impl MapArea {
                     }
 
                     if settled {
-                        state.borrow_mut().zoom_animating = false;
+                        let mut s = state.borrow_mut();
+                        s.zoom_animating = false;
+                        s.zoom_center_target = None;
                     }
 
-                    // queue_render triggers the connect_render callback which
-                    // will pass allow_retessellate=true on the settle frame.
                     area.queue_render();
 
                     if settled {
@@ -377,6 +397,88 @@ impl MapArea {
         }));
         gl_area.add_controller(scroll);
 
+        // Closure shared with interactions that want smooth animated zoom toward
+        // a specific viewport (zoom + center), as opposed to the anchor-based
+        // scroll zoom.  Sets targets and starts the tick-callback if not already
+        // running; if a tick-callback is already running it picks up the new
+        // targets automatically on its next iteration.
+        let animate_to: Rc<dyn Fn(f64, [f64; 2])> = Rc::new({
+            let state = Rc::clone(&state);
+            let gl_area_weak = gl_area.downgrade();
+            move |target_zoom: f64, target_center: [f64; 2]| {
+                let Some(gl_area) = gl_area_weak.upgrade() else { return };
+                let mut s = state.borrow_mut();
+                s.zoom_target = target_zoom;
+                s.zoom_center_target = Some(target_center);
+                let was_animating = s.zoom_animating;
+                if !was_animating {
+                    s.zoom_animating = true;
+                }
+                drop(s);
+                if !was_animating {
+                    gl_area.add_tick_callback(clone!(#[strong] state, move |area, _clock| {
+                        let animating = state.borrow().zoom_animating;
+                        if !animating {
+                            return glib::ControlFlow::Break;
+                        }
+
+                        let (target, anchor, anchor_screen, center_target) = {
+                            let s = state.borrow();
+                            (s.zoom_target, s.zoom_anchor, s.zoom_anchor_screen, s.zoom_center_target)
+                        };
+
+                        let (new_zoom, new_cx, new_cy, settled) = {
+                            let s = state.borrow();
+                            let proj = s.project.borrow();
+                            let vp = &proj.viewport;
+                            let z = vp.zoom + (target - vp.zoom) * 0.2;
+                            if let Some([tcx, tcy]) = center_target {
+                                let settled_z = (z - target).abs() < 1e-4;
+                                let z = if settled_z { target } else { z };
+                                let cx = vp.center.x + (tcx - vp.center.x) * 0.2;
+                                let cy = vp.center.y + (tcy - vp.center.y) * 0.2;
+                                let settled_c = (cx - tcx).abs() < 1.0 && (cy - tcy).abs() < 1.0;
+                                let (cx, cy) = if settled_c { (tcx, tcy) } else { (cx, cy) };
+                                (z, cx, cy, settled_z && settled_c)
+                            } else {
+                                let settled = (z - target).abs() < 1e-4;
+                                let z = if settled { target } else { z };
+                                let res = (2.0 * rgis_core::EARTH_HALF_CIRC)
+                                    / (256.0 * 2_f64.powf(z));
+                                let cx = anchor[0]
+                                    - (anchor_screen[0] as f64 - vp.width_px as f64 * 0.5) * res;
+                                let cy = anchor[1]
+                                    + (anchor_screen[1] as f64 - vp.height_px as f64 * 0.5) * res;
+                                (z, cx, cy, settled)
+                            }
+                        };
+
+                        {
+                            let s = state.borrow();
+                            let mut proj = s.project.borrow_mut();
+                            proj.viewport.zoom = new_zoom;
+                            proj.viewport.center.x = new_cx;
+                            proj.viewport.center.y = new_cy;
+                        }
+
+                        if settled {
+                            let mut s = state.borrow_mut();
+                            s.zoom_animating = false;
+                            s.zoom_center_target = None;
+                        }
+
+                        area.queue_render();
+
+                        if settled {
+                            glib::ControlFlow::Break
+                        } else {
+                            glib::ControlFlow::Continue
+                        }
+                    }));
+                }
+            }
+        });
+
         // Attach interaction controllers.
         let project_for_interactions = {
             let s = state.borrow();
@@ -384,7 +486,7 @@ impl MapArea {
         };
         interactions
             .drag_zoom_box
-            .attach(&gl_area, &drawing_area, project_for_interactions);
+            .attach(&gl_area, &drawing_area, project_for_interactions, Rc::clone(&animate_to));
 
         Self { gl_area, overlay, state, renderer }
     }
