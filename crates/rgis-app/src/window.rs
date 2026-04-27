@@ -1,3 +1,4 @@
+use crate::drag_zoom_box::Interactions;
 use crate::map_area::MapArea;
 use crate::sidebar::Sidebar;
 
@@ -26,7 +27,7 @@ impl RgisWindow {
         let tile_fetcher = Arc::new(TileFetcher::new(OsmTileSource));
 
         // ── Map canvas ────────────────────────────────────────────────────────
-        let map_area = MapArea::new(Rc::clone(&project), Arc::clone(&tile_fetcher));
+        let map_area = MapArea::new(Rc::clone(&project), Arc::clone(&tile_fetcher), Interactions::default());
 
         // ── Sidebar ───────────────────────────────────────────────────────────
         let sidebar = Sidebar::new(Rc::clone(&project), {

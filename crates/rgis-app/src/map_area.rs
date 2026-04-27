@@ -11,6 +11,8 @@ use rgis_core::Project;
 use rgis_render::{GlRenderer, MapRenderer, TileImage};
 use rgis_tiles::{tile_screen_rect, visible_tiles, OsmTileSource, TileFetcher, TileCoord, TileReady};
 
+use crate::drag_zoom_box::Interactions;
+
 /// Load a GL function pointer by searching all currently loaded shared libraries.
 /// After GTK4 realizes a GLArea it has already loaded the platform GL library
 /// (EGL on Wayland, GLX on X11), so core GL 3.3 symbols are always present.
@@ -18,10 +20,13 @@ unsafe fn gl_proc_addr(s: &std::ffi::CStr) -> *const std::ffi::c_void {
     libc::dlsym(libc::RTLD_DEFAULT, s.as_ptr() as *const _) as *const _
 }
 
-/// Wraps a `gtk4::GLArea` that renders the map.
+/// Wraps a `gtk4::GLArea` that renders the map, placed inside a
+/// `gtk4::Overlay` so that interaction visuals (e.g. the zoom-box
+/// rubber-band rectangle) can be drawn on top without touching the GL context.
 #[derive(Clone)]
 pub struct MapArea {
     gl_area: gtk4::GLArea,
+    overlay: gtk4::Overlay,
     state: Rc<RefCell<MapState>>,
     /// Separated into its own RefCell so `render()` can borrow project + renderer
     /// simultaneously without cloning layer data.
@@ -52,7 +57,11 @@ struct MapState {
 }
 
 impl MapArea {
-    pub fn new(project: Rc<RefCell<Project>>, tile_fetcher: Arc<TileFetcher>) -> Self {
+    pub fn new(
+        project: Rc<RefCell<Project>>,
+        tile_fetcher: Arc<TileFetcher>,
+        interactions: Interactions,
+    ) -> Self {
         let gl_area = gtk4::GLArea::new();
         gl_area.set_hexpand(true);
         gl_area.set_vexpand(true);
@@ -61,6 +70,21 @@ impl MapArea {
         // Render only when explicitly requested via queue_render(); this avoids
         // redundant frames and is prerequisite for flicker-free double buffering.
         gl_area.set_auto_render(false);
+
+        // Transparent drawing area used by interaction overlays (e.g. zoom-box
+        // rubber-band). It sits on top of the GL area but passes all input
+        // events through so that gestures registered on gl_area still fire.
+        let drawing_area = gtk4::DrawingArea::new();
+        drawing_area.set_hexpand(true);
+        drawing_area.set_vexpand(true);
+        drawing_area.set_can_focus(false);
+        // Ensure pointer events pass through to the GL area below.
+        drawing_area.set_can_target(false);
+
+        // Wrap GL area + drawing-area overlay into a single widget.
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&gl_area));
+        overlay.add_overlay(&drawing_area);
 
         let renderer: Rc<RefCell<Option<GlRenderer>>> = Rc::new(RefCell::new(None));
 
@@ -192,9 +216,18 @@ impl MapArea {
         }));
 
         // Pan gesture — positive drag delta → map follows finger (natural/intuitive).
+        // Denied when Shift is held so the DragZoomBox interaction takes over.
         let drag = gtk4::GestureDrag::new();
         drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
-        drag.connect_drag_begin(clone!(#[strong] state, move |_, x, y| {
+        drag.connect_drag_begin(clone!(#[strong] state, move |gesture, x, y| {
+            let shift = gesture
+                .current_event()
+                .map(|ev| ev.modifier_state().contains(gtk4::gdk::ModifierType::SHIFT_MASK))
+                .unwrap_or(false);
+            if shift {
+                gesture.set_state(gtk4::EventSequenceState::Denied);
+                return;
+            }
             let mut s = state.borrow_mut();
             // Settle any in-flight zoom animation immediately so that the
             // tick callback stops overwriting viewport.center and the pan
@@ -217,7 +250,7 @@ impl MapArea {
             s.drag_start = Some((x, y));
             s.drag_last = Some((x, y));
         }));
-        drag.connect_drag_update(clone!(#[strong] state, #[weak] gl_area, move |_, dx, dy| {
+        drag.connect_drag_update(clone!(#[strong] state, #[weak] gl_area, move |_gesture, dx, dy| {
             let mut s = state.borrow_mut();
             if let Some((lx, ly)) = s.drag_last {
                 let start = s.drag_start.unwrap_or((0.0, 0.0));
@@ -344,11 +377,20 @@ impl MapArea {
         }));
         gl_area.add_controller(scroll);
 
-        Self { gl_area, state, renderer }
+        // Attach interaction controllers.
+        let project_for_interactions = {
+            let s = state.borrow();
+            Rc::clone(&s.project)
+        };
+        interactions
+            .drag_zoom_box
+            .attach(&gl_area, &drawing_area, project_for_interactions);
+
+        Self { gl_area, overlay, state, renderer }
     }
 
-    pub fn widget(&self) -> &gtk4::GLArea {
-        &self.gl_area
+    pub fn widget(&self) -> &gtk4::Overlay {
+        &self.overlay
     }
 
     pub fn queue_render(&self) {

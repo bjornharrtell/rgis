@@ -1,7 +1,9 @@
+mod drag_zoom_box;
 mod map_area;
 mod sidebar;
 mod window;
 
+use glib::ExitCode;
 use libadwaita::prelude::*;
 use libadwaita::Application;
 
@@ -28,5 +30,6 @@ fn main() {
         win.present();
     });
 
-    std::process::exit(app.run().value());
+    let exit_code: ExitCode = app.run();
+    std::process::exit(exit_code.get() as i32);
 }
