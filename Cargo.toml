@@ -22,11 +22,11 @@ async-channel = "2"
 
 # Geo / data
 geo-types   = { version = "0.7", features = ["serde"] }
-geo         = "0.28"
-geozero     = { version = "0.14", features = ["with-geo"] }
-geojson     = "0.24"
-shapefile   = "0.6"
-flatgeobuf  = { version = "4", default-features = false }
+geo         = "0.33"
+geozero     = { version = "0.15", features = ["with-geo"] }
+geojson     = "1"
+shapefile   = "0.8"
+flatgeobuf  = { version = "6", default-features = false }
 proj4rs     = "0.1"
 rstar       = "0.12"
 
