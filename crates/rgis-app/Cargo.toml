@@ -1,0 +1,29 @@
+[package]
+name = "rgis-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rgis"
+path = "src/main.rs"
+
+[dependencies]
+rgis-core   = { path = "../rgis-core" }
+rgis-io     = { path = "../rgis-io" }
+rgis-render = { path = "../rgis-render" }
+rgis-tiles  = { path = "../rgis-tiles" }
+
+gtk4        = { workspace = true }
+libadwaita  = { workspace = true }
+glib        = { workspace = true }
+gio         = { workspace = true }
+glow        = { workspace = true }
+tokio       = { workspace = true }
+async-channel = { workspace = true }
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+libc        = "0.2"
+
+[build-dependencies]
+pkg-config  = "0.3"

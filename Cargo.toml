@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rgis-app",
+    "crates/rgis-core",
+    "crates/rgis-io",
+    "crates/rgis-render",
+    "crates/rgis-tiles",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = []
+repository = "https://github.com/yourname/rgis"
+
+[workspace.dependencies]
+# Async runtime
+tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }
+async-channel = "2"
+
+# Geo / data
+geo-types   = { version = "0.7", features = ["serde"] }
+geo         = "0.28"
+geozero     = { version = "0.14", features = ["with-geo"] }
+geojson     = "0.24"
+shapefile   = "0.6"
+flatgeobuf  = { version = "4", default-features = false }
+proj4rs     = "0.1"
+rstar       = "0.12"
+
+# Serialisation
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Error handling
+thiserror   = "1"
+anyhow      = "1"
+
+# Tiles / networking
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+image       = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lru         = "0.12"
+directories = "5"
+
+# Rendering
+glow        = "0.14"
+lyon_tessellation = "1"
+
+# GTK / Adwaita
+gtk4        = { version = "0.9", features = ["v4_14"] }
+libadwaita  = { version = "0.7", features = ["v1_5"] }
+glib        = "0.20"
+gio         = "0.20"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,17 @@
+[package]
+name = "rgis-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rgis-core   = { path = "../rgis-core" }
+geo-types   = { workspace = true }
+geo         = { workspace = true }
+geozero     = { workspace = true }
+geojson     = { workspace = true }
+shapefile   = { workspace = true }
+flatgeobuf  = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
