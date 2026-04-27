@@ -196,6 +196,24 @@ impl MapArea {
         drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
         drag.connect_drag_begin(clone!(#[strong] state, move |_, x, y| {
             let mut s = state.borrow_mut();
+            // Settle any in-flight zoom animation immediately so that the
+            // tick callback stops overwriting viewport.center and the pan
+            // gesture has full control from the very first drag event.
+            if s.zoom_animating {
+                let target = s.zoom_target;
+                let anchor = s.zoom_anchor;
+                let anchor_screen = s.zoom_anchor_screen;
+                let mut proj = s.project.borrow_mut();
+                proj.viewport.zoom = target;
+                // Recompute center for the settled zoom so the anchor stays put.
+                let res = (2.0 * rgis_core::EARTH_HALF_CIRC) / (256.0 * 2_f64.powf(target));
+                proj.viewport.center.x =
+                    anchor[0] - (anchor_screen[0] as f64 - proj.viewport.width_px as f64 * 0.5) * res;
+                proj.viewport.center.y =
+                    anchor[1] + (anchor_screen[1] as f64 - proj.viewport.height_px as f64 * 0.5) * res;
+                drop(proj);
+                s.zoom_animating = false;
+            }
             s.drag_start = Some((x, y));
             s.drag_last = Some((x, y));
         }));
