@@ -142,9 +142,10 @@ impl MapArea {
                 let cy = start.1 + dy;
                 let ddx = cx - lx;
                 let ddy = cy - ly;
-                // pan(ddx, ddy): center.x -= ddx*res, center.y += ddy*res
-                // → content follows the drag direction.
-                s.project.borrow_mut().viewport.pan(ddx as f32, ddy as f32);
+                // Scale logical-pixel delta to device pixels so pan distance
+                // matches the physical pointer movement on HiDPI displays.
+                let scale = gl_area.scale_factor() as f32;
+                s.project.borrow_mut().viewport.pan(ddx as f32 * scale, ddy as f32 * scale);
                 s.drag_last = Some((cx, cy));
                 drop(s);
                 gl_area.queue_render();
@@ -158,9 +159,12 @@ impl MapArea {
         gl_area.add_controller(drag);
 
         // Track pointer position so scroll-to-zoom uses the cursor as anchor.
+        // Motion events are in logical pixels; convert to device pixels so the
+        // stored position is consistent with viewport.width_px / height_px.
         let motion = gtk4::EventControllerMotion::new();
-        motion.connect_motion(clone!(#[strong] state, move |_, x, y| {
-            state.borrow_mut().cursor_px = [x as f32, y as f32];
+        motion.connect_motion(clone!(#[strong] state, #[weak] gl_area, move |_, x, y| {
+            let scale = gl_area.scale_factor() as f32;
+            state.borrow_mut().cursor_px = [x as f32 * scale, y as f32 * scale];
         }));
         gl_area.add_controller(motion);
 
@@ -169,7 +173,7 @@ impl MapArea {
             gtk4::EventControllerScrollFlags::VERTICAL,
         );
         scroll.connect_scroll(clone!(#[strong] state, #[weak] gl_area, #[upgrade_or_else] || glib::Propagation::Proceed, move |_ctrl, _dx, dy| {
-            let mut s = state.borrow_mut();
+            let s = state.borrow_mut();
             let cursor = s.cursor_px;
             s.project.borrow_mut().viewport.zoom_toward(cursor, -dy * 0.25);
             drop(s);
