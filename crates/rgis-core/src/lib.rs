@@ -264,11 +264,24 @@ fn compute_bounds(features: &[Feature]) -> Option<Bounds> {
 
 // ── Project ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Project {
     pub layers: Vec<Layer>,
     pub viewport: Viewport,
+    /// Whether the OSM tile background is visible.
+    pub show_tiles: bool,
     next_id: u64,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            viewport: Viewport::default(),
+            show_tiles: true,
+            next_id: 0,
+        }
+    }
 }
 
 impl Project {

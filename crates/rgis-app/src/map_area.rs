@@ -17,7 +17,7 @@ use crate::drag_zoom_box::Interactions;
 /// After GTK4 realizes a GLArea it has already loaded the platform GL library
 /// (EGL on Wayland, GLX on X11), so core GL 3.3 symbols are always present.
 unsafe fn gl_proc_addr(s: &std::ffi::CStr) -> *const std::ffi::c_void {
-    libc::dlsym(libc::RTLD_DEFAULT, s.as_ptr() as *const _) as *const _
+    unsafe { libc::dlsym(libc::RTLD_DEFAULT, s.as_ptr() as *const _) as *const _ }
 }
 
 /// Wraps a `gtk4::GLArea` that renders the map, placed inside a
@@ -42,6 +42,9 @@ struct MapState {
     drag_last: Option<(f64, f64)>,
     /// Last known pointer position in widget-local pixels.
     cursor_px: [f32; 2],
+    /// Optional callback invoked on cursor move: `(lon_deg, lat_deg, m_per_px)`.
+    /// `None` is passed when the cursor leaves the widget.
+    status_fn: Option<std::rc::Rc<dyn Fn(Option<(f64, f64)>, f64)>>,
 
     // ── Smooth zoom animation ─────────────────────────────────────────────
     /// Target zoom level for the ongoing animation.  Updated on every scroll
@@ -100,6 +103,7 @@ impl MapArea {
             drag_start: None,
             drag_last: None,
             cursor_px: [0.0, 0.0],
+            status_fn: None,
             zoom_target: initial_zoom,
             zoom_anchor: [0.0, 0.0],
             zoom_anchor_screen: [0.0, 0.0],
@@ -151,8 +155,12 @@ impl MapArea {
 
             // Build TileImages for visible tiles that are already loaded.
             // Arc::clone is a reference-count bump; no pixel data is copied.
-            let visible = visible_tiles(&viewport, &OsmTileSource);
-            let mut tile_images: Vec<TileImage> = Vec::with_capacity(visible.len());
+            let mut tile_images: Vec<TileImage> = Vec::new();
+            let visible = if proj.show_tiles {
+                visible_tiles(&viewport, &OsmTileSource)
+            } else {
+                vec![]
+            };
 
             for coord in &visible {
                 if let Some((rgba, w, h)) = s.tile_cache.get(coord) {
@@ -291,8 +299,27 @@ impl MapArea {
         // stored position is consistent with viewport.width_px / height_px.
         let motion = gtk4::EventControllerMotion::new();
         motion.connect_motion(clone!(#[strong] state, #[weak] gl_area, move |_, x, y| {
-            let scale = gl_area.scale_factor() as f32;
-            state.borrow_mut().cursor_px = [x as f32 * scale, y as f32 * scale];
+            let scale_f = gl_area.scale_factor() as f32;
+            let px = [x as f32 * scale_f, y as f32 * scale_f];
+            let mut s = state.borrow_mut();
+            s.cursor_px = px;
+            if let Some(ref f) = s.status_fn {
+                let world = s.project.borrow().viewport.screen_to_world(px);
+                let m_per_px = s.project.borrow().viewport.resolution();
+                let (lon, lat) = rgis_core::mercator_to_lonlat(world.x, world.y);
+                let f = std::rc::Rc::clone(f);
+                drop(s);
+                f(Some((lon, lat)), m_per_px);
+            }
+        }));
+        motion.connect_leave(clone!(#[strong] state, move |_| {
+            let s = state.borrow();
+            if let Some(ref f) = s.status_fn {
+                let m_per_px = s.project.borrow().viewport.resolution();
+                let f = std::rc::Rc::clone(f);
+                drop(s);
+                f(None, m_per_px);
+            }
         }));
         gl_area.add_controller(motion);
 
@@ -531,6 +558,13 @@ impl MapArea {
             (rgba, w, h)
         });
         self.gl_area.queue_render();
+    }
+
+    /// Register a callback that is invoked when the cursor moves over the map
+    /// or leaves it.  Arguments are `(coords, m_per_px)` where `coords` is
+    /// `Some((lon_deg, lat_deg))` while the cursor is inside, or `None` on leave.
+    pub fn set_status_fn(&self, f: impl Fn(Option<(f64, f64)>, f64) + 'static) {
+        self.state.borrow_mut().status_fn = Some(std::rc::Rc::new(f));
     }
 
     pub fn invalidate_layer(&self, id: rgis_core::LayerId) {

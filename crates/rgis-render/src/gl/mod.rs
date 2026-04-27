@@ -59,7 +59,7 @@ pub struct GlRenderer {
 impl GlRenderer {
     /// # Safety
     /// The caller must ensure a valid OpenGL context is current.
-    pub unsafe fn new(gl: glow::Context) -> Self {
+    pub unsafe fn new(gl: glow::Context) -> Self { unsafe {
         let programs = compile_programs(&gl);
 
         let (tile_vao, tile_vbo) = create_tile_quad_buffers(&gl);
@@ -75,7 +75,7 @@ impl GlRenderer {
             tile_textures: std::cell::RefCell::new(HashMap::new()),
             tile_age: std::cell::RefCell::new(HashMap::new()),
         }
-    }
+    }}
 }
 
 impl MapRenderer for GlRenderer {
@@ -178,7 +178,7 @@ impl MapRenderer for GlRenderer {
 // ── Tile rendering ────────────────────────────────────────────────────────────
 
 impl GlRenderer {
-    unsafe fn draw_tiles(&self, tiles: &[TileImage], proj: &[f32; 16]) {
+    unsafe fn draw_tiles(&self, tiles: &[TileImage], proj: &[f32; 16]) { unsafe {
         let gl = &self.gl;
         let mut tile_textures = self.tile_textures.borrow_mut();
         gl.use_program(Some(self.programs.tile));
@@ -257,7 +257,7 @@ impl GlRenderer {
                 true
             }
         });
-    }
+    }}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -297,24 +297,24 @@ fn world_to_ndc_matrix(vp: &Viewport) -> [f32; 16] {
     ]
 }
 
-unsafe fn set_uniform_mat4(gl: &glow::Context, prog: glow::Program, name: &str, mat: &[f32; 16]) {
+unsafe fn set_uniform_mat4(gl: &glow::Context, prog: glow::Program, name: &str, mat: &[f32; 16]) { unsafe {
     if let Some(loc) = gl.get_uniform_location(prog, name) {
         gl.uniform_matrix_4_f32_slice(Some(&loc), false, mat);
     }
-}
+}}
 
 unsafe fn set_uniform_color(
     gl: &glow::Context,
     prog: glow::Program,
     name: &str,
     color: rgis_core::Color,
-) {
+) { unsafe {
     if let Some(loc) = gl.get_uniform_location(prog, name) {
         gl.uniform_4_f32(Some(&loc), color.r, color.g, color.b, color.a);
     }
-}
+}}
 
-unsafe fn upload_mesh(gl: &glow::Context, mesh: &GpuMesh) -> (glow::VertexArray, glow::Buffer, glow::Buffer, i32) {
+unsafe fn upload_mesh(gl: &glow::Context, mesh: &GpuMesh) -> (glow::VertexArray, glow::Buffer, glow::Buffer, i32) { unsafe {
     let vao = gl.create_vertex_array().unwrap();
     let vbo = gl.create_buffer().unwrap();
     let ebo = gl.create_buffer().unwrap();
@@ -342,9 +342,9 @@ unsafe fn upload_mesh(gl: &glow::Context, mesh: &GpuMesh) -> (glow::VertexArray,
     gl.bind_vertex_array(None);
 
     (vao, vbo, ebo, mesh.indices.len() as i32)
-}
+}}
 
-unsafe fn build_layer_buffers(gl: &glow::Context, layer: &Layer, viewport: &Viewport) -> LayerBuffers {
+unsafe fn build_layer_buffers(gl: &glow::Context, layer: &Layer, viewport: &Viewport) -> LayerBuffers { unsafe {
     let res = viewport.resolution() as f32;
 
     // Fills are viewport-independent — world-space coordinates never change.
@@ -367,9 +367,9 @@ unsafe fn build_layer_buffers(gl: &glow::Context, layer: &Layer, viewport: &View
         points_vao, points_vbo, points_ebo, points_index_count,
         tessellated_zoom: viewport.zoom,
     }
-}
+}}
 
-unsafe fn free_layer_buffers(gl: &glow::Context, bufs: LayerBuffers) {
+unsafe fn free_layer_buffers(gl: &glow::Context, bufs: LayerBuffers) { unsafe {
     gl.delete_vertex_array(bufs.fill_vao);
     gl.delete_buffer(bufs.fill_vbo);
     gl.delete_buffer(bufs.fill_ebo);
@@ -379,9 +379,9 @@ unsafe fn free_layer_buffers(gl: &glow::Context, bufs: LayerBuffers) {
     gl.delete_vertex_array(bufs.points_vao);
     gl.delete_buffer(bufs.points_vbo);
     gl.delete_buffer(bufs.points_ebo);
-}
+}}
 
-unsafe fn create_tile_quad_buffers(gl: &glow::Context) -> (glow::VertexArray, glow::Buffer) {
+unsafe fn create_tile_quad_buffers(gl: &glow::Context) -> (glow::VertexArray, glow::Buffer) { unsafe {
     let vao = gl.create_vertex_array().unwrap();
     let vbo = gl.create_buffer().unwrap();
     let ebo = gl.create_buffer().unwrap();
@@ -415,9 +415,9 @@ unsafe fn create_tile_quad_buffers(gl: &glow::Context) -> (glow::VertexArray, gl
     gl.bind_vertex_array(None);
 
     (vao, vbo)
-}
+}}
 
-unsafe fn compile_programs(gl: &glow::Context) -> Programs {
+unsafe fn compile_programs(gl: &glow::Context) -> Programs { unsafe {
     let vector = compile_program(
         gl,
         include_str!("shaders/vector.vert"),
@@ -429,9 +429,9 @@ unsafe fn compile_programs(gl: &glow::Context) -> Programs {
         include_str!("shaders/tile.frag"),
     );
     Programs { vector, tile }
-}
+}}
 
-unsafe fn compile_program(gl: &glow::Context, vert_src: &str, frag_src: &str) -> glow::Program {
+unsafe fn compile_program(gl: &glow::Context, vert_src: &str, frag_src: &str) -> glow::Program { unsafe {
     let vert = compile_shader(gl, glow::VERTEX_SHADER, vert_src);
     let frag = compile_shader(gl, glow::FRAGMENT_SHADER, frag_src);
 
@@ -448,9 +448,9 @@ unsafe fn compile_program(gl: &glow::Context, vert_src: &str, frag_src: &str) ->
     gl.delete_shader(frag);
 
     prog
-}
+}}
 
-unsafe fn compile_shader(gl: &glow::Context, ty: u32, src: &str) -> glow::Shader {
+unsafe fn compile_shader(gl: &glow::Context, ty: u32, src: &str) -> glow::Shader { unsafe {
     let shader = gl.create_shader(ty).unwrap();
     gl.shader_source(shader, src);
     gl.compile_shader(shader);
@@ -458,7 +458,7 @@ unsafe fn compile_shader(gl: &glow::Context, ty: u32, src: &str) -> glow::Shader
         panic!("Shader compile error: {}", gl.get_shader_info_log(shader));
     }
     shader
-}
+}}
 
 /// Reinterpret a slice of plain-old-data as bytes without the `bytemuck` crate.
 fn bytemuck_cast_slice<T: Copy>(data: &[T]) -> &[u8] {

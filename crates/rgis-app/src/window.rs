@@ -1,6 +1,7 @@
 use crate::drag_zoom_box::Interactions;
 use crate::map_area::MapArea;
 use crate::sidebar::Sidebar;
+use crate::status_bar::StatusBar;
 
 use std::{
     cell::RefCell,
@@ -61,6 +62,18 @@ impl RgisWindow {
         let toolbar_view = libadwaita::ToolbarView::new();
         toolbar_view.add_top_bar(&header);
         toolbar_view.set_content(Some(&split_view));
+
+        // ── Status bar ────────────────────────────────────────────────────────
+        let status_bar = StatusBar::new();
+        toolbar_view.add_bottom_bar(status_bar.widget());
+
+        map_area.set_status_fn({
+            let status_bar = status_bar.clone();
+            move |coords, m_per_px| match coords {
+                Some((lon, lat)) => status_bar.update(lon, lat, m_per_px),
+                None => status_bar.clear_coords(),
+            }
+        });
 
         // ── Window ────────────────────────────────────────────────────────────
         let window = ApplicationWindow::builder()

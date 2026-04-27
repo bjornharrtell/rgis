@@ -1,6 +1,7 @@
 mod drag_zoom_box;
 mod map_area;
 mod sidebar;
+mod status_bar;
 mod window;
 
 use glib::ExitCode;
