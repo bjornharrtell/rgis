@@ -37,6 +37,18 @@ struct MapState {
     drag_last: Option<(f64, f64)>,
     /// Last known pointer position in widget-local pixels.
     cursor_px: [f32; 2],
+
+    // ── Smooth zoom animation ─────────────────────────────────────────────
+    /// Target zoom level for the ongoing animation.  Updated on every scroll
+    /// event; the tick-callback eases `viewport.zoom` toward this value.
+    zoom_target: f64,
+    /// The Web-Mercator world position (metres) that should remain fixed
+    /// under the cursor throughout the animation.
+    zoom_anchor: [f64; 2],
+    /// The screen-pixel position of the zoom anchor.
+    zoom_anchor_screen: [f32; 2],
+    /// Whether a zoom tick-callback is currently registered and running.
+    zoom_animating: bool,
 }
 
 impl MapArea {
@@ -46,9 +58,13 @@ impl MapArea {
         gl_area.set_vexpand(true);
         gl_area.set_required_version(3, 3);
         gl_area.set_has_depth_buffer(false);
+        // Render only when explicitly requested via queue_render(); this avoids
+        // redundant frames and is prerequisite for flicker-free double buffering.
+        gl_area.set_auto_render(false);
 
         let renderer: Rc<RefCell<Option<GlRenderer>>> = Rc::new(RefCell::new(None));
 
+        let initial_zoom = project.borrow().viewport.zoom;
         let state = Rc::new(RefCell::new(MapState {
             project,
             tile_fetcher,
@@ -56,6 +72,10 @@ impl MapArea {
             drag_start: None,
             drag_last: None,
             cursor_px: [0.0, 0.0],
+            zoom_target: initial_zoom,
+            zoom_anchor: [0.0, 0.0],
+            zoom_anchor_screen: [0.0, 0.0],
+            zoom_animating: false,
         }));
 
         // realize: create the GL renderer
@@ -122,7 +142,12 @@ impl MapArea {
                 }
             }
 
-            rend.render(&viewport, &proj.layers, &tile_images);
+            // Retessellate geometry only when no zoom animation is in progress.
+            // During animation the old (slightly-misscaled) stroke geometry is
+            // reused; on the settle frame allow_retessellate=true so it is
+            // rebuilt once at the final zoom level.
+            let allow_retessellate = !s.zoom_animating;
+            rend.render(&viewport, &proj.layers, &tile_images, allow_retessellate);
             glib::Propagation::Proceed
         }));
 
@@ -168,16 +193,95 @@ impl MapArea {
         }));
         gl_area.add_controller(motion);
 
-        // Scroll to zoom — zoom toward the pointer position.
+        // Scroll to zoom — smooth animated zoom toward the pointer position.
         let scroll = gtk4::EventControllerScroll::new(
             gtk4::EventControllerScrollFlags::VERTICAL,
         );
         scroll.connect_scroll(clone!(#[strong] state, #[weak] gl_area, #[upgrade_or_else] || glib::Propagation::Proceed, move |_ctrl, _dx, dy| {
-            let s = state.borrow_mut();
+            let mut s = state.borrow_mut();
             let cursor = s.cursor_px;
-            s.project.borrow_mut().viewport.zoom_toward(cursor, -dy * 0.25);
-            drop(s);
-            gl_area.queue_render();
+            let delta = -dy * 0.125;
+
+            // World-space anchor: the map point under the cursor that must
+            // remain fixed throughout the animation.
+            let anchor_world = {
+                let proj = s.project.borrow();
+                let w = proj.viewport.screen_to_world(cursor);
+                [w.x, w.y]
+            };
+            s.zoom_anchor = anchor_world;
+            s.zoom_anchor_screen = cursor;
+
+            // If no animation is running, sync zoom_target with the actual
+            // viewport zoom first (handles external zoom changes like fit_bounds).
+            if !s.zoom_animating {
+                let current_zoom = { let proj = s.project.borrow(); proj.viewport.zoom };
+                s.zoom_target = current_zoom;
+            }
+            s.zoom_target = (s.zoom_target + delta).clamp(0.0, 22.0);
+
+            if !s.zoom_animating {
+                s.zoom_animating = true;
+                drop(s);
+                // Register a per-frame tick-callback that eases the viewport
+                // zoom toward zoom_target with exponential decay (~20 % per
+                // frame at 60 fps, giving a snappy ~150 ms feel).
+                gl_area.add_tick_callback(clone!(#[strong] state, move |area, _clock| {
+                    // Read current animation state.
+                    let animating = state.borrow().zoom_animating;
+                    if !animating {
+                        return glib::ControlFlow::Break;
+                    }
+
+                    let (target, anchor, anchor_screen) = {
+                        let s = state.borrow();
+                        (s.zoom_target, s.zoom_anchor, s.zoom_anchor_screen)
+                    };
+
+                    // Compute the next zoom value and the corresponding center
+                    // that keeps `anchor` fixed under `anchor_screen`.
+                    let (new_zoom, new_cx, new_cy, settled) = {
+                        let s = state.borrow();
+                        let proj = s.project.borrow();
+                        let vp = &proj.viewport;
+                        let z = vp.zoom + (target - vp.zoom) * 0.2;
+                        let settled = (z - target).abs() < 1e-4;
+                        let z = if settled { target } else { z };
+                        // Compute metres-per-pixel at the candidate zoom.
+                        let res = (2.0 * rgis_core::EARTH_HALF_CIRC)
+                            / (256.0 * 2_f64.powf(z));
+                        // Center such that anchor_world maps to anchor_screen.
+                        let cx = anchor[0]
+                            - (anchor_screen[0] as f64 - vp.width_px as f64 * 0.5) * res;
+                        let cy = anchor[1]
+                            + (anchor_screen[1] as f64 - vp.height_px as f64 * 0.5) * res;
+                        (z, cx, cy, settled)
+                    };
+
+                    // Apply.
+                    {
+                        let s = state.borrow();
+                        let mut proj = s.project.borrow_mut();
+                        proj.viewport.zoom = new_zoom;
+                        proj.viewport.center.x = new_cx;
+                        proj.viewport.center.y = new_cy;
+                    }
+
+                    if settled {
+                        state.borrow_mut().zoom_animating = false;
+                    }
+
+                    // queue_render triggers the connect_render callback which
+                    // will pass allow_retessellate=true on the settle frame.
+                    area.queue_render();
+
+                    if settled {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                }));
+            }
             glib::Propagation::Proceed
         }));
         gl_area.add_controller(scroll);

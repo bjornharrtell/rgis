@@ -18,11 +18,19 @@ pub struct TileImage {
 /// Abstraction over rendering backends.
 pub trait MapRenderer {
     fn resize(&mut self, width: u32, height: u32);
+    /// Render a frame.
+    ///
+    /// `allow_retessellate` — when `false` the renderer must not rebuild any
+    /// zoom-dependent geometry buffers.  Pass `false` while a zoom animation
+    /// is in progress so that the old (slightly-wrong-width) tessellation is
+    /// reused for every animation frame.  Pass `true` on the settle frame so
+    /// the geometry is rebuilt once at the final zoom level.
     fn render(
         &mut self,
         viewport: &Viewport,
         layers: &[Layer],
         tiles: &[TileImage],
+        allow_retessellate: bool,
     );
     fn invalidate_layer(&mut self, layer_id: rgis_core::LayerId);
 }

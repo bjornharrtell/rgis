@@ -82,7 +82,7 @@ impl MapRenderer for GlRenderer {
         }
     }
 
-    fn render(&mut self, viewport: &Viewport, layers: &[Layer], tiles: &[TileImage]) {
+    fn render(&mut self, viewport: &Viewport, layers: &[Layer], tiles: &[TileImage], allow_retessellate: bool) {
         unsafe {
             let gl = &self.gl;
             gl.clear_color(0.15, 0.15, 0.15, 1.0);
@@ -108,14 +108,22 @@ impl MapRenderer for GlRenderer {
             sorted.sort_by_key(|l| l.z_order);
 
             for layer in sorted {
-                // Rebuild if zoom changed significantly (strokes/points are zoom-dependent).
-                let needs_rebuild = self.layer_cache.get(&layer.id)
+                // Rebuild stroke/point geometry when zoom has drifted far enough
+                // — but only when the caller permits it (i.e. no zoom animation
+                // is in flight).  Fill buffers are viewport-independent and
+                // never need rebuilding here.
+                let needs_rebuild = allow_retessellate && self.layer_cache.get(&layer.id)
                     .map(|b| (b.tessellated_zoom - viewport.zoom).abs() > 0.5)
                     .unwrap_or(true);
                 if needs_rebuild {
-                    if let Some(old) = self.layer_cache.remove(&layer.id) {
+                    // Build new buffers BEFORE freeing old ones so the layer is
+                    // always present on the GPU (true double-buffer swap).
+                    let new_bufs = build_layer_buffers(gl, layer, viewport);
+                    if let Some(old) = self.layer_cache.insert(layer.id, new_bufs) {
                         free_layer_buffers(gl, old);
                     }
+                } else if !self.layer_cache.contains_key(&layer.id) {
+                    // First upload (no old buffers to double-buffer against).
                     let bufs = build_layer_buffers(gl, layer, viewport);
                     self.layer_cache.insert(layer.id, bufs);
                 }
