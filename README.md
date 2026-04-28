@@ -36,10 +36,21 @@ sudo apt install \
     libcairo2-dev \
     libpango1.0-dev \
     libepoxy-dev \
-    libssl-dev
+    libgl1-mesa-dev \
+    libegl1-mesa-dev
 ```
 
-The GTK4 / libadwaita stack pulls in everything needed for `gtk4-sys`, `libadwaita-sys`, `gdk4-sys`, `gsk4-sys`, `graphene-sys`, `gio-sys`, `glib-sys`, and `gobject-sys`. `libepoxy-dev` is required for the OpenGL context used by `GtkGLArea` / `glow`. `libssl-dev` is only needed if you swap `reqwest`'s `rustls-tls` feature for `native-tls`; it can be omitted otherwise.
+The GTK4 / libadwaita stack pulls in everything needed for `gtk4-sys`, `libadwaita-sys`, `gdk4-sys`, `gsk4-sys`, `graphene-sys`, `gio-sys`, `glib-sys`, and `gobject-sys`.
+
+OpenGL is used directly by `rgis-render` via [`glow`](https://crates.io/crates/glow). At runtime we resolve GL entry points with `dlsym(RTLD_DEFAULT, ...)` after promoting `libGL.so.1` and `libEGL.so.1` to the global symbol scope, so both must be installed and loadable:
+
+- `libepoxy-dev` — required by GTK4's `GtkGLArea`.
+- `libgl1-mesa-dev` — provides `libGL.so.1` (X11 / GLX backends).
+- `libegl1-mesa-dev` — provides `libEGL.so.1` (Wayland / EGL backends).
+
+On hardware with proprietary drivers (NVIDIA, AMDGPU PRO) the vendor packages provide equivalent `libGL.so.1` / `libEGL.so.1` and the Mesa `-dev` packages can be omitted.
+
+`reqwest` is configured with `rustls-tls`, so no system OpenSSL (`libssl-dev`) is required.
 
 ### 3. Build and run
 
