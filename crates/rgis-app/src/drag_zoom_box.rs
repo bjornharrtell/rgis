@@ -37,16 +37,6 @@ impl Default for DragZoomBox {
 }
 
 impl DragZoomBox {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Enable or disable this interaction (default: `true`).
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
     /// Wire up gesture controllers on `gl_area` and the rubber-band
     /// `drawing_area` overlay.  Called once during `MapArea` construction.
     pub(crate) fn attach(

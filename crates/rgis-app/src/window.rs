@@ -20,6 +20,7 @@ use rgis_tiles::{OsmTileSource, TileFetcher};
 
 pub struct RgisWindow {
     window: ApplicationWindow,
+    load: Rc<dyn Fn(PathBuf)>,
 }
 
 impl RgisWindow {
@@ -89,21 +90,30 @@ impl RgisWindow {
             split_view.set_show_sidebar(btn.is_active());
         }));
 
-        // Open file button
-        {
+        // Reusable loader closure shared between the file dialog and any
+        // file paths supplied via `GApplication::open` (CLI / D-Bus).
+        let load: Rc<dyn Fn(PathBuf)> = {
             let project = Rc::clone(&project);
             let sidebar = sidebar.clone();
             let map_area = map_area.clone();
             let toast_overlay = toast_overlay.clone();
-            let window = window.clone();
-            open_btn.connect_clicked(move |_| {
-                open_file_dialog(
-                    &window,
+            Rc::new(move |path: PathBuf| {
+                load_path(
+                    path,
                     Rc::clone(&project),
                     sidebar.clone(),
                     map_area.clone(),
                     toast_overlay.clone(),
                 );
+            })
+        };
+
+        // Open file button
+        {
+            let load = Rc::clone(&load);
+            let window = window.clone();
+            open_btn.connect_clicked(move |_| {
+                open_file_dialog(&window, Rc::clone(&load));
             });
         }
 
@@ -118,23 +128,21 @@ impl RgisWindow {
             });
         }
 
-        Self { window }
+        Self { window, load }
     }
 
     pub fn present(&self) {
         self.window.present();
     }
+
+    pub fn load_path(&self, path: PathBuf) {
+        (self.load)(path);
+    }
 }
 
 // ── File open dialog ──────────────────────────────────────────────────────────
 
-fn open_file_dialog(
-    parent: &ApplicationWindow,
-    project: Rc<RefCell<Project>>,
-    sidebar: Sidebar,
-    map_area: MapArea,
-    toast_overlay: ToastOverlay,
-) {
+fn open_file_dialog(parent: &ApplicationWindow, load: Rc<dyn Fn(PathBuf)>) {
     let filter = gtk4::FileFilter::new();
     filter.set_name(Some("GIS files"));
     filter.add_pattern("*.geojson");
@@ -153,7 +161,7 @@ fn open_file_dialog(
     dialog.open(Some(parent), gio::Cancellable::NONE, move |result| {
         let Ok(file) = result else { return };
         let Some(path) = file.path() else { return };
-        load_path(path, Rc::clone(&project), sidebar.clone(), map_area.clone(), toast_overlay.clone());
+        load(path);
     });
 }
 
