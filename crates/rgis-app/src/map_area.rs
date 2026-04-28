@@ -72,6 +72,12 @@ impl MapArea {
         let gl_area = gtk4::GLArea::new();
         gl_area.set_hexpand(true);
         gl_area.set_vexpand(true);
+        // Our shaders are written for desktop OpenGL 3.3 core (`#version 330 core`),
+        // so refuse a GLES context — otherwise GtkGLArea may hand us GLES on
+        // systems where GDK defaults to it (e.g. Wayland with some drivers, or
+        // when `GDK_DEBUG=gl-gles` / `GSK_RENDERER=gl` is set), and shader
+        // compilation will abort the process from inside the realize signal.
+        gl_area.set_allowed_apis(gtk4::gdk::GLAPI::GL);
         gl_area.set_required_version(3, 3);
         gl_area.set_has_depth_buffer(false);
         // Render only when explicitly requested via queue_render(); this avoids
@@ -111,17 +117,46 @@ impl MapArea {
             zoom_animating: false,
         }));
 
-        // realize: create the GL renderer
+        // realize: create the GL renderer.
+        //
+        // GTK invokes this signal from C; any Rust panic crossing the FFI
+        // boundary aborts the process via `panic_cannot_unwind`. Catch panics
+        // (e.g. shader-compile failures, missing GL entry points) and surface
+        // them via `GLArea::set_error` so the user sees the GTK error widget
+        // instead of a hard crash.
         gl_area.connect_realize(clone!(#[strong] renderer, move |area| {
-            area.make_current();
-            if let Some(err) = area.error() {
-                eprintln!("GLArea: context error on realize: {err}");
-                return;
-            }
-            let gl = unsafe {
-                glow::Context::from_loader_function_cstr(|s| gl_proc_addr(s))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                area.make_current();
+                if let Some(err) = area.error() {
+                    return Err(format!("GLArea context error: {err}"));
+                }
+                let gl = unsafe {
+                    glow::Context::from_loader_function_cstr(|s| gl_proc_addr(s))
+                };
+                *renderer.borrow_mut() = Some(unsafe { GlRenderer::new(gl) });
+                Ok(())
+            }));
+
+            let message = match result {
+                Ok(Ok(())) => return,
+                Ok(Err(msg)) => msg,
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_owned()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_owned()
+                    };
+                    format!("GL renderer initialisation panicked: {msg}")
+                }
             };
-            *renderer.borrow_mut() = Some(unsafe { GlRenderer::new(gl) });
+
+            eprintln!("rgis: {message}");
+            area.set_error(Some(&glib::Error::new(
+                gtk4::gio::IOErrorEnum::Failed,
+                &message,
+            )));
         }));
 
         // unrealize: drop renderer
