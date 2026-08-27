@@ -1,0 +1,14 @@
+[build]
+target = "index.html"
+dist = "dist"
+# GitHub Pages serves project sites from https://<user>.github.io/<repo>/,
+# so assets need to be referenced with that base path. This is overridden to
+# "/" for local `trunk serve`.
+public_url = "/rgis/"
+
+[watch]
+watch = ["src", "assets", "index.html"]
+
+[serve]
+address = "127.0.0.1"
+port = 8080
