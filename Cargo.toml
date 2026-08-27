@@ -35,7 +35,7 @@ geo-types   = { version = "0.7", features = ["serde"] }
 geo         = "0.33"
 geozero     = { version = "0.15", features = ["with-geo"] }
 geojson     = "1"
-shapefile   = "0.8"
+shapefile   = "0.9"
 flatgeobuf  = { version = "6", default-features = false }
 proj4rs     = "0.1"
 
@@ -44,20 +44,20 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
 # Error handling
-thiserror   = "1"
+thiserror   = "2"
 anyhow      = "1"
 image       = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lru         = "0.12"
-directories = "5"
+lru         = "0.18"
+directories = "6"
 
 # UI / rendering
-eframe      = { version = "0.35.0", features = ["persistence"] }
-egui        = "0.35.0"
-wgpu        = "=29.0.4"
+eframe      = { version = "0.36.1", features = ["persistence"] }
+egui        = "0.36.1"
+wgpu        = "=30.0.1"
 lyon        = "1.0.19"
 bytemuck    = { version = "1.25.2", features = ["derive"] }
 ehttp       = "0.7.1"
-rfd         = "0.15"
+rfd         = "0.17"
 poll-promise = "0.3"
 
 [profile.dev]
