@@ -8,11 +8,11 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Application, AsyncApp, Bounds, ClickEvent, Context, Hsla, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
-    Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, black, canvas, div,
-    prelude::*, px, rgb, size,
+    AnyElement, App, Application, AsyncApp, Bounds, ClickEvent, Context, FontWeight,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
+    SharedString, Styled, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, canvas,
+    div, prelude::*, px, rgb, size,
 };
 use image::Frame;
 use rgis_core::{Layer, LayerId, Project, Viewport, mercator_to_lonlat};
@@ -23,6 +23,21 @@ use rgis_tiles::{
 
 const APP_ID: &str = "rs.rgis.app";
 const SIDEBAR_WIDTH: f32 = 280.0;
+const HEADER_HEIGHT: f32 = 40.0;
+const STATUS_BAR_HEIGHT: f32 = 28.0;
+
+// A small, Zed-inspired dark palette kept consistent across the header,
+// sidebar, map, and status bar so the UI reads as one coherent surface set.
+const COLOR_APP_BG: u32 = 0x1b1c1e;
+const COLOR_SURFACE: u32 = 0x212225;
+const COLOR_SURFACE_HOVER: u32 = 0x2b2d31;
+const COLOR_MAP_BG: u32 = 0x191a1c;
+const COLOR_BORDER: u32 = 0x35363a;
+const COLOR_TEXT: u32 = 0xd7d8dc;
+const COLOR_TEXT_MUTED: u32 = 0x8b8d92;
+const COLOR_ACCENT: u32 = 0x5b9bf8;
+const COLOR_DANGER_BG: u32 = 0x3a2226;
+const COLOR_DANGER_TEXT: u32 = 0xe06c75;
 
 #[derive(Default)]
 struct DragState {
@@ -359,15 +374,17 @@ impl RgisApp {
             .items_center()
             .justify_between()
             .gap_2()
-            .px_2()
-            .py_1()
+            .px_3()
+            .py(px(6.0))
             .border_b_1()
-            .border_color(rgb(0x26303c))
+            .border_color(rgb(COLOR_BORDER))
+            .hover(|style| style.bg(rgb(COLOR_SURFACE_HOVER)))
             .child(
                 div()
                     .flex_1()
                     .id(SharedString::from(format!("layer-toggle-{}", id.0)))
                     .cursor_pointer()
+                    .text_sm()
                     .child(label)
                     .on_click(cx.listener(move |this, event, window, cx| {
                         this.toggle_layer(id, event, window, cx);
@@ -377,7 +394,8 @@ impl RgisApp {
                 div()
                     .id(SharedString::from(format!("layer-remove-{}", id.0)))
                     .cursor_pointer()
-                    .text_color(Hsla::red())
+                    .text_color(rgb(COLOR_DANGER_TEXT))
+                    .text_sm()
                     .child("✕")
                     .on_click(cx.listener(move |this, event, window, cx| {
                         this.remove_layer(id, event, window, cx);
@@ -400,11 +418,13 @@ impl RgisApp {
                 .flex()
                 .id("toggle-osm")
                 .items_center()
-                .px_2()
-                .py_1()
+                .px_3()
+                .py(px(6.0))
                 .border_b_1()
-                .border_color(rgb(0x26303c))
+                .border_color(rgb(COLOR_BORDER))
+                .text_sm()
                 .cursor_pointer()
+                .hover(|style| style.bg(rgb(COLOR_SURFACE_HOVER)))
                 .child(format!(
                     "{} OSM Background",
                     checkbox_label(self.project.show_tiles)
@@ -420,33 +440,18 @@ impl RgisApp {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x161d26))
+            .bg(rgb(COLOR_SURFACE))
             .overflow_hidden()
-            .text_color(rgb(0xf4f7fb))
+            .text_color(rgb(COLOR_TEXT))
             .border_r_1()
-            .border_color(rgb(0x26303c))
+            .border_color(rgb(COLOR_BORDER))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
                     .px_3()
                     .py_2()
-                    .bg(rgb(0x1d2631))
-                    .child("Layers")
-                    .child(
-                        div()
-                            .id("add-layer")
-                            .cursor_pointer()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(0x2f80ed))
-                            .child("Add Layer…")
-                            .on_click(cx.listener(|this, event, window, cx| {
-                                this.prompt_for_layer_paths(event, window, cx);
-                            })),
-                    ),
+                    .text_xs()
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child("LAYERS"),
             )
             .child(
                 div()
@@ -462,13 +467,61 @@ impl RgisApp {
                     .m_2()
                     .p_2()
                     .rounded_sm()
-                    .bg(rgb(0x4a1f24))
+                    .bg(rgb(COLOR_DANGER_BG))
+                    .text_color(rgb(COLOR_DANGER_TEXT))
                     .text_sm()
                     .child(error.clone()),
             );
         }
 
         sidebar
+    }
+
+    fn render_header_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(HEADER_HEIGHT))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .bg(rgb(COLOR_SURFACE))
+            .border_b_1()
+            .border_color(rgb(COLOR_BORDER))
+            .text_color(rgb(COLOR_TEXT))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("rgis"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(COLOR_TEXT_MUTED))
+                            .child(format!("{} layers", self.project.layers.len())),
+                    ),
+            )
+            .child(
+                div()
+                    .id("add-layer")
+                    .cursor_pointer()
+                    .px(px(10.0))
+                    .py_1()
+                    .rounded_sm()
+                    .text_sm()
+                    .bg(rgb(COLOR_ACCENT))
+                    .hover(|style| style.opacity(0.9))
+                    .child("Add Layer…")
+                    .on_click(cx.listener(|this, event, window, cx| {
+                        this.prompt_for_layer_paths(event, window, cx);
+                    })),
+            )
     }
 
     fn render_status_bar(&self) -> impl IntoElement {
@@ -478,15 +531,18 @@ impl RgisApp {
             .unwrap_or_else(|| "—".to_string());
         let scale = status_bar::format_scale(self.prepared_viewport().resolution());
         div()
-            .h(px(36.0))
+            .h(px(STATUS_BAR_HEIGHT))
             .w_full()
             .flex()
             .items_center()
             .justify_between()
             .px_3()
-            .bg(rgb(0x14181d))
-            .text_color(rgb(0xd8dee9))
-            .text_sm()
+            .gap_3()
+            .bg(rgb(COLOR_SURFACE))
+            .border_t_1()
+            .border_color(rgb(COLOR_BORDER))
+            .text_color(rgb(COLOR_TEXT_MUTED))
+            .text_xs()
             .child(div().child(coords))
             .child(div().child(scale))
             .child(div().child("EPSG:4326"))
@@ -494,14 +550,8 @@ impl RgisApp {
 
     fn render_map(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let map_bounds = Rc::clone(&self.map_bounds);
-        let viewport = self.prepared_viewport();
-        let map_origin = {
-            let bounds = self.map_bounds.borrow();
-            [f32::from(bounds.origin.x), f32::from(bounds.origin.y)]
-        };
-        let layer_paths =
-            build_project_paths_with_offset(&self.project.layers, &viewport, map_origin)
-                .unwrap_or_default();
+        let base_viewport = self.project.viewport.clone();
+        let project_layers = self.project.layers.clone();
         let tile_fetcher = Arc::clone(&self.tile_fetcher);
         let tile_images = self.tile_images.clone();
         let pending_tiles = Rc::clone(&self.pending_tiles);
@@ -510,11 +560,25 @@ impl RgisApp {
         div()
             .flex_1()
             .h_full()
-            .bg(rgb(0x222b34))
+            .overflow_hidden()
+            .bg(rgb(COLOR_MAP_BG))
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
+                        // Always derive the viewport used for this frame's tessellation
+                        // and tile layout from the freshly-measured bounds, rather than a
+                        // value cached from the previous frame. This prevents a frame of
+                        // lag (visible as jank) when the map area is resized.
                         *map_bounds.borrow_mut() = bounds;
+                        let mut viewport = base_viewport.clone();
+                        viewport.width_px = f32::from(bounds.size.width).max(1.0).round() as u32;
+                        viewport.height_px = f32::from(bounds.size.height).max(1.0).round() as u32;
+
+                        let map_origin = [f32::from(bounds.origin.x), f32::from(bounds.origin.y)];
+                        let layer_paths =
+                            build_project_paths_with_offset(&project_layers, &viewport, map_origin)
+                                .unwrap_or_default();
+
                         let mut tiles = Vec::new();
                         let mut requested = Vec::new();
                         if show_tiles {
@@ -537,28 +601,33 @@ impl RgisApp {
                                 }
                             }
                         }
-                        (tiles, requested)
+                        (tiles, requested, layer_paths)
                     },
-                    move |bounds, (tiles, requested), window, _cx| {
+                    move |bounds, (tiles, requested, layer_paths), window, _cx| {
                         for coord in requested {
                             tile_fetcher.request(coord);
                         }
 
-                        window.paint_quad(gpui::fill(bounds, rgb(0x222b34)));
+                        // Clip all custom painting (tiles + vector layers) to the map
+                        // canvas's own bounds so nothing bleeds into the sidebar,
+                        // header, or status bar when panning/zooming.
+                        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                            window.paint_quad(gpui::fill(bounds, rgb(COLOR_MAP_BG)));
 
-                        for (image, bounds) in &tiles {
-                            let _ = window.paint_image(
-                                *bounds,
-                                Default::default(),
-                                Arc::clone(image),
-                                0,
-                                false,
-                            );
-                        }
+                            for (image, bounds) in &tiles {
+                                let _ = window.paint_image(
+                                    *bounds,
+                                    Default::default(),
+                                    Arc::clone(image),
+                                    0,
+                                    false,
+                                );
+                            }
 
-                        for layer in &layer_paths {
-                            paint_layer_paths(window, layer);
-                        }
+                            for layer in &layer_paths {
+                                paint_layer_paths(window, layer);
+                            }
+                        });
                     },
                 )
                 .size_full(),
@@ -586,11 +655,13 @@ impl Render for RgisApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(black())
+            .bg(rgb(COLOR_APP_BG))
+            .child(self.render_header_bar(cx))
             .child(
                 div()
                     .flex_1()
                     .flex()
+                    .overflow_hidden()
                     .child(self.render_sidebar(cx))
                     .child(self.render_map(window, cx)),
             )
