@@ -44,15 +44,8 @@ image       = { version = "0.25", default-features = false, features = ["png", "
 lru         = "0.12"
 directories = "5"
 
-# Rendering
-glow        = "0.14"
-lyon_tessellation = "1"
-
-# GTK / Adwaita
-gtk4        = { version = "0.11", features = ["v4_14"] }
-libadwaita  = { version = "0.9", features = ["v1_5"] }
-glib        = "0.22"
-gio         = "0.22"
+# UI / rendering
+gpui        = { version = "0.2" }
 
 [profile.dev]
 opt-level = 1

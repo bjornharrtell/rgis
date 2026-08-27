@@ -1,21 +1,19 @@
 # rgis
 
-A GIS desktop application written in Rust, built on GTK4 / libadwaita with OpenGL-based rendering.
+A Rust GIS desktop application built on [gpui](https://crates.io/crates/gpui) for both UI and rendering.
 
 ## Features
 
 - Read GeoJSON, Shapefile, and FlatGeobuf data
-- OpenGL rendering via `glow` and `lyon_tessellation`
-- Raster tile background layers
-- Coordinate reproduction via `proj4rs`
+- Render vector layers as gpui paths (fills, strokes, point markers)
+- Show OpenStreetMap raster tiles behind vector data
+- Keep map state in Web Mercator while reporting cursor coordinates in WGS-84
 
 ## Building on Ubuntu
 
-Tested on Ubuntu 24.04. Earlier versions need GTK4 ≥ 4.14 and libadwaita ≥ 1.5 from a backport or PPA.
-
-### 1. Install a Rust toolchain
-
 The pinned toolchain is declared in [rust-toolchain.toml](rust-toolchain.toml) and will be installed automatically by `rustup` on first build.
+
+### 1. Install Rust
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -23,34 +21,28 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### 2. Install system dependencies
 
+`gpui` on Linux needs Wayland/Vulkan/font/text/input libraries. This workspace also uses image loading, HTTP tile fetching, and local disk cache storage.
+
 ```sh
 sudo apt update
 sudo apt install \
     build-essential \
     pkg-config \
-    libgtk-4-dev \
-    libadwaita-1-dev \
-    libglib2.0-dev \
-    libgdk-pixbuf-2.0-dev \
-    libgraphene-1.0-dev \
-    libcairo2-dev \
-    libpango1.0-dev \
-    libepoxy-dev \
-    libgl1-mesa-dev \
-    libegl1-mesa-dev
+    libwayland-dev \
+    libxkbcommon-dev \
+    libxkbcommon-x11-dev \
+    libfontconfig1-dev \
+    libfreetype6-dev \
+    libvulkan-dev \
+    libxcb1-dev \
+    libxcb-xkb-dev \
+    libxrandr-dev \
+    libxi-dev \
+    libx11-dev \
+    libasound2-dev
 ```
 
-The GTK4 / libadwaita stack pulls in everything needed for `gtk4-sys`, `libadwaita-sys`, `gdk4-sys`, `gsk4-sys`, `graphene-sys`, `gio-sys`, `glib-sys`, and `gobject-sys`.
-
-OpenGL is used directly by `rgis-render` via [`glow`](https://crates.io/crates/glow). At runtime we resolve GL entry points with `dlsym(RTLD_DEFAULT, ...)` after promoting `libGL.so.1` and `libEGL.so.1` to the global symbol scope, so both must be installed and loadable:
-
-- `libepoxy-dev` — required by GTK4's `GtkGLArea`.
-- `libgl1-mesa-dev` — provides `libGL.so.1` (X11 / GLX backends).
-- `libegl1-mesa-dev` — provides `libEGL.so.1` (Wayland / EGL backends).
-
-On hardware with proprietary drivers (NVIDIA, AMDGPU PRO) the vendor packages provide equivalent `libGL.so.1` / `libEGL.so.1` and the Mesa `-dev` packages can be omitted.
-
-`reqwest` is configured with `rustls-tls`, so no system OpenSSL (`libssl-dev`) is required.
+`reqwest` is configured with `rustls-tls`, so OpenSSL development headers are not required for the current dependency set.
 
 ### 3. Build and run
 
@@ -58,7 +50,7 @@ On hardware with proprietary drivers (NVIDIA, AMDGPU PRO) the vendor packages pr
 cargo run --release
 ```
 
-For a faster iteration cycle during development:
+For a faster edit/build cycle:
 
 ```sh
 cargo run
@@ -68,11 +60,17 @@ cargo run
 
 | Crate | Purpose |
 | --- | --- |
-| [crates/rgis-app](crates/rgis-app) | GTK4 / libadwaita application shell and `rgis` binary |
-| [crates/rgis-core](crates/rgis-core) | Shared types and core abstractions |
+| [crates/rgis-app](crates/rgis-app) | gpui application shell and `rgis` binary |
+| [crates/rgis-core](crates/rgis-core) | Core GIS types, styling, projection helpers, project/viewport state |
 | [crates/rgis-io](crates/rgis-io) | GeoJSON / Shapefile / FlatGeobuf readers |
-| [crates/rgis-render](crates/rgis-render) | OpenGL rendering backend |
+| [crates/rgis-render](crates/rgis-render) | gpui-based map rendering helpers that build screen-space `Path<Pixels>` values |
 | [crates/rgis-tiles](crates/rgis-tiles) | Raster tile fetching and caching |
+
+## Architecture notes
+
+- `rgis-core`, `rgis-io`, and `rgis-tiles` stay backend-agnostic.
+- `rgis-render` converts `rgis-core::Layer` geometry into gpui `PathBuilder` output each frame in screen space.
+- `rgis-app` owns the gpui window, sidebar, status bar, tile image cache, and pan/zoom interactions.
 
 ## License
 

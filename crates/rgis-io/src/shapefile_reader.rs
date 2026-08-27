@@ -14,8 +14,8 @@ pub fn load_shapefile(path: &Path) -> Result<LoadedLayer, IoError> {
         .unwrap_or("layer")
         .to_owned();
 
-    let mut reader = shapefile::Reader::from_path(path)
-        .map_err(|e| IoError::Shapefile(e.to_string()))?;
+    let mut reader =
+        shapefile::Reader::from_path(path).map_err(|e| IoError::Shapefile(e.to_string()))?;
 
     let mut features = Vec::new();
 
@@ -42,12 +42,12 @@ pub fn load_shapefile(path: &Path) -> Result<LoadedLayer, IoError> {
 fn field_value_to_json(v: FieldValue) -> Value {
     match v {
         FieldValue::Character(Some(s)) => Value::String(s),
-        FieldValue::Numeric(Some(n)) => {
-            serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null)
-        }
-        FieldValue::Float(Some(f)) => {
-            serde_json::Number::from_f64(f as f64).map(Value::Number).unwrap_or(Value::Null)
-        }
+        FieldValue::Numeric(Some(n)) => serde_json::Number::from_f64(n)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        FieldValue::Float(Some(f)) => serde_json::Number::from_f64(f as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         FieldValue::Integer(n) => Value::Number(n.into()),
         FieldValue::Logical(Some(b)) => Value::Bool(b),
         _ => Value::Null,

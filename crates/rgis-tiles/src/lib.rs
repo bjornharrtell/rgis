@@ -1,7 +1,4 @@
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use async_channel::{Receiver, Sender};
 use directories::ProjectDirs;
@@ -50,7 +47,10 @@ pub struct OsmTileSource;
 impl TileSource for OsmTileSource {
     fn url(&self, c: TileCoord) -> String {
         let sub = b"abc"[(c.x as usize + c.y as usize) % 3] as char;
-        format!("https://{sub}.tile.openstreetmap.org/{}/{}/{}.png", c.z, c.x, c.y)
+        format!(
+            "https://{sub}.tile.openstreetmap.org/{}/{}/{}.png",
+            c.z, c.x, c.y
+        )
     }
     fn attribution(&self) -> &str {
         "\u{00A9} OpenStreetMap contributors"
@@ -178,13 +178,19 @@ impl TileFetcher {
             }
 
             let url = source.url(coord);
-            let Ok(resp) = client.get(&url).send().await else { return };
+            let Ok(resp) = client.get(&url).send().await else {
+                return;
+            };
             if !resp.status().is_success() {
                 return;
             }
-            let Ok(bytes) = resp.bytes().await else { return };
+            let Ok(bytes) = resp.bytes().await else {
+                return;
+            };
 
-            let Ok(img) = image::load_from_memory(&bytes) else { return };
+            let Ok(img) = image::load_from_memory(&bytes) else {
+                return;
+            };
             let rgba = img.to_rgba8();
 
             write_disk(coord, &bytes).await;
@@ -197,7 +203,7 @@ impl TileFetcher {
 
 // ── Viewport -> visible tile coords ──────────────────────────────────────────
 
-use rgis_core::{Viewport, EARTH_HALF_CIRC};
+use rgis_core::{EARTH_HALF_CIRC, Viewport};
 
 pub fn visible_tiles(viewport: &Viewport, source: &dyn TileSource) -> Vec<TileCoord> {
     let z = (viewport.zoom.floor() as u8).min(source.max_zoom());
@@ -240,8 +246,14 @@ pub fn tile_screen_rect(coord: TileCoord, viewport: &Viewport) -> [f32; 4] {
     let mx = coord.x as f64 * tile_merc_size - EARTH_HALF_CIRC;
     let my = EARTH_HALF_CIRC - (coord.y + 1) as f64 * tile_merc_size;
 
-    let [sx0, sy0] = viewport.world_to_screen(geo_types::Coord { x: mx, y: my + tile_merc_size });
-    let [sx1, sy1] = viewport.world_to_screen(geo_types::Coord { x: mx + tile_merc_size, y: my });
+    let [sx0, sy0] = viewport.world_to_screen(geo_types::Coord {
+        x: mx,
+        y: my + tile_merc_size,
+    });
+    let [sx1, sy1] = viewport.world_to_screen(geo_types::Coord {
+        x: mx + tile_merc_size,
+        y: my,
+    });
 
     [sx0, sy0, sx1 - sx0, sy1 - sy0]
 }
