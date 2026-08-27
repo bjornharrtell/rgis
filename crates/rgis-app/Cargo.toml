@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "rgis_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rgis"
 path = "src/main.rs"
@@ -14,6 +18,16 @@ rgis-io     = { path = "../rgis-io" }
 rgis-render = { path = "../rgis-render" }
 rgis-tiles  = { path = "../rgis-tiles" }
 
-gpui        = { workspace = true }
-tokio       = { workspace = true }
+eframe      = { workspace = true }
+egui        = { workspace = true }
+egui-wgpu   = "0.35.0"
+wgpu        = { workspace = true }
 image       = { workspace = true }
+rfd         = { workspace = true }
+poll-promise = { workspace = true }
+
+# Native file loading uses Promise::spawn_thread (blocking IO on a background
+# std::thread, needs no extra feature). The browser can't spawn OS threads, so
+# wasm uses Promise::spawn_local backed by wasm-bindgen-futures instead.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+poll-promise = { workspace = true, features = ["web"] }

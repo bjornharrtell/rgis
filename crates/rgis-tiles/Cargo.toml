@@ -7,10 +7,12 @@ license.workspace = true
 [dependencies]
 rgis-core   = { path = "../rgis-core" }
 geo-types   = { workspace = true }
-tokio       = { workspace = true }
 async-channel = { workspace = true }
-reqwest     = { workspace = true }
 image       = { workspace = true }
 lru         = { workspace = true }
-directories = { workspace = true }
 thiserror   = { workspace = true }
+ehttp = { workspace = true }
+
+# Disk tile cache is native-only; the browser has no filesystem to cache to.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+directories = { workspace = true }

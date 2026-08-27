@@ -8,6 +8,16 @@ members = [
     "crates/rgis-tiles",
     "crates/rgis-web",
 ]
+# rgis-web only compiles for wasm32 (built via `trunk`, not `cargo`), so it's
+# excluded here: plain `cargo run`/`build`/`test` (no `-p`/`--workspace`) target
+# just the native desktop app.
+default-members = [
+    "crates/rgis-app",
+    "crates/rgis-core",
+    "crates/rgis-io",
+    "crates/rgis-render",
+    "crates/rgis-tiles",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,7 +28,6 @@ repository = "https://github.com/yourname/rgis"
 
 [workspace.dependencies]
 # Async runtime
-tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }
 async-channel = "2"
 
 # Geo / data
@@ -37,15 +46,19 @@ serde_json  = "1"
 # Error handling
 thiserror   = "1"
 anyhow      = "1"
-
-# Tiles / networking
-reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 image       = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 lru         = "0.12"
 directories = "5"
 
 # UI / rendering
-gpui        = { version = "0.2" }
+eframe      = { version = "0.35.0", features = ["persistence"] }
+egui        = "0.35.0"
+wgpu        = "=29.0.4"
+lyon        = "1.0.19"
+bytemuck    = { version = "1.25.2", features = ["derive"] }
+ehttp       = "0.7.1"
+rfd         = "0.15"
+poll-promise = "0.3"
 
 [profile.dev]
 opt-level = 1

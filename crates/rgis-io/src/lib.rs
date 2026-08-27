@@ -30,42 +30,45 @@ pub struct LoadedLayer {
     pub features: Vec<Feature>,
 }
 
-/// Load a layer from any supported file path, dispatching on file extension.
-pub async fn load(path: impl AsRef<std::path::Path>) -> Result<LoadedLayer, IoError> {
-    let path = path.as_ref().to_owned();
+/// Load a layer from a file path, dispatching on file extension. Native-only:
+/// shapefiles need their `.shx`/`.dbf` sibling files, which only a real
+/// filesystem path (not in-memory bytes) can resolve.
+pub fn load_path(path: impl AsRef<std::path::Path>) -> Result<LoadedLayer, IoError> {
+    let path = path.as_ref();
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    match ext.as_str() {
-        "geojson" | "json" => tokio::task::spawn_blocking(move || {
-            load_geojson(&path).map(|mut l| {
-                l.features = reproject_features(l.features);
-                l
-            })
-        })
-        .await
-        .unwrap(),
-        "shp" => tokio::task::spawn_blocking(move || {
-            load_shapefile(&path).map(|mut l| {
-                l.features = reproject_features(l.features);
-                l
-            })
-        })
-        .await
-        .unwrap(),
-        "fgb" => tokio::task::spawn_blocking(move || {
-            load_flatgeobuf(&path).map(|mut l| {
-                l.features = reproject_features(l.features);
-                l
-            })
-        })
-        .await
-        .unwrap(),
-        other => Err(IoError::UnsupportedFormat(other.to_owned())),
-    }
+    let mut loaded = match ext.as_str() {
+        "geojson" | "json" => load_geojson(path)?,
+        "shp" => load_shapefile(path)?,
+        "fgb" => load_flatgeobuf(path)?,
+        other => return Err(IoError::UnsupportedFormat(other.to_owned())),
+    };
+    loaded.features = reproject_features(loaded.features);
+    Ok(loaded)
+}
+
+/// Load a layer from an in-memory byte buffer, dispatching on the file name's
+/// extension. Works on both native and wasm32 (e.g. bytes handed back by a
+/// browser file picker). Shapefiles are not supported here since they need
+/// sibling `.shx`/`.dbf` files; use [`load_path`] on native for those.
+pub fn load_bytes(name: &str, bytes: &[u8]) -> Result<LoadedLayer, IoError> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let mut loaded = match ext.as_str() {
+        "geojson" | "json" => geojson_reader::load_geojson_bytes(name, bytes)?,
+        "fgb" => flatgeobuf_reader::load_flatgeobuf_bytes(name, bytes)?,
+        other => return Err(IoError::UnsupportedFormat(other.to_owned())),
+    };
+    loaded.features = reproject_features(loaded.features);
+    Ok(loaded)
 }
 
 /// Reproject all feature geometries from WGS-84 (lon/lat degrees) to
