@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rgis-core         = { path = "../rgis-core" }
+rgis-tiles        = { path = "../rgis-tiles" }
 geo-types         = { workspace = true }
 image             = { workspace = true }
 wgpu              = { workspace = true }

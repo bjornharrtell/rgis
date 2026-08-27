@@ -8,7 +8,8 @@ use std::sync::Arc;
 use poll_promise::Promise;
 use rgis_core::{Layer, LayerId, Project, mercator_to_lonlat};
 use rgis_io::{IoError, LoadedLayer};
-use rgis_tiles::{OsmTileSource, TileCoord, TileFetcher, tile_screen_rect, visible_tiles};
+use rgis_render::{SceneMesh, TileMesh};
+use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
 mod status_bar;
 
@@ -28,8 +29,12 @@ type LoadResults = Vec<(String, Result<LoadedLayer, IoError>)>;
 
 pub struct RgisApp {
     project: Project,
-    tile_fetcher: Arc<TileFetcher>,
-    tile_images: HashMap<TileCoord, Arc<image::RgbaImage>>,
+    vector_tile_fetcher: Arc<VectorTileFetcher>,
+    /// Tessellated mesh per tile, in tile-local metres (viewport-independent
+    /// — see `rgis_render::build_tile_mesh`) — built once per tile and
+    /// reused across every pan/zoom, unlike the final screen-space mesh
+    /// which is cheap to recompute every frame from these.
+    tile_meshes: HashMap<TileCoord, Arc<TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
     pending_loads: Vec<Promise<LoadResults>>,
     cursor_lonlat: Option<(f64, f64)>,
@@ -49,8 +54,8 @@ impl RgisApp {
 
         Self {
             project: Project::default(),
-            tile_fetcher: Arc::new(TileFetcher::new(OsmTileSource)),
-            tile_images: HashMap::new(),
+            vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
+            tile_meshes: HashMap::new(),
             pending_tiles: std::collections::HashSet::new(),
             pending_loads: Vec::new(),
             cursor_lonlat: None,
@@ -177,10 +182,29 @@ impl RgisApp {
     }
 
     fn drain_ready_tiles(&mut self) {
-        while let Ok(ready) = self.tile_fetcher.receiver.try_recv() {
+        while let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() {
             self.pending_tiles.remove(&ready.coord);
-            self.tile_images.insert(ready.coord, ready.image);
+            let mesh = rgis_render::build_tile_mesh(&ready.tile, ready.coord);
+            self.tile_meshes.insert(ready.coord, Arc::new(mesh));
         }
+    }
+
+    /// Walks up from `coord` to find the closest already-cached ancestor
+    /// tile, used as a placeholder (drawn scaled up to cover the same area)
+    /// while the actual tile is still loading, so zooming in shows the old
+    /// detail enlarged instead of a blank gap.
+    fn nearest_cached_ancestor(&self, coord: TileCoord) -> Option<TileCoord> {
+        let (mut z, mut x, mut y) = (coord.z, coord.x, coord.y);
+        while z > 0 {
+            z -= 1;
+            x /= 2;
+            y /= 2;
+            let ancestor = TileCoord { z, x, y };
+            if self.tile_meshes.contains_key(&ancestor) {
+                return Some(ancestor);
+            }
+        }
+        None
     }
 
     /// The root "LAYERS" tree entry: click to expand/collapse, hover to
@@ -256,7 +280,7 @@ impl RgisApp {
                             }
                         }
 
-                        tree_row(ui, &mut show_tiles, "OSM Background", false);
+                        tree_row(ui, &mut show_tiles, "OpenFreeMap Background", false);
                     }
                 });
 
@@ -327,28 +351,67 @@ impl RgisApp {
                     mercator_to_lonlat(world.x, world.y)
                 });
 
-                let mesh =
-                    rgis_render::build_scene_mesh(&self.project.layers, &self.project.viewport);
-
-                let mut tiles = Vec::new();
+                let mut mesh = SceneMesh::default();
+                let mut background_index_count = 0;
+                let mut basemap_tiles = Vec::new();
                 if self.project.show_tiles {
-                    for coord in visible_tiles(&self.project.viewport, &OsmTileSource) {
-                        if let Some(image) = self.tile_images.get(&coord) {
-                            let rect = tile_screen_rect(coord, &self.project.viewport);
-                            tiles.push(rgis_render::TileDraw {
-                                key: tile_cache_key(coord),
-                                rect,
-                                rgba: Arc::clone(image),
+                    let mut current_draws = Vec::new();
+                    let mut fallback_coords = std::collections::HashSet::new();
+                    for coord in
+                        visible_tiles_for_zoom(&self.project.viewport, OPENFREEMAP_MAX_ZOOM)
+                    {
+                        if let Some(tile_mesh) = self.tile_meshes.get(&coord) {
+                            let transform =
+                                rgis_render::tile_screen_transform(coord, &self.project.viewport);
+                            current_draws.push(rgis_render::BasemapTileDraw {
+                                coord,
+                                mesh: Arc::clone(tile_mesh),
+                                offset: transform.offset,
+                                scale: transform.scale,
+                                width_scale: transform.width_scale,
+                                size: transform.size,
                             });
-                        } else if self.pending_tiles.insert(coord) {
-                            self.tile_fetcher.request(coord);
+                        } else {
+                            if self.pending_tiles.insert(coord) {
+                                self.vector_tile_fetcher.request(coord);
+                            }
+                            if let Some(ancestor) = self.nearest_cached_ancestor(coord) {
+                                fallback_coords.insert(ancestor);
+                            }
                         }
                     }
+                    // Draw already-cached lower-zoom tiles first (scaled up
+                    // to cover the same area) so still-loading tiles don't
+                    // leave a blank gap; matching current-zoom tiles then
+                    // draw on top once they arrive.
+                    for coord in fallback_coords {
+                        if let Some(tile_mesh) = self.tile_meshes.get(&coord) {
+                            let transform =
+                                rgis_render::tile_screen_transform(coord, &self.project.viewport);
+                            basemap_tiles.push(rgis_render::BasemapTileDraw {
+                                coord,
+                                mesh: Arc::clone(tile_mesh),
+                                offset: transform.offset,
+                                scale: transform.scale,
+                                width_scale: transform.width_scale,
+                                size: transform.size,
+                            });
+                        }
+                    }
+                    basemap_tiles.extend(current_draws);
+                    mesh = rgis_render::build_background_mesh(&self.project.viewport);
+                    background_index_count = mesh.indices.len() as u32;
                 }
+                mesh.extend(rgis_render::build_scene_mesh(
+                    &self.project.layers,
+                    &self.project.viewport,
+                ));
 
                 let callback = rgis_render::MapCallback {
                     mesh,
-                    tiles,
+                    background_index_count,
+                    basemap_tiles,
+                    tiles: Vec::new(),
                     width: rect.width(),
                     height: rect.height(),
                 };
@@ -375,13 +438,6 @@ impl eframe::App for RgisApp {
     }
 }
 
-fn tile_cache_key(coord: TileCoord) -> u64 {
-    ((coord.z as u64) << 56) | ((coord.x as u64) << 28) | (coord.y as u64)
-}
-
-/// A single indented tree row (checkbox + label), with a remove action that
-/// only appears while the row is hovered — mirrors VS Code's explorer pane.
-/// Returns `(toggled, remove_clicked)`.
 fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool) -> (bool, bool) {
     let row_height = ui.spacing().interact_size.y + ROW_VPAD * 2.0;
     let rect = egui::Rect::from_min_size(
