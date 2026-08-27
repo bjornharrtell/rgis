@@ -36,6 +36,13 @@ pub struct RgisApp {
     /// which is cheap to recompute every frame from these.
     tile_meshes: HashMap<TileCoord, Arc<TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
+    /// Tessellation jobs in flight: a decoded tile arriving from
+    /// `vector_tile_fetcher` is tessellated on a background thread (native)
+    /// / spawned task (wasm) rather than inline in `drain_ready_tiles`,
+    /// since tessellating a complex tile can take long enough to visibly
+    /// stall input handling (e.g. zoom-wheel events) if done synchronously
+    /// in the UI update loop.
+    pending_tile_meshes: Vec<Promise<(TileCoord, TileMesh)>>,
     pending_loads: Vec<Promise<LoadResults>>,
     cursor_lonlat: Option<(f64, f64)>,
     last_error: Option<String>,
@@ -57,6 +64,7 @@ impl RgisApp {
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
             tile_meshes: HashMap::new(),
             pending_tiles: std::collections::HashSet::new(),
+            pending_tile_meshes: Vec::new(),
             pending_loads: Vec::new(),
             cursor_lonlat: None,
             last_error: None,
@@ -183,10 +191,32 @@ impl RgisApp {
 
     fn drain_ready_tiles(&mut self) {
         while let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() {
-            self.pending_tiles.remove(&ready.coord);
-            let mesh = rgis_render::build_tile_mesh(&ready.tile, ready.coord);
-            self.tile_meshes.insert(ready.coord, Arc::new(mesh));
+            let coord = ready.coord;
+            let tile = ready.tile;
+            #[cfg(not(target_arch = "wasm32"))]
+            let promise = Promise::spawn_thread("tessellate-tile", move || {
+                (coord, rgis_render::build_tile_mesh(&tile, coord))
+            });
+            #[cfg(target_arch = "wasm32")]
+            let promise =
+                Promise::spawn_local(
+                    async move { (coord, rgis_render::build_tile_mesh(&tile, coord)) },
+                );
+            self.pending_tile_meshes.push(promise);
         }
+
+        let pending = std::mem::take(&mut self.pending_tile_meshes);
+        let mut still_pending = Vec::new();
+        for promise in pending {
+            match promise.try_take() {
+                Ok((coord, mesh)) => {
+                    self.pending_tiles.remove(&coord);
+                    self.tile_meshes.insert(coord, Arc::new(mesh));
+                }
+                Err(promise) => still_pending.push(promise),
+            }
+        }
+        self.pending_tile_meshes = still_pending;
     }
 
     /// Walks up from `coord` to find the closest already-cached ancestor
