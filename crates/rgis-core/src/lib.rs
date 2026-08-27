@@ -339,11 +339,22 @@ mod tests {
             width_px: 800,
             height_px: 600,
         };
-        let world = Coord { x: 100_000.0, y: -50_000.0 };
+        let world = Coord {
+            x: 100_000.0,
+            y: -50_000.0,
+        };
         let screen = vp.world_to_screen(world);
         let back = vp.screen_to_world(screen);
-        assert!((world.x - back.x).abs() < 1.0, "x round-trip: delta={}", (world.x - back.x).abs());
-        assert!((world.y - back.y).abs() < 1.0, "y round-trip: delta={}", (world.y - back.y).abs());
+        assert!(
+            (world.x - back.x).abs() < 1.0,
+            "x round-trip: delta={}",
+            (world.x - back.x).abs()
+        );
+        assert!(
+            (world.y - back.y).abs() < 1.0,
+            "y round-trip: delta={}",
+            (world.y - back.y).abs()
+        );
     }
 
     #[test]

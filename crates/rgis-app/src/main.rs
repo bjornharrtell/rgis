@@ -17,7 +17,9 @@ use gpui::{
 use image::Frame;
 use rgis_core::{Layer, LayerId, Project, Viewport, mercator_to_lonlat};
 use rgis_render::{LayerPaths, build_project_paths_with_offset};
-use rgis_tiles::{OsmTileSource, TileCoord, TileFetcher, TileReady, tile_screen_rect, visible_tiles};
+use rgis_tiles::{
+    OsmTileSource, TileCoord, TileFetcher, TileReady, tile_screen_rect, visible_tiles,
+};
 
 const APP_ID: &str = "rs.rgis.app";
 const SIDEBAR_WIDTH: f32 = 280.0;
@@ -40,11 +42,7 @@ struct RgisApp {
 }
 
 impl RgisApp {
-    fn new(
-        startup_paths: Vec<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn new(startup_paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         window.set_window_title("rgis");
 
         let tile_fetcher = Arc::new(TileFetcher::new(OsmTileSource));
@@ -147,13 +145,20 @@ impl RgisApp {
                 self.last_error = Some(format!("Failed to load {}: {error}", display_name(&path)));
             }
             Err(error) => {
-                self.last_error =
-                    Some(format!("Layer load task failed for {}: {error}", display_name(&path)));
+                self.last_error = Some(format!(
+                    "Layer load task failed for {}: {error}",
+                    display_name(&path)
+                ));
             }
         }
     }
 
-    fn prompt_for_layer_paths(&mut self, _event: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn prompt_for_layer_paths(
+        &mut self,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -195,14 +200,26 @@ impl RgisApp {
         cx.notify();
     }
 
-    fn toggle_layer(&mut self, id: LayerId, _event: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_layer(
+        &mut self,
+        id: LayerId,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(layer) = self.project.get_layer_mut(id) {
             layer.visible = !layer.visible;
             cx.notify();
         }
     }
 
-    fn remove_layer(&mut self, id: LayerId, _event: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn remove_layer(
+        &mut self,
+        id: LayerId,
+        _event: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.project.remove_layer(id);
         cx.notify();
     }
@@ -224,7 +241,12 @@ impl RgisApp {
         }
     }
 
-    fn on_map_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_map_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.drag.active = false;
         self.drag.last_position = None;
         cx.notify();
@@ -249,12 +271,10 @@ impl RgisApp {
         if self.drag.active && event.dragging() {
             self.sync_viewport_dimensions();
             if let Some(previous) = self.drag.last_position.replace(local) {
-                self.project
-                    .viewport
-                    .pan(
-                        f32::from(local.x) - f32::from(previous.x),
-                        f32::from(local.y) - f32::from(previous.y),
-                    );
+                self.project.viewport.pan(
+                    f32::from(local.x) - f32::from(previous.x),
+                    f32::from(local.y) - f32::from(previous.y),
+                );
             }
         } else {
             self.drag.last_position = Some(local);
@@ -284,10 +304,9 @@ impl RgisApp {
         self.sync_viewport_dimensions();
         let local = self.window_to_map(event.position);
         let zoom_delta = if delta_y < 0.0 { 0.25 } else { -0.25 };
-        self.project.viewport.zoom_toward(
-            [f32::from(local.x), f32::from(local.y)],
-            zoom_delta,
-        );
+        self.project
+            .viewport
+            .zoom_toward([f32::from(local.x), f32::from(local.y)], zoom_delta);
         self.update_cursor(event.position);
         cx.notify();
     }
@@ -325,7 +344,10 @@ impl RgisApp {
 
         self.sync_viewport_dimensions();
         let local = self.window_to_map(window_position);
-        let world = self.project.viewport.screen_to_world([f32::from(local.x), f32::from(local.y)]);
+        let world = self
+            .project
+            .viewport
+            .screen_to_world([f32::from(local.x), f32::from(local.y)]);
         self.cursor_lonlat = Some(mercator_to_lonlat(world.x, world.y));
     }
 
@@ -383,7 +405,10 @@ impl RgisApp {
                 .border_b_1()
                 .border_color(rgb(0x26303c))
                 .cursor_pointer()
-                .child(format!("{} OSM Background", checkbox_label(self.project.show_tiles)))
+                .child(format!(
+                    "{} OSM Background",
+                    checkbox_label(self.project.show_tiles)
+                ))
                 .on_click(cx.listener(|this, event, window, cx| {
                     this.toggle_tiles(event, window, cx);
                 }))
@@ -423,7 +448,13 @@ impl RgisApp {
                             })),
                     ),
             )
-            .child(div().flex_1().id("layer-list").overflow_y_scroll().children(rows));
+            .child(
+                div()
+                    .flex_1()
+                    .id("layer-list")
+                    .overflow_y_scroll()
+                    .children(rows),
+            );
 
         if let Some(error) = &self.last_error {
             sidebar = sidebar.child(

@@ -1,5 +1,8 @@
 use anyhow::Error as PathError;
-use geo_types::{Coord, Geometry, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Triangle};
+use geo_types::{
+    Coord, Geometry, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
+    Triangle,
+};
 use gpui::{Hsla, Path, PathBuilder, Pixels, Point as GpuiPoint, Rgba, point, px};
 use rgis_core::{Feature, Layer, LayerId, Viewport};
 use thiserror::Error;
@@ -18,7 +21,10 @@ pub struct LayerPaths {
     pub points: Vec<(Path<Pixels>, Hsla)>,
 }
 
-pub fn build_project_paths(layers: &[Layer], viewport: &Viewport) -> Result<Vec<LayerPaths>, RenderError> {
+pub fn build_project_paths(
+    layers: &[Layer],
+    viewport: &Viewport,
+) -> Result<Vec<LayerPaths>, RenderError> {
     build_project_paths_with_offset(layers, viewport, [0.0, 0.0])
 }
 
@@ -70,7 +76,11 @@ pub fn build_layer_paths_with_offset(
     Ok(LayerPaths {
         layer_id: layer.id,
         fills: build_path_vec(has_fill, fill_builder, color_to_hsla(layer.style.fill))?,
-        strokes: build_path_vec(has_stroke, stroke_builder, color_to_hsla(layer.style.stroke))?,
+        strokes: build_path_vec(
+            has_stroke,
+            stroke_builder,
+            color_to_hsla(layer.style.stroke),
+        )?,
         points: build_path_vec(has_points, point_builder, color_to_hsla(layer.style.fill))?,
     })
 }
@@ -106,7 +116,13 @@ impl PathCollector<'_> {
     fn append_geometry(&mut self, geometry: &Geometry) {
         match geometry {
             Geometry::Point(point) => {
-                append_point_circle(point, self.viewport, self.point_builder, self.point_radius, self.offset);
+                append_point_circle(
+                    point,
+                    self.viewport,
+                    self.point_builder,
+                    self.point_radius,
+                    self.offset,
+                );
                 *self.has_points = true;
             }
             Geometry::MultiPoint(points) => {
@@ -124,33 +140,59 @@ impl PathCollector<'_> {
                 *self.has_stroke = true;
             }
             Geometry::LineString(line_string) => {
-                *self.has_stroke |=
-                    append_linestring(line_string, self.viewport, self.stroke_builder, false, self.offset);
+                *self.has_stroke |= append_linestring(
+                    line_string,
+                    self.viewport,
+                    self.stroke_builder,
+                    false,
+                    self.offset,
+                );
             }
             Geometry::MultiLineString(lines) => {
-                *self.has_stroke |= append_multilinestring(lines, self.viewport, self.stroke_builder, self.offset);
+                *self.has_stroke |=
+                    append_multilinestring(lines, self.viewport, self.stroke_builder, self.offset);
             }
             Geometry::Polygon(polygon) => {
-                *self.has_fill |= append_polygon_fill(polygon, self.viewport, self.fill_builder, self.offset);
+                *self.has_fill |=
+                    append_polygon_fill(polygon, self.viewport, self.fill_builder, self.offset);
                 *self.has_stroke |=
                     append_polygon_stroke(polygon, self.viewport, self.stroke_builder, self.offset);
             }
             Geometry::MultiPolygon(polygons) => {
-                *self.has_fill |= append_multipolygon_fill(polygons, self.viewport, self.fill_builder, self.offset);
-                *self.has_stroke |=
-                    append_multipolygon_stroke(polygons, self.viewport, self.stroke_builder, self.offset);
+                *self.has_fill |= append_multipolygon_fill(
+                    polygons,
+                    self.viewport,
+                    self.fill_builder,
+                    self.offset,
+                );
+                *self.has_stroke |= append_multipolygon_stroke(
+                    polygons,
+                    self.viewport,
+                    self.stroke_builder,
+                    self.offset,
+                );
             }
             Geometry::Rect(rect) => {
                 let polygon = Polygon::from(*rect);
-                *self.has_fill |= append_polygon_fill(&polygon, self.viewport, self.fill_builder, self.offset);
-                *self.has_stroke |=
-                    append_polygon_stroke(&polygon, self.viewport, self.stroke_builder, self.offset);
+                *self.has_fill |=
+                    append_polygon_fill(&polygon, self.viewport, self.fill_builder, self.offset);
+                *self.has_stroke |= append_polygon_stroke(
+                    &polygon,
+                    self.viewport,
+                    self.stroke_builder,
+                    self.offset,
+                );
             }
             Geometry::Triangle(triangle) => {
                 let polygon = triangle_to_polygon(*triangle);
-                *self.has_fill |= append_polygon_fill(&polygon, self.viewport, self.fill_builder, self.offset);
-                *self.has_stroke |=
-                    append_polygon_stroke(&polygon, self.viewport, self.stroke_builder, self.offset);
+                *self.has_fill |=
+                    append_polygon_fill(&polygon, self.viewport, self.fill_builder, self.offset);
+                *self.has_stroke |= append_polygon_stroke(
+                    &polygon,
+                    self.viewport,
+                    self.stroke_builder,
+                    self.offset,
+                );
             }
             Geometry::GeometryCollection(collection) => {
                 for geometry in &collection.0 {
@@ -357,9 +399,18 @@ mod tests {
             LayerId(1),
             "mixed",
             vec![
-                Feature { geometry: Geometry::Polygon(polygon), properties: serde_json::Value::Null },
-                Feature { geometry: Geometry::LineString(line), properties: serde_json::Value::Null },
-                Feature { geometry: Geometry::MultiPoint(points), properties: serde_json::Value::Null },
+                Feature {
+                    geometry: Geometry::Polygon(polygon),
+                    properties: serde_json::Value::Null,
+                },
+                Feature {
+                    geometry: Geometry::LineString(line),
+                    properties: serde_json::Value::Null,
+                },
+                Feature {
+                    geometry: Geometry::MultiPoint(points),
+                    properties: serde_json::Value::Null,
+                },
             ],
         );
 
@@ -384,13 +435,19 @@ mod tests {
         let mut hidden = Layer::new(
             LayerId(2),
             "hidden",
-            vec![Feature { geometry: Geometry::Polygon(polygon.clone()), properties: serde_json::Value::Null }],
+            vec![Feature {
+                geometry: Geometry::Polygon(polygon.clone()),
+                properties: serde_json::Value::Null,
+            }],
         );
         hidden.visible = false;
         let mut visible = Layer::new(
             LayerId(3),
             "visible",
-            vec![Feature { geometry: Geometry::Polygon(polygon), properties: serde_json::Value::Null }],
+            vec![Feature {
+                geometry: Geometry::Polygon(polygon),
+                properties: serde_json::Value::Null,
+            }],
         );
         visible.z_order = 1;
 

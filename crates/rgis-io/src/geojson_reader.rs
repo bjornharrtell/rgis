@@ -43,10 +43,7 @@ pub fn load_geojson(path: &Path) -> Result<LoadedLayer, IoError> {
         let geo_geom: geo_types::Geometry = (&geom_raw)
             .try_into()
             .map_err(|e: geojson::Error| IoError::GeoJson(e.to_string()))?;
-        let properties = f
-            .properties
-            .map(Value::Object)
-            .unwrap_or(Value::Null);
+        let properties = f.properties.map(Value::Object).unwrap_or(Value::Null);
         features.push(Feature {
             geometry: geo_geom,
             properties,
