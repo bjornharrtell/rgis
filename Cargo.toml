@@ -29,7 +29,6 @@ geojson     = "1"
 shapefile   = "0.8"
 flatgeobuf  = { version = "6", default-features = false }
 proj4rs     = "0.1"
-rstar       = "0.12"
 
 # Serialisation
 serde       = { version = "1", features = ["derive"] }

@@ -4842,7 +4842,6 @@ name = "rgis-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "geo",
  "geo-types",
  "gpui",
  "rgis-core",
