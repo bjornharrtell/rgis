@@ -37,7 +37,7 @@ geozero     = { version = "0.15", features = ["with-geo"] }
 geojson     = "1"
 shapefile   = "0.9"
 flatgeobuf  = { version = "6", default-features = false }
-proj4rs     = "0.1"
+proj4rs     = { version = "0.1", features = ["crs-definitions", "geo-types"] }
 
 # Serialisation
 serde       = { version = "1", features = ["derive"] }

@@ -36,7 +36,11 @@ pub fn load_shapefile(path: &Path) -> Result<LoadedLayer, IoError> {
         });
     }
 
-    Ok(LoadedLayer { name, features })
+    Ok(LoadedLayer {
+        name,
+        features,
+        epsg: None,
+    })
 }
 
 fn field_value_to_json(v: FieldValue) -> Value {

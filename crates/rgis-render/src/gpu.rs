@@ -330,16 +330,8 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             return;
         };
 
-        if let (Some(vertex_buffer), Some(index_buffer)) =
-            (&frame.vertex_buffer, &frame.index_buffer)
-        {
-            render_pass.set_pipeline(&resources.vector_pipeline);
-            render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..frame.index_count, 0, 0..1);
-        }
-
+        // OSM tiles are the map background, so draw them first; the vector
+        // mesh is drawn on top so layers stay visible above the basemap.
         if let Some(tile_vertex_buffer) = &frame.tile_vertex_buffer {
             render_pass.set_pipeline(&resources.tile_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
@@ -352,6 +344,16 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     render_pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
                 }
             }
+        }
+
+        if let (Some(vertex_buffer), Some(index_buffer)) =
+            (&frame.vertex_buffer, &frame.index_buffer)
+        {
+            render_pass.set_pipeline(&resources.vector_pipeline);
+            render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..frame.index_count, 0, 0..1);
         }
     }
 }

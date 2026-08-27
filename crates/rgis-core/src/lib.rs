@@ -207,6 +207,18 @@ pub fn mercator_to_lonlat(x: f64, y: f64) -> (f64, f64) {
     (lon, lat)
 }
 
+/// Reproject a geometry from an arbitrary EPSG CRS directly to EPSG:3857
+/// (Web Mercator) metres, matching the projection used by [`lonlat_to_mercator`].
+pub fn reproject_geometry_to_mercator(
+    epsg_code: u16,
+    mut geometry: Geometry,
+) -> Result<Geometry, String> {
+    let from = proj4rs::Proj::from_epsg_code(epsg_code).map_err(|e| e.to_string())?;
+    let to = proj4rs::Proj::from_epsg_code(3857).map_err(|e| e.to_string())?;
+    proj4rs::transform::transform(&from, &to, &mut geometry).map_err(|e| e.to_string())?;
+    Ok(geometry)
+}
+
 // ── Feature ───────────────────────────────────────────────────────────────────
 
 /// A single geographic feature with optional attribute properties.
@@ -318,6 +330,24 @@ mod tests {
         let (lon2, lat2) = mercator_to_lonlat(merc.x, merc.y);
         assert!((lon - lon2).abs() < 1e-8, "lon round-trip: {lon} vs {lon2}");
         assert!((lat - lat2).abs() < 1e-8, "lat round-trip: {lat} vs {lat2}");
+    }
+
+    #[test]
+    fn reproject_utm32n_to_mercator() {
+        // A point in Aalborg, Denmark, in EPSG:25832 (UTM zone 32N).
+        let geom = reproject_geometry_to_mercator(
+            25832,
+            Geometry::Point(geo_types::Point::new(569290.0, 6287398.8)),
+        )
+        .unwrap();
+        let Geometry::Point(p) = geom else {
+            panic!("expected point")
+        };
+        assert!(p.x().is_finite() && p.y().is_finite());
+        let (lon, lat) = mercator_to_lonlat(p.x(), p.y());
+        // Expected roughly 10.13 lon, 56.73 lat (near Randers, Denmark).
+        assert!((lon - 10.13).abs() < 0.1, "lon: {lon}");
+        assert!((lat - 56.73).abs() < 0.1, "lat: {lat}");
     }
 
     #[test]

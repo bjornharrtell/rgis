@@ -56,5 +56,9 @@ fn read_flatgeobuf(
         });
     }
 
-    Ok(LoadedLayer { name, features })
+    Ok(LoadedLayer {
+        name,
+        features,
+        epsg: None,
+    })
 }

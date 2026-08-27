@@ -30,6 +30,8 @@ fn parse_geojson(name: String, raw: &str) -> Result<LoadedLayer, IoError> {
         .parse::<geojson::GeoJson>()
         .map_err(|e| IoError::GeoJson(e.to_string()))?;
 
+    let epsg = extract_epsg(&fc)?;
+
     let collection = match fc {
         geojson::GeoJson::FeatureCollection(fc) => fc,
         geojson::GeoJson::Feature(f) => geojson::FeatureCollection {
@@ -63,5 +65,39 @@ fn parse_geojson(name: String, raw: &str) -> Result<LoadedLayer, IoError> {
         });
     }
 
-    Ok(LoadedLayer { name, features })
+    Ok(LoadedLayer {
+        name,
+        features,
+        epsg,
+    })
+}
+
+/// GeoJSON coordinates are WGS-84 (lon/lat degrees) per RFC 7946, but the
+/// deprecated top-level `crs` member is still produced by some tools (e.g.
+/// exports in a projected CRS such as EPSG:25832). Extract the EPSG code so
+/// the caller can reproject properly instead of treating those coordinates
+/// as if they were already lon/lat, which previously crashed the tessellator.
+fn extract_epsg(gj: &geojson::GeoJson) -> Result<Option<u16>, IoError> {
+    let foreign_members = match gj {
+        geojson::GeoJson::FeatureCollection(fc) => fc.foreign_members.as_ref(),
+        geojson::GeoJson::Feature(f) => f.foreign_members.as_ref(),
+        geojson::GeoJson::Geometry(g) => g.foreign_members.as_ref(),
+    };
+    let Some(crs_name) = foreign_members
+        .and_then(|m| m.get("crs"))
+        .and_then(|crs| crs.get("properties"))
+        .and_then(|props| props.get("name"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    if crs_name.contains("CRS84") || crs_name.contains("4326") {
+        return Ok(None);
+    }
+    let code = crs_name
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| IoError::GeoJson(format!("unrecognized CRS \"{crs_name}\"")))?;
+    Ok(Some(code))
 }
