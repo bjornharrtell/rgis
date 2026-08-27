@@ -14,16 +14,6 @@ rgis-io     = { path = "../rgis-io" }
 rgis-render = { path = "../rgis-render" }
 rgis-tiles  = { path = "../rgis-tiles" }
 
-gtk4        = { workspace = true }
-libadwaita  = { workspace = true }
-glib        = { workspace = true }
-gio         = { workspace = true }
-glow        = { workspace = true }
+gpui        = { workspace = true }
 tokio       = { workspace = true }
-async-channel = { workspace = true }
-thiserror   = { workspace = true }
-anyhow      = { workspace = true }
-libc        = "0.2"
-
-[build-dependencies]
-pkg-config  = "0.3"
+image       = { workspace = true }
