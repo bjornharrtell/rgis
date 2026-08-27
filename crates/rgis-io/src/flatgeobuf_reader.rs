@@ -17,7 +17,24 @@ pub fn load_flatgeobuf(path: &Path) -> Result<LoadedLayer, IoError> {
 
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
-    let mut fgb = FgbReader::open(&mut reader)
+    read_flatgeobuf(name, &mut reader)
+}
+
+pub fn load_flatgeobuf_bytes(name: &str, bytes: &[u8]) -> Result<LoadedLayer, IoError> {
+    let name = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("layer")
+        .to_owned();
+    let mut reader = std::io::Cursor::new(bytes);
+    read_flatgeobuf(name, &mut reader)
+}
+
+fn read_flatgeobuf(
+    name: String,
+    reader: &mut (impl std::io::Read + std::io::Seek),
+) -> Result<LoadedLayer, IoError> {
+    let mut fgb = FgbReader::open(reader)
         .map_err(|e| IoError::FlatGeobuf(e.to_string()))?
         .select_all()
         .map_err(|e| IoError::FlatGeobuf(e.to_string()))?;

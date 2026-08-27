@@ -11,8 +11,21 @@ pub fn load_geojson(path: &Path) -> Result<LoadedLayer, IoError> {
         .and_then(|s| s.to_str())
         .unwrap_or("layer")
         .to_owned();
-
     let raw = std::fs::read_to_string(path)?;
+    parse_geojson(name, &raw)
+}
+
+pub fn load_geojson_bytes(name: &str, bytes: &[u8]) -> Result<LoadedLayer, IoError> {
+    let name = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("layer")
+        .to_owned();
+    let raw = std::str::from_utf8(bytes).map_err(|e| IoError::GeoJson(e.to_string()))?;
+    parse_geojson(name, raw)
+}
+
+fn parse_geojson(name: String, raw: &str) -> Result<LoadedLayer, IoError> {
     let fc: geojson::GeoJson = raw
         .parse::<geojson::GeoJson>()
         .map_err(|e| IoError::GeoJson(e.to_string()))?;

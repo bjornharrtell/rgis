@@ -7,7 +7,14 @@ license.workspace = true
 [dependencies]
 rgis-core         = { path = "../rgis-core" }
 geo-types         = { workspace = true }
-gpui              = { workspace = true }
-anyhow            = { workspace = true }
-serde_json        = { workspace = true }
-thiserror         = { workspace = true }
+image             = { workspace = true }
+wgpu              = { workspace = true }
+egui-wgpu         = "0.35.0"
+epaint            = "0.35.0"
+lyon              = { workspace = true }
+bytemuck          = { workspace = true }
+
+# WebGL2 is a fallback for browsers without WebGPU support (Safari, older
+# Firefox); native builds only need Vulkan/Metal/DX12 (already default).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["webgl"] }

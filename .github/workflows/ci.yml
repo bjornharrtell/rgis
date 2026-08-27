@@ -11,8 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Skip generating full debug info for CI builds; this isn't used for
-  # debugging in CI and noticeably speeds up compilation/linking for the
-  # large gpui-based dependency tree.
+  # debugging in CI and noticeably speeds up compilation/linking.
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
@@ -57,10 +56,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # rgis-web only compiles for wasm32 (it's checked/built by the
+        # build-wasm job below), so it's excluded from this native job.
+        run: cargo clippy --workspace --exclude rgis-web --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude rgis-web
 
   build-wasm:
     name: Build (wasm32 / browser)

@@ -1,11 +1,9 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::{Arc, Mutex};
 
 use async_channel::{Receiver, Sender};
-use directories::ProjectDirs;
 use image::RgbaImage;
 use lru::LruCache;
 use thiserror::Error;
-use tokio::sync::Mutex;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -24,7 +22,7 @@ pub struct Tile {
 #[derive(Debug, Error)]
 pub enum TileError {
     #[error("network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(String),
     #[error("image decode error: {0}")]
     Image(#[from] image::ImageError),
     #[error("io error: {0}")]
@@ -60,33 +58,53 @@ impl TileSource for OsmTileSource {
     }
 }
 
-// ── Disk cache helpers ────────────────────────────────────────────────────────
+// ── Disk cache helpers (native only; the browser has no filesystem) ─────────
 
-fn cache_dir() -> Option<PathBuf> {
-    ProjectDirs::from("rs", "", "rgis").map(|d| d.cache_dir().join("tiles"))
-}
+#[cfg(not(target_arch = "wasm32"))]
+mod disk_cache {
+    use super::TileCoord;
+    use directories::ProjectDirs;
+    use image::RgbaImage;
+    use std::path::PathBuf;
 
-fn disk_path(coord: TileCoord) -> Option<PathBuf> {
-    cache_dir().map(|d| {
-        d.join(coord.z.to_string())
-            .join(coord.x.to_string())
-            .join(format!("{}.png", coord.y))
-    })
-}
-
-async fn read_disk(coord: TileCoord) -> Option<RgbaImage> {
-    let path = disk_path(coord)?;
-    let bytes = tokio::fs::read(&path).await.ok()?;
-    image::load_from_memory(&bytes).ok().map(|i| i.to_rgba8())
-}
-
-async fn write_disk(coord: TileCoord, bytes: &[u8]) {
-    if let Some(path) = disk_path(coord) {
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        let _ = tokio::fs::write(&path, bytes).await;
+    fn cache_dir() -> Option<PathBuf> {
+        ProjectDirs::from("rs", "", "rgis").map(|d| d.cache_dir().join("tiles"))
     }
+
+    fn disk_path(coord: TileCoord) -> Option<PathBuf> {
+        cache_dir().map(|d| {
+            d.join(coord.z.to_string())
+                .join(coord.x.to_string())
+                .join(format!("{}.png", coord.y))
+        })
+    }
+
+    pub fn read(coord: TileCoord) -> Option<RgbaImage> {
+        let path = disk_path(coord)?;
+        let bytes = std::fs::read(&path).ok()?;
+        image::load_from_memory(&bytes).ok().map(|i| i.to_rgba8())
+    }
+
+    pub fn write(coord: TileCoord, bytes: &[u8]) {
+        if let Some(path) = disk_path(coord) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, bytes);
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod disk_cache {
+    use super::TileCoord;
+    use image::RgbaImage;
+
+    pub fn read(_coord: TileCoord) -> Option<RgbaImage> {
+        None
+    }
+
+    pub fn write(_coord: TileCoord, _bytes: &[u8]) {}
 }
 
 // ── TileCache (in-memory LRU) ─────────────────────────────────────────────────
@@ -133,22 +151,16 @@ pub struct TileFetcher {
     source: Arc<dyn TileSource>,
     sender: Sender<TileReady>,
     pub receiver: Receiver<TileReady>,
-    client: reqwest::Client,
 }
 
 impl TileFetcher {
     pub fn new(source: impl TileSource) -> Self {
         let (sender, receiver) = async_channel::bounded(256);
-        let client = reqwest::Client::builder()
-            .user_agent("rgis/0.1 (https://github.com/yourname/rgis)")
-            .build()
-            .expect("failed to build reqwest client");
         Self {
             cache: Arc::new(Mutex::new(TileCache::new())),
             source: Arc::new(source),
             sender,
             receiver,
-            client,
         }
     }
 
@@ -156,47 +168,39 @@ impl TileFetcher {
         self.source.attribution()
     }
 
+    /// Request a tile. Delivery is asynchronous: the result (if any) shows up
+    /// on `self.receiver`. Works identically on native (background thread,
+    /// via `ehttp`'s `ureq` backend) and wasm32 (browser `fetch`).
     pub fn request(&self, coord: TileCoord) {
+        if let Some(img) = self.cache.lock().unwrap().get(coord) {
+            let _ = self.sender.try_send(TileReady { coord, image: img });
+            return;
+        }
+
+        if let Some(img) = disk_cache::read(coord) {
+            let arc = self.cache.lock().unwrap().insert(coord, img);
+            let _ = self.sender.try_send(TileReady { coord, image: arc });
+            return;
+        }
+
         let cache = Arc::clone(&self.cache);
-        let source = Arc::clone(&self.source);
         let sender = self.sender.clone();
-        let client = self.client.clone();
+        let request = ehttp::Request::get(self.source.url(coord));
 
-        tokio::spawn(async move {
-            {
-                let mut c = cache.lock().await;
-                if let Some(img) = c.get(coord) {
-                    let _ = sender.send(TileReady { coord, image: img }).await;
-                    return;
-                }
-            }
-
-            if let Some(img) = read_disk(coord).await {
-                let arc = cache.lock().await.insert(coord, img);
-                let _ = sender.send(TileReady { coord, image: arc }).await;
+        ehttp::fetch(request, move |result: ehttp::Result<ehttp::Response>| {
+            let Ok(response) = result else { return };
+            if !response.ok {
                 return;
             }
-
-            let url = source.url(coord);
-            let Ok(resp) = client.get(&url).send().await else {
-                return;
-            };
-            if !resp.status().is_success() {
-                return;
-            }
-            let Ok(bytes) = resp.bytes().await else {
-                return;
-            };
-
-            let Ok(img) = image::load_from_memory(&bytes) else {
+            let Ok(img) = image::load_from_memory(&response.bytes) else {
                 return;
             };
             let rgba = img.to_rgba8();
 
-            write_disk(coord, &bytes).await;
+            disk_cache::write(coord, &response.bytes);
 
-            let arc = cache.lock().await.insert(coord, rgba);
-            let _ = sender.send(TileReady { coord, image: arc }).await;
+            let arc = cache.lock().unwrap().insert(coord, rgba);
+            let _ = sender.try_send(TileReady { coord, image: arc });
         });
     }
 }
