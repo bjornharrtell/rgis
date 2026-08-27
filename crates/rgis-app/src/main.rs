@@ -694,7 +694,7 @@ fn paint_layer_paths(window: &mut Window, layer: &LayerPaths) {
 
 fn rgba_to_render_image(image: &Arc<image::RgbaImage>) -> Arc<RenderImage> {
     let mut buffer = image.as_ref().clone();
-    for pixel in buffer.chunks_exact_mut(4) {
+    for pixel in buffer.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
