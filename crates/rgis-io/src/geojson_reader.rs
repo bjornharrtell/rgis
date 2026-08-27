@@ -65,7 +65,11 @@ fn parse_geojson(name: String, raw: &str) -> Result<LoadedLayer, IoError> {
         });
     }
 
-    Ok(LoadedLayer { name, features, epsg })
+    Ok(LoadedLayer {
+        name,
+        features,
+        epsg,
+    })
 }
 
 /// GeoJSON coordinates are WGS-84 (lon/lat degrees) per RFC 7946, but the
@@ -94,8 +98,6 @@ fn extract_epsg(gj: &geojson::GeoJson) -> Result<Option<u16>, IoError> {
         .rsplit(':')
         .next()
         .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| {
-            IoError::GeoJson(format!("unrecognized CRS \"{crs_name}\""))
-        })?;
+        .ok_or_else(|| IoError::GeoJson(format!("unrecognized CRS \"{crs_name}\"")))?;
     Ok(Some(code))
 }

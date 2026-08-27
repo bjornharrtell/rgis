@@ -209,7 +209,10 @@ pub fn mercator_to_lonlat(x: f64, y: f64) -> (f64, f64) {
 
 /// Reproject a geometry from an arbitrary EPSG CRS directly to EPSG:3857
 /// (Web Mercator) metres, matching the projection used by [`lonlat_to_mercator`].
-pub fn reproject_geometry_to_mercator(epsg_code: u16, mut geometry: Geometry) -> Result<Geometry, String> {
+pub fn reproject_geometry_to_mercator(
+    epsg_code: u16,
+    mut geometry: Geometry,
+) -> Result<Geometry, String> {
     let from = proj4rs::Proj::from_epsg_code(epsg_code).map_err(|e| e.to_string())?;
     let to = proj4rs::Proj::from_epsg_code(3857).map_err(|e| e.to_string())?;
     proj4rs::transform::transform(&from, &to, &mut geometry).map_err(|e| e.to_string())?;

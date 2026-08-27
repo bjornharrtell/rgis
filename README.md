@@ -97,6 +97,18 @@ publishes to GitHub Pages on every push to `main`.
 - `rgis-render` tessellates `rgis-core::Layer` geometry (via `lyon`) into a `SceneMesh`, then draws it each frame from an `egui-wgpu` `MapCallback` paint callback.
 - `rgis-app` owns the `eframe::App` implementation: the layer panel, status bar, tile image cache, and pan/zoom interactions, shared verbatim between the native binary and the wasm build.
 
+## Development
+
+CI runs `cargo fmt --all -- --check`, so run `cargo fmt --all` before
+committing. To catch this locally, enable the repo's git hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+This runs `cargo fmt --all -- --check` on every commit and rejects it if
+formatting is needed.
+
 ## License
 
 Dual-licensed under either of

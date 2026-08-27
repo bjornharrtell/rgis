@@ -1,0 +1,9 @@
+#!/bin/sh
+# Mirrors the "cargo fmt --check" CI job so formatting issues are caught
+# before they're pushed. Enable with: git config core.hooksPath .githooks
+
+if ! cargo fmt --all -- --check; then
+    echo
+    echo "cargo fmt found unformatted code. Run 'cargo fmt --all' and commit again." >&2
+    exit 1
+fi

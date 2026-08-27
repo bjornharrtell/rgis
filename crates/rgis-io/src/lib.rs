@@ -82,10 +82,7 @@ pub fn load_bytes(name: &str, bytes: &[u8]) -> Result<LoadedLayer, IoError> {
 /// unless a CRS is detected. Out-of-range WGS-84 coordinates (e.g. a
 /// projected CRS mistakenly treated as WGS-84) are rejected rather than
 /// silently reprojected into non-finite mercator values.
-fn reproject_features(
-    features: Vec<Feature>,
-    epsg: Option<u16>,
-) -> Result<Vec<Feature>, IoError> {
+fn reproject_features(features: Vec<Feature>, epsg: Option<u16>) -> Result<Vec<Feature>, IoError> {
     features
         .into_iter()
         .map(|f| {
