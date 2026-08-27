@@ -12,6 +12,11 @@ use rgis_tiles::{OsmTileSource, TileCoord, TileFetcher, tile_screen_rect, visibl
 
 mod status_bar;
 
+/// Extra vertical padding added above/below the sidebar tree row content.
+const ROW_VPAD: f32 = 5.0;
+/// Background fill painted behind a hovered sidebar tree row.
+const ROW_HOVER_FILL: egui::Color32 = egui::Color32::from_gray(40);
+
 /// One or more layers finished (or failed) loading, each tagged with a
 /// display name for error messages.
 type LoadResults = Vec<(String, Result<LoadedLayer, IoError>)>;
@@ -24,6 +29,7 @@ pub struct RgisApp {
     pending_loads: Vec<Promise<LoadResults>>,
     cursor_lonlat: Option<(f64, f64)>,
     last_error: Option<String>,
+    layers_expanded: bool,
 }
 
 impl RgisApp {
@@ -44,6 +50,7 @@ impl RgisApp {
             pending_loads: Vec::new(),
             cursor_lonlat: None,
             last_error: None,
+            layers_expanded: true,
         }
     }
 
@@ -166,55 +173,81 @@ impl RgisApp {
         }
     }
 
-    fn render_header(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("header").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("rgis");
-                ui.label(format!("{} layers", self.project.layers.len()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Add Layer…").clicked() {
-                        self.queue_pick_files();
-                    }
-                });
+    /// The root "LAYERS" tree entry: click to expand/collapse, hover to
+    /// reveal the "add layer" action — mirrors VS Code's explorer pane.
+    fn render_layers_root_row(&mut self, ui: &mut egui::Ui) {
+        let row_height = ui.spacing().interact_size.y + ROW_VPAD * 2.0;
+        let rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), row_height),
+        );
+        // A passive geometric check (not a registered widget) so it doesn't
+        // compete with the add-button's own click hit-testing.
+        let hovered = ui.rect_contains_pointer(rect);
+        if hovered {
+            ui.painter().rect_filled(rect, 2.0, ROW_HOVER_FILL);
+        }
+
+        let mut add_clicked = false;
+        ui.horizontal(|ui| {
+            // Force the row to its full padded height so content is
+            // vertically centered within it (plain `ui.horizontal` only
+            // assumes `interact_size.y` and top-aligns any extra space).
+            ui.set_min_height(row_height);
+            let icon_size = ui.spacing().icon_width.max(10.0);
+            let (icon_rect, icon_response) =
+                ui.allocate_exact_size(egui::vec2(icon_size, icon_size), egui::Sense::click());
+            if icon_response.clicked() {
+                self.layers_expanded = !self.layers_expanded;
+            }
+            let openness = if self.layers_expanded { 1.0 } else { 0.0 };
+            egui::containers::collapsing_header::paint_default_icon(
+                ui,
+                openness,
+                &icon_response.with_new_rect(icon_rect),
+            );
+            ui.label(egui::RichText::new("LAYERS").small().strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
+                if hovered && icon_button(ui, "➕", "Add Layer…").clicked() {
+                    add_clicked = true;
+                }
             });
         });
+
+        if add_clicked {
+            self.queue_pick_files();
+        }
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("sidebar")
             .default_size(280.0)
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("LAYERS").weak().small());
-                ui.separator();
-
                 let mut to_toggle: Option<LayerId> = None;
                 let mut to_remove: Option<LayerId> = None;
+                let mut show_tiles = self.project.show_tiles;
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for layer in self.project.layers.iter().rev() {
-                        ui.horizontal(|ui| {
+                    self.render_layers_root_row(ui);
+
+                    if self.layers_expanded {
+                        tree_row(ui, &mut show_tiles, "OSM Background", false);
+
+                        for layer in self.project.layers.iter().rev() {
                             let mut visible = layer.visible;
-                            if ui.checkbox(&mut visible, &layer.name).changed() {
+                            let (toggled, removed) = tree_row(ui, &mut visible, &layer.name, true);
+                            if toggled {
                                 to_toggle = Some(layer.id);
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("✕").clicked() {
-                                        to_remove = Some(layer.id);
-                                    }
-                                },
-                            );
-                        });
-                    }
-
-                    ui.separator();
-                    let mut show_tiles = self.project.show_tiles;
-                    if ui.checkbox(&mut show_tiles, "OSM Background").changed() {
-                        self.project.show_tiles = show_tiles;
+                            if removed {
+                                to_remove = Some(layer.id);
+                            }
+                        }
                     }
                 });
 
+                self.project.show_tiles = show_tiles;
                 if let Some(id) = to_toggle
                     && let Some(layer) = self.project.get_layer_mut(id)
                 {
@@ -233,16 +266,16 @@ impl RgisApp {
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label("EPSG:4326");
+                ui.separator();
+                ui.label(status_bar::format_scale(self.project.viewport.resolution()));
+                ui.separator();
                 let coords = self
                     .cursor_lonlat
                     .map(|(lon, lat)| status_bar::format_coordinates(lon, lat))
                     .unwrap_or_else(|| "—".to_string());
                 ui.label(coords);
-                ui.separator();
-                ui.label(status_bar::format_scale(self.project.viewport.resolution()));
-                ui.separator();
-                ui.label("EPSG:4326");
             });
         });
     }
@@ -268,7 +301,7 @@ impl RgisApp {
                         && let Some(pos) = response.hover_pos()
                     {
                         let local = pos - rect.min;
-                        let zoom_delta = if scroll > 0.0 { 0.25 } else { -0.25 };
+                        let zoom_delta = if scroll > 0.0 { 0.125 } else { -0.125 };
                         self.project
                             .viewport
                             .zoom_toward([local.x, local.y], zoom_delta);
@@ -317,9 +350,10 @@ impl eframe::App for RgisApp {
         self.poll_pending_loads();
         self.drain_ready_tiles();
 
-        self.render_header(ui);
-        self.render_sidebar(ui);
+        // Bottom panel must be added before the side panel so it spans the
+        // full window width instead of just the area right of the sidebar.
         self.render_status_bar(ui);
+        self.render_sidebar(ui);
         self.render_map(ui);
 
         if !self.pending_loads.is_empty() || !self.pending_tiles.is_empty() {
@@ -330,4 +364,66 @@ impl eframe::App for RgisApp {
 
 fn tile_cache_key(coord: TileCoord) -> u64 {
     ((coord.z as u64) << 56) | ((coord.x as u64) << 28) | (coord.y as u64)
+}
+
+/// A single indented tree row (checkbox + label), with a remove action that
+/// only appears while the row is hovered — mirrors VS Code's explorer pane.
+/// Returns `(toggled, remove_clicked)`.
+fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool) -> (bool, bool) {
+    let row_height = ui.spacing().interact_size.y + ROW_VPAD * 2.0;
+    let rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), row_height),
+    );
+    // A passive geometric check (not a registered widget) so it doesn't
+    // compete with the remove-button's own click hit-testing.
+    let hovered = ui.rect_contains_pointer(rect);
+    if hovered {
+        ui.painter().rect_filled(rect, 2.0, ROW_HOVER_FILL);
+    }
+
+    let mut toggled = false;
+    let mut remove_clicked = false;
+
+    ui.horizontal(|ui| {
+        // Force the row to its full padded height so content is vertically
+        // centered within it (plain `ui.horizontal` only assumes
+        // `interact_size.y` and top-aligns any extra space).
+        ui.set_min_height(row_height);
+        ui.add_space(ui.spacing().indent);
+        if ui.checkbox(checked, label).changed() {
+            toggled = true;
+        }
+        if removable {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
+                if hovered && icon_button(ui, "✕", "Remove layer").clicked() {
+                    remove_clicked = true;
+                }
+            });
+        }
+    });
+
+    (toggled, remove_clicked)
+}
+
+/// A small square icon button with the glyph painted centered in its rect
+/// (avoids off-center glyphs from `Button`'s frame/padding), with a tooltip.
+fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response {
+    let size = ui.spacing().icon_width.max(14.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 3.0, visuals.weak_bg_fill);
+        }
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            egui::TextStyle::Small.resolve(ui.style()),
+            visuals.text_color(),
+        );
+    }
+    response.on_hover_text(tooltip)
 }
