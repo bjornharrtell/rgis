@@ -16,7 +16,11 @@ fn main() {
         native_options,
         Box::new(move |cc| {
             let mut app = rgis_app::RgisApp::new(cc);
-            app.queue_load_paths(startup_paths.clone());
+            if startup_paths.is_empty() {
+                app.queue_load_sample();
+            } else {
+                app.queue_load_paths(startup_paths);
+            }
             Ok(Box::new(app))
         }),
     )

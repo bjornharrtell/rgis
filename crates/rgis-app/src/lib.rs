@@ -12,6 +12,11 @@ use rgis_tiles::{OsmTileSource, TileCoord, TileFetcher, tile_screen_rect, visibl
 
 mod status_bar;
 
+/// A demo dataset (a few simple shapes over Europe) bundled with the binary
+/// so both the native app and the browser build have something to show
+/// without requiring a file picker.
+pub const SAMPLE_GEOJSON: &[u8] = include_bytes!("../assets/sample.geojson");
+
 /// Extra vertical padding added above/below the sidebar tree row content.
 const ROW_VPAD: f32 = 5.0;
 /// Background fill painted behind a hovered sidebar tree row.
@@ -148,6 +153,11 @@ impl RgisApp {
         self.apply_load_result(name, result);
     }
 
+    /// Load the bundled [`SAMPLE_GEOJSON`] demo dataset as a layer.
+    pub fn queue_load_sample(&mut self) {
+        self.queue_load_bytes("sample.geojson".to_string(), SAMPLE_GEOJSON.to_vec());
+    }
+
     fn apply_load_result(&mut self, name: String, result: Result<LoadedLayer, IoError>) {
         match result {
             Ok(loaded) => {
@@ -232,8 +242,9 @@ impl RgisApp {
                     self.render_layers_root_row(ui);
 
                     if self.layers_expanded {
-                        tree_row(ui, &mut show_tiles, "OSM Background", false);
-
+                        // Listed top-to-bottom in draw order (topmost drawn
+                        // layer first), with the OSM basemap last since it's
+                        // always the bottom of the stack.
                         for layer in self.project.layers.iter().rev() {
                             let mut visible = layer.visible;
                             let (toggled, removed) = tree_row(ui, &mut visible, &layer.name, true);
@@ -244,6 +255,8 @@ impl RgisApp {
                                 to_remove = Some(layer.id);
                             }
                         }
+
+                        tree_row(ui, &mut show_tiles, "OSM Background", false);
                     }
                 });
 

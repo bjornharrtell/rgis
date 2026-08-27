@@ -7,10 +7,6 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-/// A demo dataset (world borders, simplified) bundled with the wasm binary so
-/// the map has something to show without requiring a file picker.
-const SAMPLE_GEOJSON: &[u8] = include_bytes!("../assets/sample.geojson");
-
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
@@ -33,7 +29,7 @@ pub fn start() {
                 eframe::WebOptions::default(),
                 Box::new(|cc| {
                     let mut app = rgis_app::RgisApp::new(cc);
-                    app.queue_load_bytes("sample.geojson".to_string(), SAMPLE_GEOJSON.to_vec());
+                    app.queue_load_sample();
                     Ok(Box::new(app))
                 }),
             )
