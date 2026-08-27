@@ -20,7 +20,7 @@ rgis-tiles  = { path = "../rgis-tiles" }
 
 eframe      = { workspace = true }
 egui        = { workspace = true }
-egui-wgpu   = "0.35.0"
+egui-wgpu   = "0.36.1"
 wgpu        = { workspace = true }
 image       = { workspace = true }
 rfd         = { workspace = true }

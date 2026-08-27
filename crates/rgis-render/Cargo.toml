@@ -9,8 +9,8 @@ rgis-core         = { path = "../rgis-core" }
 geo-types         = { workspace = true }
 image             = { workspace = true }
 wgpu              = { workspace = true }
-egui-wgpu         = "0.35.0"
-epaint            = "0.35.0"
+egui-wgpu         = "0.36.1"
+epaint            = "0.36.1"
 lyon              = { workspace = true }
 bytemuck          = { workspace = true }
 
