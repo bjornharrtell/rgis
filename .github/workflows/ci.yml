@@ -10,6 +10,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Skip generating full debug info for CI builds; this isn't used for
+  # debugging in CI and noticeably speeds up compilation/linking for the
+  # large gpui-based dependency tree.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   check:
