@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -41,7 +44,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -58,33 +61,32 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-  build-windows:
-    name: Build (Windows)
-    runs-on: windows-latest
-
-    defaults:
-      run:
-        shell: msys2 {0}
+  build-wasm:
+    name: Build (wasm32 / browser)
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Set up MSYS2 with GTK4 stack
-        uses: msys2/setup-msys2@v2
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-libadwaita
-            mingw-w64-ucrt-x86_64-pkg-config
-            mingw-w64-ucrt-x86_64-rust
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: "latest"
 
       - name: Build
-        run: cargo build --release
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: rgis-windows
-          path: target/release/rgis.exe
+        working-directory: crates/rgis-web
+        run: trunk build --release

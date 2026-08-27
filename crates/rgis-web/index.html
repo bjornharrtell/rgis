@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>rgis (web)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        height: 100%;
+        background: #eef2f5;
+      }
+      #rgis-canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+    </style>
+    <link data-trunk rel="rust" href="Cargo.toml" />
+  </head>
+  <body>
+    <canvas id="rgis-canvas"></canvas>
+  </body>
+</html>

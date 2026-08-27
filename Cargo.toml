@@ -6,6 +6,7 @@ members = [
     "crates/rgis-io",
     "crates/rgis-render",
     "crates/rgis-tiles",
+    "crates/rgis-web",
 ]
 
 [workspace.package]

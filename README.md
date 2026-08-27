@@ -56,6 +56,25 @@ For a faster edit/build cycle:
 cargo run
 ```
 
+## Building for the browser (wasm)
+
+[crates/rgis-web](crates/rgis-web) is a `wasm32-unknown-unknown` build that
+renders GeoJSON on an HTML5 canvas, reusing `rgis-core` for viewport math and
+Web Mercator projection. It supports pan (click-drag) and zoom (scroll wheel).
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+cd crates/rgis-web
+trunk serve
+```
+
+Then open <http://127.0.0.1:8080/rgis/> in a browser.
+
+A `trunk build --release` produces static assets in `crates/rgis-web/dist`
+which are what the [`pages` workflow](.github/workflows/pages.yml)
+publishes to GitHub Pages on every push to `main`.
+
 ## Project layout
 
 | Crate | Purpose |
@@ -65,6 +84,7 @@ cargo run
 | [crates/rgis-io](crates/rgis-io) | GeoJSON / Shapefile / FlatGeobuf readers |
 | [crates/rgis-render](crates/rgis-render) | gpui-based map rendering helpers that build screen-space `Path<Pixels>` values |
 | [crates/rgis-tiles](crates/rgis-tiles) | Raster tile fetching and caching |
+| [crates/rgis-web](crates/rgis-web) | wasm/browser build rendering GeoJSON on an HTML5 canvas |
 
 ## Architecture notes
 
