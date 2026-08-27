@@ -177,8 +177,10 @@ impl RgisApp {
     /// reveal the "add layer" action — mirrors VS Code's explorer pane.
     fn render_layers_root_row(&mut self, ui: &mut egui::Ui) {
         let row_height = ui.spacing().interact_size.y + ROW_VPAD * 2.0;
-        let rect =
-            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), row_height));
+        let rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), row_height),
+        );
         // A passive geometric check (not a registered widget) so it doesn't
         // compete with the add-button's own click hit-testing.
         let hovered = ui.rect_contains_pointer(rect);
@@ -234,8 +236,7 @@ impl RgisApp {
 
                         for layer in self.project.layers.iter().rev() {
                             let mut visible = layer.visible;
-                            let (toggled, removed) =
-                                tree_row(ui, &mut visible, &layer.name, true);
+                            let (toggled, removed) = tree_row(ui, &mut visible, &layer.name, true);
                             if toggled {
                                 to_toggle = Some(layer.id);
                             }
@@ -368,15 +369,12 @@ fn tile_cache_key(coord: TileCoord) -> u64 {
 /// A single indented tree row (checkbox + label), with a remove action that
 /// only appears while the row is hovered — mirrors VS Code's explorer pane.
 /// Returns `(toggled, remove_clicked)`.
-fn tree_row(
-    ui: &mut egui::Ui,
-    checked: &mut bool,
-    label: &str,
-    removable: bool,
-) -> (bool, bool) {
+fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool) -> (bool, bool) {
     let row_height = ui.spacing().interact_size.y + ROW_VPAD * 2.0;
-    let rect =
-        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), row_height));
+    let rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), row_height),
+    );
     // A passive geometric check (not a registered widget) so it doesn't
     // compete with the remove-button's own click hit-testing.
     let hovered = ui.rect_contains_pointer(rect);
