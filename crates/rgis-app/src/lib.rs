@@ -123,6 +123,10 @@ pub struct RgisApp {
     cursor_lonlat: Option<(f64, f64)>,
     last_error: Option<String>,
     layers_expanded: bool,
+    /// Screen-space start position of an in-progress shift-drag
+    /// bounding-box zoom gesture (see `render_map`) -- `None` when no such
+    /// gesture is active, in which case a plain drag pans the map instead.
+    bbox_zoom_start: Option<egui::Pos2>,
     /// e.g. "Vulkan"/"Metal" (native) or "BrowserWebGpu"/"Gl" (web) — shown
     /// in the status bar since the web build silently falls back to WebGL2
     /// (much higher per-draw-call overhead) when WebGPU isn't available.
@@ -153,6 +157,7 @@ impl RgisApp {
             cursor_lonlat: None,
             last_error: None,
             layers_expanded: true,
+            bbox_zoom_start: None,
             gpu_backend_label,
         }
     }
@@ -506,9 +511,45 @@ impl RgisApp {
                 self.project.viewport.width_px = rect.width().max(1.0).round() as u32;
                 self.project.viewport.height_px = rect.height().max(1.0).round() as u32;
 
+                // Shift + left-click-drag draws a bounding box to zoom to,
+                // instead of panning -- the mode is decided once, at drag
+                // start, so releasing shift mid-drag doesn't switch modes.
+                if response.drag_started() && ui.input(|i| i.modifiers.shift) {
+                    self.bbox_zoom_start = response.interact_pointer_pos();
+                }
+
                 if response.dragged() {
-                    let delta = response.drag_delta();
-                    self.project.viewport.pan(delta.x, delta.y);
+                    if self.bbox_zoom_start.is_none() {
+                        let delta = response.drag_delta();
+                        self.project.viewport.pan(delta.x, delta.y);
+                    }
+                } else if response.drag_stopped()
+                    && let Some(start) = self.bbox_zoom_start.take()
+                {
+                    let end = response
+                        .interact_pointer_pos()
+                        .unwrap_or(ui.ctx().pointer_latest_pos().unwrap_or(start));
+                    let min = start.min(end);
+                    let max = start.max(end);
+                    // Ignore near-zero-area boxes (e.g. a shift-click with
+                    // no real drag) rather than zooming to nothing.
+                    if (max.x - min.x) > 4.0 && (max.y - min.y) > 4.0 {
+                        let world_a = self
+                            .project
+                            .viewport
+                            .screen_to_world([min.x - rect.min.x, min.y - rect.min.y]);
+                        let world_b = self
+                            .project
+                            .viewport
+                            .screen_to_world([max.x - rect.min.x, max.y - rect.min.y]);
+                        let bounds = rgis_core::Bounds {
+                            min_x: world_a.x.min(world_b.x),
+                            min_y: world_a.y.min(world_b.y),
+                            max_x: world_a.x.max(world_b.x),
+                            max_y: world_a.y.max(world_b.y),
+                        };
+                        self.project.viewport.fit_bounds(&bounds);
+                    }
                 }
 
                 if response.hovered() {
@@ -605,6 +646,25 @@ impl RgisApp {
                     .add(egui_wgpu::Callback::new_paint_callback(rect, callback));
                 if pending_glyphs {
                     ui.ctx().request_repaint();
+                }
+
+                // Draw the in-progress bbox-zoom selection rectangle, if
+                // any, on top of the map.
+                if let Some(start) = self.bbox_zoom_start
+                    && let Some(current) = response.interact_pointer_pos()
+                {
+                    let drag_rect = egui::Rect::from_two_pos(start, current);
+                    ui.painter().rect_stroke(
+                        drag_rect,
+                        0.0,
+                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        egui::StrokeKind::Outside,
+                    );
+                    ui.painter().rect_filled(
+                        drag_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    );
                 }
             });
     }
