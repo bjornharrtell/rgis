@@ -433,13 +433,15 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
         }
     }
 
+    let labels = extract_labels(tile, coord, tile_size_m, &mut lines);
+
     TileMesh {
         fill: SceneMesh {
             vertices: fill_buffers.vertices,
             indices: fill_buffers.indices,
         },
         lines,
-        labels: extract_labels(tile, coord, tile_size_m),
+        labels,
     }
 }
 
@@ -491,10 +493,41 @@ fn poi_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
 /// priority)`, or `None` to skip the feature.
 type LabelStyleFn = fn(&VectorFeature, f64) -> Option<(f32, i32)>;
 
+/// Constant on-screen radius (device pixels) of the small dot marker drawn
+/// under `place`/`poi` point labels, mirroring the "liberty" style's
+/// `circle_11_black` sprite / POI icon dots (see `marker_style` below).
+const MARKER_RADIUS_PX: f32 = 2.5;
+const MARKER_FILL: [f32; 4] = [0.13, 0.13, 0.13, 1.0];
+const MARKER_HALO: [f32; 4] = [1.0, 1.0, 1.0, 0.9];
+
+/// Whether a `place`/`poi` feature should get a small dot marker alongside
+/// its label, mirroring the reference style's `icon-image` rules: `place`
+/// features only show a generic dot for `village`/`town`/`city` classes and
+/// only below zoom 10 (the style swaps to `''`, i.e. no icon, at z>=10);
+/// `poi` features always show an icon (we approximate every POI class/
+/// subclass sprite with a plain dot, since this renderer has no icon-sprite
+/// atlas yet).
+fn marker_style(layer_name: &str, feature: &VectorFeature, zoom: f64) -> bool {
+    match layer_name {
+        "place" => {
+            let class = feature.get_str("class").unwrap_or("");
+            matches!(class, "village" | "town" | "city") && zoom < 10.0
+        }
+        "poi" => true,
+        _ => false,
+    }
+}
+
 /// Extracts point labels (named `place`/`poi` features) from a decoded
 /// tile, in the same tile-local-metres space `build_tile_mesh` uses for its
-/// fill/line vertices.
-fn extract_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) -> Vec<TileLabel> {
+/// fill/line vertices, appending a small dot marker per labeled point into
+/// `lines` (see `marker_style`).
+fn extract_labels(
+    tile: &VectorTile,
+    coord: TileCoord,
+    tile_size_m: f64,
+    lines: &mut LineMesh,
+) -> Vec<TileLabel> {
     let zoom = coord.z as f64;
     // (layer name, halo color, per-feature style fn).
     let sources: [(&str, [f32; 4], LabelStyleFn); 2] = [
@@ -522,6 +555,10 @@ fn extract_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) -> Vec<
                 continue;
             };
             let pos = ctx.project_point(p.x(), p.y());
+            if marker_style(layer_name, feature, zoom) {
+                append_disc(lines, [pos.x, pos.y], MARKER_RADIUS_PX + 1.0, MARKER_HALO);
+                append_disc(lines, [pos.x, pos.y], MARKER_RADIUS_PX, MARKER_FILL);
+            }
             labels.push(TileLabel {
                 position: [pos.x, pos.y],
                 text: text.to_string(),
