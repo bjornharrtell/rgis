@@ -11,8 +11,11 @@ use lru::LruCache;
 use poll_promise::Promise;
 use rgis_core::{Layer, LayerId, Project, mercator_to_lonlat};
 use rgis_io::{IoError, LoadedLayer};
-use rgis_render::{SceneMesh, TileMesh};
-use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
+use rgis_render::{GlyphBitmapRanges, LabelGlyphInstance, SceneMesh, TileMesh};
+use rgis_tiles::{
+    GLYPH_BUFFER, GLYPH_PIXELS_PER_EM, GlyphFetcher, OPENFREEMAP_MAX_ZOOM, TileCoord,
+    VectorTileFetcher, glyph_range_start, visible_tiles_for_zoom,
+};
 
 mod status_bar;
 #[cfg(target_arch = "wasm32")]
@@ -84,6 +87,8 @@ const MAX_TESSELLATIONS_PER_FRAME: usize = 3;
 const ROW_VPAD: f32 = 5.0;
 /// Background fill painted behind a hovered sidebar tree row.
 const ROW_HOVER_FILL: egui::Color32 = egui::Color32::from_gray(40);
+/// MapLibre/OpenFreeMap fontstack name used for all map labels for now.
+const LABEL_FONTSTACK: &str = "Noto Sans Regular";
 
 /// One or more layers finished (or failed) loading, each tagged with a
 /// display name for error messages.
@@ -92,6 +97,7 @@ type LoadResults = Vec<(String, Result<LoadedLayer, IoError>)>;
 pub struct RgisApp {
     project: Project,
     vector_tile_fetcher: Arc<VectorTileFetcher>,
+    glyph_fetcher: Arc<GlyphFetcher>,
     /// Tessellated mesh per tile, in tile-local metres (viewport-independent
     /// — see `rgis_render::build_tile_mesh`) — built once per tile and
     /// reused across every pan/zoom, unlike the final screen-space mesh
@@ -137,6 +143,7 @@ impl RgisApp {
         Self {
             project: Project::default(),
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
+            glyph_fetcher: GlyphFetcher::new(),
             tile_meshes: LruCache::new(NonZeroUsize::new(TILE_MESH_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
@@ -349,6 +356,14 @@ impl RgisApp {
             }
         }
         self.pending_tile_meshes = still_pending;
+    }
+
+    fn drain_ready_glyphs(&mut self) -> bool {
+        let mut drained_any = false;
+        while self.glyph_fetcher.receiver.try_recv().is_ok() {
+            drained_any = true;
+        }
+        drained_any
     }
 
     /// Walks up from `coord` to find the closest already-cached ancestor
@@ -571,17 +586,312 @@ impl RgisApp {
                     &self.project.viewport,
                 ));
 
+                // Screen-space label glyph quads must be collected before
+                // `basemap_tiles` moves into the paint callback below.
+                let (label_glyphs, glyph_bitmaps, pending_glyphs) =
+                    self.collect_label_draws(&basemap_tiles, rect);
+
                 let callback = rgis_render::MapCallback {
                     mesh,
                     background_index_count,
                     basemap_tiles,
                     tiles: Vec::new(),
+                    labels: label_glyphs,
+                    glyph_bitmaps,
                     width: rect.width(),
                     height: rect.height(),
                 };
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, callback));
+                if pending_glyphs {
+                    ui.ctx().request_repaint();
+                }
             });
+    }
+
+    /// Projects visible basemap labels into screen space, performs
+    /// priority-ordered greedy decluttering, and expands every surviving
+    /// string into per-glyph screen quads ready for the map callback's SDF
+    /// text pipeline.
+    fn collect_label_draws(
+        &self,
+        basemap_tiles: &[rgis_render::BasemapTileDraw],
+        rect: egui::Rect,
+    ) -> (Vec<LabelGlyphInstance>, GlyphBitmapRanges, bool) {
+        struct ProjectedLabel {
+            priority: i32,
+            pos: egui::Pos2,
+            text: String,
+            font_size: f32,
+            color: [f32; 4],
+            halo_color: [f32; 4],
+            angle: f32,
+            /// Screen-space road polyline for line-placed labels (see
+            /// `TileLabel::path`); `None` for point (place/poi) labels.
+            path: Option<Vec<egui::Pos2>>,
+        }
+
+        // Label positions feed the wgpu `MapCallback` (same as basemap
+        // tiles' own `offset`/`scale`), which places everything in
+        // rect-*local* pixel space (0,0 at the map panel's own top-left,
+        // matching `width`/`height`) -- NOT absolute window space, unlike
+        // the old egui-painter-based approach this replaced. So `rect.min`
+        // must NOT be added here (that previously caused labels to drift
+        // by the sidebar's width and desync from the tiles under
+        // zoom/pan). The cull rect is likewise expressed in that same
+        // rect-local space, with a little slack beyond the viewport so a
+        // label whose anchor point is just off-screen (but whose text
+        // would still be partially visible) isn't dropped before the
+        // overlap pass even sees it.
+        let cull_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, rect.size()).expand(64.0);
+        let mut projected = Vec::new();
+        for draw in basemap_tiles {
+            for label in &draw.mesh.labels {
+                let pos = egui::pos2(
+                    label.position[0] * draw.scale + draw.offset[0],
+                    label.position[1] * draw.scale + draw.offset[1],
+                );
+                if !cull_rect.contains(pos) {
+                    continue;
+                }
+                projected.push(ProjectedLabel {
+                    priority: label.priority,
+                    pos,
+                    text: label.text.clone(),
+                    font_size: label.font_size,
+                    color: label.color,
+                    halo_color: label.halo_color,
+                    angle: label.angle,
+                    path: label.path.as_ref().map(|path| {
+                        path.iter()
+                            .map(|p| {
+                                egui::pos2(
+                                    p[0] * draw.scale + draw.offset[0],
+                                    p[1] * draw.scale + draw.offset[1],
+                                )
+                            })
+                            .collect()
+                    }),
+                });
+            }
+        }
+        projected.sort_by_key(|l| l.priority);
+
+        let mut placed: Vec<egui::Rect> = Vec::with_capacity(projected.len());
+        let mut glyphs = Vec::new();
+        let mut glyph_bitmaps = GlyphBitmapRanges::default();
+        let mut pending_glyphs = false;
+        let fontstack = LABEL_FONTSTACK.to_string();
+
+        for label in projected {
+            if label.text.is_empty() {
+                continue;
+            }
+
+            let mut codepoints = Vec::with_capacity(label.text.chars().count());
+            let mut ranges = std::collections::HashMap::new();
+            let mut missing = false;
+            for ch in label.text.chars() {
+                let codepoint = ch as u32;
+                codepoints.push(codepoint);
+                let range_start = glyph_range_start(codepoint);
+                let Some(range) = self.glyph_fetcher.get_cached(LABEL_FONTSTACK, codepoint) else {
+                    self.glyph_fetcher.request(LABEL_FONTSTACK, codepoint);
+                    pending_glyphs = true;
+                    missing = true;
+                    continue;
+                };
+                if !range.contains_key(&codepoint) {
+                    self.glyph_fetcher.request(LABEL_FONTSTACK, codepoint);
+                    pending_glyphs = true;
+                    missing = true;
+                    continue;
+                }
+                ranges.entry(range_start).or_insert(range);
+            }
+            if missing {
+                continue;
+            }
+
+            let scale = label.font_size / GLYPH_PIXELS_PER_EM;
+            let total_advance = codepoints
+                .iter()
+                .filter_map(|codepoint| {
+                    let range = ranges.get(&glyph_range_start(*codepoint))?;
+                    let glyph = range.get(codepoint)?;
+                    Some(glyph.advance as f32 * scale)
+                })
+                .sum::<f32>();
+            // Baseline-relative vertical center of this label's actual ink
+            // (not a guessed constant): `top` is how far each glyph's ink
+            // rises above the baseline and `height - top` is how far it
+            // dips below, so the tallest ascender/descender across the
+            // string's glyphs gives the true cap-height box to center on
+            // the road line, matching how MapLibre centers line-placed
+            // text vertically on the line itself rather than hanging it
+            // below like point labels.
+            let (mut max_ascent, mut max_descent) = (0i32, 0i32);
+            for codepoint in &codepoints {
+                if let Some(glyph) = ranges
+                    .get(&glyph_range_start(*codepoint))
+                    .and_then(|range| range.get(codepoint))
+                {
+                    max_ascent = max_ascent.max(glyph.top);
+                    max_descent = max_descent.max(glyph.height as i32 - glyph.top);
+                }
+            }
+            let baseline_offset = (max_ascent - max_descent) as f32 * 0.5 * scale;
+            let mut label_glyphs = Vec::with_capacity(codepoints.len());
+            let mut bounds: Option<egui::Rect> = None;
+
+            if let Some(path) = &label.path {
+                // Road label: thread glyphs along the actual line geometry
+                // (like MapLibre's `symbol-placement: line`) instead of one
+                // flat quad, so text curves with bends in the road.
+                let Some(total_len) = path_length(path) else {
+                    continue;
+                };
+                let mid_len = total_len * 0.5;
+                // Sample the tangent near the anchor to decide whether
+                // walking the path forward would lay the text out upside
+                // down; if so, walk it in the other direction instead so
+                // the label always reads left-to-right, upright.
+                let (_, probe_angle) = point_and_angle_at(path, mid_len);
+                let forward = probe_angle.cos() >= 0.0;
+                let mut pen_len = mid_len - total_advance * 0.5;
+                for codepoint in codepoints {
+                    let range_start = glyph_range_start(codepoint);
+                    let Some(range) = ranges.get(&range_start) else {
+                        continue;
+                    };
+                    let Some(glyph) = range.get(&codepoint) else {
+                        continue;
+                    };
+                    let sample_len = if forward {
+                        pen_len
+                    } else {
+                        total_len - pen_len
+                    };
+                    let (anchor, mut angle) = point_and_angle_at(path, sample_len);
+                    if !forward {
+                        angle += std::f32::consts::PI;
+                    }
+                    let x = anchor.x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
+                    let y = anchor.y + baseline_offset
+                        - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
+                    let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let glyph_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                    bounds = Some(match bounds {
+                        Some(existing) => existing.union(glyph_rect),
+                        None => glyph_rect,
+                    });
+                    label_glyphs.push(LabelGlyphInstance {
+                        rect: [x, y, w, h],
+                        anchor: [anchor.x, anchor.y],
+                        angle,
+                        fontstack: fontstack.clone(),
+                        codepoint,
+                        color: label.color,
+                        halo_color: label.halo_color,
+                    });
+                    glyph_bitmaps
+                        .entry((fontstack.clone(), range_start))
+                        .or_insert_with(|| Arc::clone(range));
+                    pen_len += glyph.advance as f32 * scale;
+                }
+            } else {
+                let baseline_y = label.pos.y + label.font_size * 0.35;
+                let mut pen_x = label.pos.x - total_advance * 0.5;
+
+                for codepoint in codepoints {
+                    let range_start = glyph_range_start(codepoint);
+                    let Some(range) = ranges.get(&range_start) else {
+                        continue;
+                    };
+                    let Some(glyph) = range.get(&codepoint) else {
+                        continue;
+                    };
+
+                    // `left`/`top` describe the ink box, while the packed
+                    // atlas rect includes the standard SDF padding around
+                    // it, so shift the screen quad by that buffer to keep
+                    // the ink aligned with the layout metrics.
+                    let x = pen_x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
+                    let y = baseline_y - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
+                    let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let glyph_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                    bounds = Some(match bounds {
+                        Some(existing) => existing.union(glyph_rect),
+                        None => glyph_rect,
+                    });
+                    label_glyphs.push(LabelGlyphInstance {
+                        rect: [x, y, w, h],
+                        anchor: [label.pos.x, label.pos.y],
+                        angle: label.angle,
+                        fontstack: fontstack.clone(),
+                        codepoint,
+                        color: label.color,
+                        halo_color: label.halo_color,
+                    });
+                    glyph_bitmaps
+                        .entry((fontstack.clone(), range_start))
+                        .or_insert_with(|| Arc::clone(range));
+                    pen_x += glyph.advance as f32 * scale;
+                }
+            }
+
+            let Some(label_rect) = bounds.map(|rect| rect.expand2(egui::vec2(2.0, 2.0))) else {
+                continue;
+            };
+            if placed
+                .iter()
+                .any(|placed_rect| placed_rect.intersects(label_rect))
+            {
+                continue;
+            }
+            placed.push(label_rect);
+            glyphs.extend(label_glyphs);
+        }
+
+        (glyphs, glyph_bitmaps, pending_glyphs)
+    }
+}
+
+/// Total length of a polyline, or `None` for degenerate (single-point/
+/// zero-length) paths that can't host line-following text.
+fn path_length(path: &[egui::Pos2]) -> Option<f32> {
+    let len: f32 = path.windows(2).map(|pair| pair[0].distance(pair[1])).sum();
+    (len > f32::EPSILON).then_some(len)
+}
+
+/// Walks `path` by cumulative arc length and returns `(point, tangent
+/// angle)` at `target_len` (clamped to the path's endpoints), used to
+/// thread road-name glyphs along the actual line geometry.
+fn point_and_angle_at(path: &[egui::Pos2], target_len: f32) -> (egui::Pos2, f32) {
+    let mut walked = 0.0f32;
+    for pair in path.windows(2) {
+        let (p0, p1) = (pair[0], pair[1]);
+        let seg_len = p0.distance(p1);
+        if walked + seg_len >= target_len || seg_len <= f32::EPSILON {
+            let t = if seg_len > f32::EPSILON {
+                ((target_len - walked) / seg_len).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let point = p0 + (p1 - p0) * t;
+            let angle = (p1.y - p0.y).atan2(p1.x - p0.x);
+            return (point, angle);
+        }
+        walked += seg_len;
+    }
+    let n = path.len();
+    if n >= 2 {
+        let (p0, p1) = (path[n - 2], path[n - 1]);
+        (*path.last().unwrap(), (p1.y - p0.y).atan2(p1.x - p0.x))
+    } else {
+        (*path.last().unwrap(), 0.0)
     }
 }
 
@@ -589,6 +899,7 @@ impl eframe::App for RgisApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_pending_loads();
         self.drain_ready_tiles();
+        let ready_glyphs = self.drain_ready_glyphs();
 
         #[cfg(target_arch = "wasm32")]
         if let Some((lon, lat, zoom)) = DEBUG_VIEWPORT_JUMP.take() {
@@ -602,7 +913,7 @@ impl eframe::App for RgisApp {
         self.render_sidebar(ui);
         self.render_map(ui);
 
-        if !self.pending_loads.is_empty() || !self.pending_tiles.is_empty() {
+        if ready_glyphs || !self.pending_loads.is_empty() || !self.pending_tiles.is_empty() {
             ui.ctx().request_repaint();
         }
     }

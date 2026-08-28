@@ -11,6 +11,12 @@ pub use vector::{
     VectorTileFetched, VectorTileFetcher, VectorTileLayer, VectorTileReady, decode_vector_tile,
 };
 
+mod glyphs;
+pub use glyphs::{
+    GLYPH_BUFFER, GLYPH_PIXELS_PER_EM, Glyph, GlyphFetcher, GlyphRangeReady, decode_glyphs,
+    glyph_range_start,
+};
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +41,8 @@ pub enum TileError {
     Io(#[from] std::io::Error),
     #[error("vector tile decode error: {0}")]
     Mvt(String),
+    #[error("glyph decode error: {0}")]
+    Glyph(String),
 }
 
 // ── TileSource trait ──────────────────────────────────────────────────────────

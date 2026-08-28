@@ -1,3 +1,7 @@
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let startup_paths: Vec<std::path::PathBuf> = std::env::args_os()
         .skip(1)

@@ -20,8 +20,9 @@ use crate::mesh::{SceneMesh, Vertex};
 const BACKGROUND: [f32; 4] = [0.973, 0.957, 0.941, 1.0];
 
 /// Bottom-to-top paint order, mirroring OpenMapTiles-based basemaps
-/// (positron/liberty/bright). Layers not listed here (POIs, place/road
-/// labels, house numbers, …) are skipped since there's no text rendering.
+/// (positron/liberty/bright). Layers not listed here (e.g. road-label line
+/// placement, house numbers) are skipped because this renderer currently
+/// only extracts point labels (`place`/`poi`) plus vector geometry.
 const LAYER_ORDER: &[&str] = &[
     "landcover",
     "landuse",
@@ -43,6 +44,12 @@ const LAYER_ORDER: &[&str] = &[
 pub struct TileMesh {
     pub(crate) fill: SceneMesh,
     pub(crate) lines: LineMesh,
+    /// Point labels (place names, POIs) extracted from the tile, in the
+    /// same tile-local-metres space as `fill`/`lines`. Unlike fills/lines
+    /// these aren't tessellated into triangles here -- the caller projects
+    /// and shapes them into screen-space SDF glyph quads each frame, so
+    /// this stays plain per-feature data.
+    pub labels: Vec<TileLabel>,
 }
 
 impl TileMesh {
@@ -57,6 +64,39 @@ impl TileMesh {
             self.lines.indices.len(),
         )
     }
+}
+
+/// A single point label (a `place` or `poi` layer feature with a `name`),
+/// positioned in tile-local metres exactly like fill/line mesh vertices --
+/// see [`tile_screen_transform`] for projecting it to screen space.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TileLabel {
+    pub position: [f32; 2],
+    pub text: String,
+    /// Font size in constant screen pixels (labels don't scale with the
+    /// tile, matching how map labels stay legible at any zoom).
+    pub font_size: f32,
+    pub color: [f32; 4],
+    /// A lighter halo/outline color drawn behind the text for legibility
+    /// over busy basemap tiles.
+    pub halo_color: [f32; 4],
+    /// Lower draws/keeps priority over higher when decluttering
+    /// overlapping labels (place names before POIs; within a class, by the
+    /// source layer's own `rank` property).
+    pub priority: i32,
+    /// Clockwise rotation in radians applied around `position` when laying
+    /// out the label's glyphs (see `LabelGlyphInstance::angle`); `0.0` for
+    /// point labels (place/poi). Ignored when `path` is `Some` (road
+    /// labels), which instead follow the path's own local tangent per
+    /// glyph.
+    pub angle: f32,
+    /// For road-name labels (`symbol-placement: line`, mirroring MapLibre):
+    /// the full road polyline in the same tile-local-metres space as
+    /// `position`, so the label's glyphs can be threaded along the actual
+    /// road geometry (curving with it) instead of sitting on one flat,
+    /// straight quad. `None` for point labels (place/poi), which are laid
+    /// out as a single horizontal run instead.
+    pub path: Option<Vec<[f32; 2]>>,
 }
 
 /// A line/stroke vertex: `center` is the tile-local-metres position
@@ -101,6 +141,11 @@ pub struct TileMeshWire {
     /// half_width: f32, color: [f32; 4] }`, 9 floats per vertex.
     pub line_vertices: Vec<f32>,
     pub line_indices: Vec<u32>,
+    /// `TileMesh::labels`, JSON-encoded (`Vec<TileLabel>` isn't a flat
+    /// numeric buffer like the vertex arrays above, but it's small -- at
+    /// most a few hundred short strings per tile -- so plain JSON avoids
+    /// hand-rolling a second binary wire format just for this).
+    pub labels_json: String,
 }
 
 impl From<&TileMesh> for TileMeshWire {
@@ -122,6 +167,7 @@ impl From<&TileMesh> for TileMeshWire {
             fill_indices: mesh.fill.indices.clone(),
             line_vertices,
             line_indices: mesh.lines.indices.clone(),
+            labels_json: serde_json::to_string(&mesh.labels).unwrap_or_default(),
         }
     }
 }
@@ -154,6 +200,7 @@ impl TileMeshWire {
                 color: [c[5], c[6], c[7], c[8]],
             })
             .collect();
+        let labels = serde_json::from_str(&self.labels_json).unwrap_or_default();
         TileMesh {
             fill: SceneMesh {
                 vertices: fill_vertices,
@@ -163,6 +210,7 @@ impl TileMeshWire {
                 vertices: line_vertices,
                 indices: self.line_indices,
             },
+            labels,
         }
     }
 }
@@ -398,13 +446,248 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
         }
     }
 
+    let labels = extract_labels(tile, coord, tile_size_m, &mut lines);
+
     TileMesh {
         fill: SceneMesh {
             vertices: fill_buffers.vertices,
             indices: fill_buffers.indices,
         },
         lines,
+        labels,
     }
+}
+
+/// OpenMapTiles `place` layer classes we label, from most to least
+/// prominent, mirroring roughly how MapLibre's "liberty" style ranks them
+/// (used both for the minimum zoom a class appears at and as a tie-break
+/// alongside the feature's own `rank` property for decluttering priority).
+fn place_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
+    let class = feature.get_str("class").unwrap_or("");
+    let rank = feature.get_number("rank").unwrap_or(20.0) as i32;
+    let (min_zoom, font_size, class_priority) = match class {
+        "country" => (0.0, 15.0, 0),
+        "state" => (4.0, 12.0, 1),
+        "city" => (3.0, 14.0, 1),
+        "town" => (6.0, 12.0, 2),
+        "village" => (9.0, 11.0, 3),
+        "hamlet" | "suburb" | "neighbourhood" => (11.0, 10.0, 4),
+        _ => (12.0, 10.0, 5),
+    };
+    if zoom < min_zoom {
+        return None;
+    }
+    Some((font_size, class_priority * 1000 + rank))
+}
+
+/// OpenMapTiles `poi` layer: gated by both zoom and the feature's own
+/// `rank` (lower = more important), mirroring the "liberty" style's
+/// `poi_r1`/`poi_r7`/`poi_r20` layers (rank 1-6 from z15, 7-19 from z16,
+/// 20+ only from z17) rather than showing every POI regardless of rank
+/// once some single zoom threshold is reached -- without this tiering,
+/// far more POIs show up per zoom level than the reference style/MapLibre
+/// client renders, which is why labels looked over-dense.
+fn poi_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
+    let rank = feature.get_number("rank").unwrap_or(30.0) as i32;
+    let min_zoom = if rank >= 20 {
+        17.0
+    } else if rank >= 7 {
+        16.0
+    } else {
+        15.0
+    };
+    if zoom < min_zoom {
+        return None;
+    }
+    Some((10.0, 10_000 + rank))
+}
+
+/// A per-feature label styling function: returns `(font size, decluttering
+/// priority)`, or `None` to skip the feature.
+type LabelStyleFn = fn(&VectorFeature, f64) -> Option<(f32, i32)>;
+
+/// Constant on-screen radius (device pixels) of the small dot marker drawn
+/// under `place`/`poi` point labels, mirroring the "liberty" style's
+/// `circle_11_black` sprite / POI icon dots (see `marker_style` below).
+const MARKER_RADIUS_PX: f32 = 2.5;
+const MARKER_FILL: [f32; 4] = [0.13, 0.13, 0.13, 1.0];
+const MARKER_HALO: [f32; 4] = [1.0, 1.0, 1.0, 0.9];
+
+/// Whether a `place`/`poi` feature should get a small dot marker alongside
+/// its label, mirroring the reference style's `icon-image` rules: `place`
+/// features only show a generic dot for `village`/`town`/`city` classes and
+/// only below zoom 10 (the style swaps to `''`, i.e. no icon, at z>=10);
+/// `poi` features always show an icon (we approximate every POI class/
+/// subclass sprite with a plain dot, since this renderer has no icon-sprite
+/// atlas yet).
+fn marker_style(layer_name: &str, feature: &VectorFeature, zoom: f64) -> bool {
+    match layer_name {
+        "place" => {
+            let class = feature.get_str("class").unwrap_or("");
+            matches!(class, "village" | "town" | "city") && zoom < 10.0
+        }
+        "poi" => true,
+        _ => false,
+    }
+}
+
+/// Extracts point labels (named `place`/`poi` features) from a decoded
+/// tile, in the same tile-local-metres space `build_tile_mesh` uses for its
+/// fill/line vertices, appending a small dot marker per labeled point into
+/// `lines` (see `marker_style`).
+fn extract_labels(
+    tile: &VectorTile,
+    coord: TileCoord,
+    tile_size_m: f64,
+    lines: &mut LineMesh,
+) -> Vec<TileLabel> {
+    let zoom = coord.z as f64;
+    // (layer name, halo color, per-feature style fn).
+    let sources: [(&str, [f32; 4], LabelStyleFn); 2] = [
+        ("place", [1.0, 1.0, 1.0, 0.9], place_label_style),
+        ("poi", [1.0, 1.0, 1.0, 0.85], poi_label_style),
+    ];
+
+    let mut labels = Vec::new();
+    for (layer_name, halo_color, style_fn) in sources {
+        let Some(layer) = tile.layers.iter().find(|l| l.name == layer_name) else {
+            continue;
+        };
+        let ctx = TileContext {
+            extent: layer.extent,
+            tile_size_m,
+        };
+        for feature in &layer.features {
+            let Geometry::Point(p) = &feature.geometry else {
+                continue;
+            };
+            let Some(text) = feature.get_str("name").filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let Some((font_size, priority)) = style_fn(feature, zoom) else {
+                continue;
+            };
+            let pos = ctx.project_point(p.x(), p.y());
+            if marker_style(layer_name, feature, zoom) {
+                append_disc(lines, [pos.x, pos.y], MARKER_RADIUS_PX + 1.0, MARKER_HALO);
+                append_disc(lines, [pos.x, pos.y], MARKER_RADIUS_PX, MARKER_FILL);
+            }
+            labels.push(TileLabel {
+                position: [pos.x, pos.y],
+                text: text.to_string(),
+                font_size,
+                color: [0.15, 0.15, 0.17, 1.0],
+                halo_color,
+                priority,
+                angle: 0.0,
+                path: None,
+            });
+        }
+    }
+    labels.extend(extract_road_labels(tile, coord, tile_size_m));
+    labels.sort_by_key(|l| l.priority);
+    labels
+}
+
+/// OpenMapTiles `transportation_name` layer: mirrors the "liberty" style's
+/// `highway-name-major`/`highway-name-minor`/`highway-name-path` layers
+/// (major roads visible from z12.2, minor/service/track from z15, paths
+/// from z15.5) rather than showing every road name regardless of class.
+fn road_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
+    let class = feature.get_str("class").unwrap_or("");
+    let (min_zoom, font_size, class_priority) = match class {
+        "motorway" | "trunk" | "primary" | "secondary" | "tertiary" => (12.2, 11.0, 0),
+        "minor" | "service" | "track" => (15.0, 10.0, 1),
+        "path" => (15.5, 9.0, 2),
+        _ => (14.0, 10.0, 3),
+    };
+    if zoom < min_zoom {
+        return None;
+    }
+    Some((font_size, class_priority))
+}
+
+/// Extracts road-name labels (`transportation_name` layer) from a decoded
+/// tile, threading each label along its full road polyline (`path`) so the
+/// glyphs curve with the actual geometry, like MapLibre's
+/// `symbol-placement: line` road labels -- unlike `place`/`poi` labels
+/// (see `extract_labels`), these aren't drawn as a single flat quad.
+fn extract_road_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) -> Vec<TileLabel> {
+    let zoom = coord.z as f64;
+    let Some(layer) = tile.layers.iter().find(|l| l.name == "transportation_name") else {
+        return Vec::new();
+    };
+    let ctx = TileContext {
+        extent: layer.extent,
+        tile_size_m,
+    };
+    let mut labels = Vec::new();
+    for feature in &layer.features {
+        let Some(text) = feature.get_str("name").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some((font_size, class_priority)) = road_label_style(feature, zoom) else {
+            continue;
+        };
+        let points = match &feature.geometry {
+            Geometry::LineString(line) => line_points(line, &ctx),
+            Geometry::MultiLineString(lines) => lines
+                .0
+                .iter()
+                .max_by(|a, b| line_length(a, &ctx).total_cmp(&line_length(b, &ctx)))
+                .map(|line| line_points(line, &ctx))
+                .unwrap_or_default(),
+            _ => continue,
+        };
+        if points.len() < 2 {
+            continue;
+        }
+        // Anchor at the arc-length midpoint of the whole road, matching
+        // where MapLibre centers a line-placed label along its geometry.
+        let mid = point_at_arc_length(&points, line_length_points(&points) * 0.5);
+        labels.push(TileLabel {
+            position: mid,
+            text: text.to_string(),
+            font_size,
+            color: [0.15, 0.15, 0.17, 1.0],
+            halo_color: [1.0, 1.0, 1.0, 0.9],
+            priority: 20_000 + class_priority,
+            angle: 0.0,
+            path: Some(points),
+        });
+    }
+    labels
+}
+
+fn line_length(line: &LineString<i32>, ctx: &TileContext) -> f32 {
+    line_length_points(&line_points(line, ctx))
+}
+
+fn line_length_points(points: &[[f32; 2]]) -> f32 {
+    points
+        .windows(2)
+        .map(|pair| ((pair[1][0] - pair[0][0]).powi(2) + (pair[1][1] - pair[0][1]).powi(2)).sqrt())
+        .sum()
+}
+
+/// Walks `points` by cumulative arc length and returns the point at
+/// `target_len` along the polyline (clamped to its endpoints).
+fn point_at_arc_length(points: &[[f32; 2]], target_len: f32) -> [f32; 2] {
+    let mut walked = 0.0f32;
+    for pair in points.windows(2) {
+        let [p0, p1] = [pair[0], pair[1]];
+        let seg_len = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
+        if walked + seg_len >= target_len || seg_len <= f32::EPSILON {
+            let t = if seg_len > f32::EPSILON {
+                (target_len - walked) / seg_len
+            } else {
+                0.0
+            };
+            return [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
+        }
+        walked += seg_len;
+    }
+    points.last().copied().unwrap_or([0.0, 0.0])
 }
 
 /// The small per-tile screen transform needed to position an already
@@ -868,6 +1151,37 @@ fn fill_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `build_tile_mesh` should extract point labels from a dense real-world
+    /// tile's `place`/`poi` layers, with the wire round-trip (used to ship
+    /// results across the wasm worker boundary; see `TileMeshWire`)
+    /// preserving them.
+    #[test]
+    fn labels_are_extracted_and_survive_the_wire_round_trip() {
+        let full_path = format!("{}/fixtures/paris_14.pbf", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&full_path).expect("failed to read fixture");
+        let tile = rgis_tiles::decode_vector_tile(&bytes).expect("decode fixture MVT");
+        let coord = TileCoord { z: 14, x: 0, y: 0 };
+        let mesh = build_tile_mesh(&tile, coord);
+
+        assert!(
+            !mesh.labels.is_empty(),
+            "expected at least one place/poi label in a dense real-world tile"
+        );
+        assert!(mesh.labels.iter().all(|l| !l.text.is_empty()));
+        // Priorities are non-decreasing (place labels sort before poi
+        // labels, each internally ranked).
+        assert!(
+            mesh.labels
+                .windows(2)
+                .all(|w| w[0].priority <= w[1].priority)
+        );
+
+        let wire = TileMeshWire::from(&mesh);
+        let round_tripped = wire.into_tile_mesh();
+        assert_eq!(round_tripped.labels.len(), mesh.labels.len());
+        assert_eq!(round_tripped.labels[0].text, mesh.labels[0].text);
+    }
 
     /// Vertex/index count contributed by exactly one bevel join triangle.
     const BEVEL_VERTS: usize = 3;
