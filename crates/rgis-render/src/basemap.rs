@@ -84,6 +84,12 @@ pub struct TileLabel {
     /// overlapping labels (place names before POIs; within a class, by the
     /// source layer's own `rank` property).
     pub priority: i32,
+    /// Clockwise rotation in radians applied around `position` when laying
+    /// out the label's glyphs (see `LabelGlyphInstance::angle`); `0.0` for
+    /// point labels (place/poi), non-zero for road names, which follow
+    /// their line's on-screen direction like MapLibre's `symbol-placement:
+    /// line` road labels.
+    pub angle: f32,
 }
 
 /// A line/stroke vertex: `center` is the tile-local-metres position
@@ -566,11 +572,106 @@ fn extract_labels(
                 color: [0.15, 0.15, 0.17, 1.0],
                 halo_color,
                 priority,
+                angle: 0.0,
             });
         }
     }
+    labels.extend(extract_road_labels(tile, coord, tile_size_m));
     labels.sort_by_key(|l| l.priority);
     labels
+}
+
+/// OpenMapTiles `transportation_name` layer: mirrors the "liberty" style's
+/// `highway-name-major`/`highway-name-minor`/`highway-name-path` layers
+/// (major roads visible from z12.2, minor/service/track from z15, paths
+/// from z15.5) rather than showing every road name regardless of class.
+fn road_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
+    let class = feature.get_str("class").unwrap_or("");
+    let (min_zoom, font_size, class_priority) = match class {
+        "motorway" | "trunk" | "primary" | "secondary" | "tertiary" => (12.2, 11.0, 0),
+        "minor" | "service" | "track" => (15.0, 10.0, 1),
+        "path" => (15.5, 9.0, 2),
+        _ => (14.0, 10.0, 3),
+    };
+    if zoom < min_zoom {
+        return None;
+    }
+    Some((font_size, class_priority))
+}
+
+/// Extracts road-name labels (`transportation_name` layer) from a decoded
+/// tile, placing each label at the midpoint of its line's longest segment
+/// and rotating it to follow that segment's on-screen direction, like
+/// MapLibre's `symbol-placement: line` road labels -- unlike `place`/`poi`
+/// labels (see `extract_labels`), these aren't drawn axis-aligned.
+fn extract_road_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) -> Vec<TileLabel> {
+    let zoom = coord.z as f64;
+    let Some(layer) = tile.layers.iter().find(|l| l.name == "transportation_name") else {
+        return Vec::new();
+    };
+    let ctx = TileContext {
+        extent: layer.extent,
+        tile_size_m,
+    };
+    let mut labels = Vec::new();
+    for feature in &layer.features {
+        let Some(text) = feature.get_str("name").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some((font_size, class_priority)) = road_label_style(feature, zoom) else {
+            continue;
+        };
+        let points = match &feature.geometry {
+            Geometry::LineString(line) => line_points(line, &ctx),
+            Geometry::MultiLineString(lines) => lines
+                .0
+                .iter()
+                .max_by(|a, b| line_length(a, &ctx).total_cmp(&line_length(b, &ctx)))
+                .map(|line| line_points(line, &ctx))
+                .unwrap_or_default(),
+            _ => continue,
+        };
+        if points.len() < 2 {
+            continue;
+        }
+        // Longest single segment, so the label sits on the straightest run
+        // of road rather than spanning a sharp bend.
+        let (mut a, mut b, mut best_len) = (points[0], points[1], 0.0f32);
+        for pair in points.windows(2) {
+            let [p0, p1] = [pair[0], pair[1]];
+            let len = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
+            if len > best_len {
+                best_len = len;
+                a = p0;
+                b = p1;
+            }
+        }
+        let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+        let mut angle = (b[1] - a[1]).atan2(b[0] - a[0]);
+        // Keep text upright (never upside-down) by flipping direction when
+        // it would otherwise point into the left half-plane.
+        if angle > std::f32::consts::FRAC_PI_2 || angle < -std::f32::consts::FRAC_PI_2 {
+            angle += std::f32::consts::PI;
+        }
+        labels.push(TileLabel {
+            position: mid,
+            text: text.to_string(),
+            font_size,
+            color: [0.15, 0.15, 0.17, 1.0],
+            halo_color: [1.0, 1.0, 1.0, 0.9],
+            priority: 20_000 + class_priority,
+            angle,
+        });
+    }
+    labels
+}
+
+fn line_length(line: &LineString<i32>, ctx: &TileContext) -> f32 {
+    let points = line_points(line, ctx);
+    points
+        .windows(2)
+        .map(|pair| ((pair[1][0] - pair[0][0]).powi(2) + (pair[1][1] - pair[0][1]).powi(2)).sqrt())
+        .sum()
 }
 
 /// The small per-tile screen transform needed to position an already

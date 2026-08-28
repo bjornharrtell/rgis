@@ -917,28 +917,35 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             let v0 = atlas_rect.y as f32 / atlas_size;
             let u1 = (atlas_rect.x + atlas_rect.w) as f32 / atlas_size;
             let v1 = (atlas_rect.y + atlas_rect.h) as f32 / atlas_size;
+            let (sin_a, cos_a) = label.angle.sin_cos();
+            let [ax, ay] = label.anchor;
+            let rotate = |px: f32, py: f32| -> [f32; 2] {
+                let dx = px - ax;
+                let dy = py - ay;
+                [ax + dx * cos_a - dy * sin_a, ay + dx * sin_a + dy * cos_a]
+            };
             let base = text_vertices.len() as u32;
             text_vertices.extend_from_slice(&[
                 TextVertex {
-                    position: [x, y],
+                    position: rotate(x, y),
                     uv: [u0, v0],
                     color: label.color,
                     halo_color: label.halo_color,
                 },
                 TextVertex {
-                    position: [x + w, y],
+                    position: rotate(x + w, y),
                     uv: [u1, v0],
                     color: label.color,
                     halo_color: label.halo_color,
                 },
                 TextVertex {
-                    position: [x + w, y + h],
+                    position: rotate(x + w, y + h),
                     uv: [u1, v1],
                     color: label.color,
                     halo_color: label.halo_color,
                 },
                 TextVertex {
-                    position: [x, y + h],
+                    position: rotate(x, y + h),
                     uv: [u0, v1],
                     color: label.color,
                     halo_color: label.halo_color,

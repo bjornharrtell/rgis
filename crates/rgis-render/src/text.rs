@@ -6,8 +6,17 @@ use rgis_tiles::Glyph;
 /// One glyph quad to draw this frame, already positioned in screen pixels.
 pub struct LabelGlyphInstance {
     /// `[x, y, w, h]` in top-left-origin screen pixels, matching the full
-    /// buffered glyph bitmap (ink plus `GLYPH_BUFFER` padding).
+    /// buffered glyph bitmap (ink plus `GLYPH_BUFFER` padding), as if the
+    /// label were laid out horizontally (`angle == 0`).
     pub rect: [f32; 4],
+    /// The label's anchor point in screen pixels; `rect`'s corners are
+    /// rotated by `angle` (radians, clockwise in screen space) around this
+    /// point before rasterizing, so multi-glyph strings keep correct
+    /// horizontal letter-spacing while the whole label follows a road's
+    /// on-screen direction (see `basemap.rs`'s `transportation_name`
+    /// extraction).
+    pub anchor: [f32; 2],
+    pub angle: f32,
     pub fontstack: String,
     pub codepoint: u32,
     pub color: [f32; 4],

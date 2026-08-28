@@ -625,6 +625,7 @@ impl RgisApp {
             font_size: f32,
             color: [f32; 4],
             halo_color: [f32; 4],
+            angle: f32,
         }
 
         // Label positions feed the wgpu `MapCallback` (same as basemap
@@ -657,6 +658,7 @@ impl RgisApp {
                     font_size: label.font_size,
                     color: label.color,
                     halo_color: label.halo_color,
+                    angle: label.angle,
                 });
             }
         }
@@ -736,6 +738,8 @@ impl RgisApp {
                 });
                 label_glyphs.push(LabelGlyphInstance {
                     rect: [x, y, w, h],
+                    anchor: [label.pos.x, label.pos.y],
+                    angle: label.angle,
                     fontstack: fontstack.clone(),
                     codepoint,
                     color: label.color,
