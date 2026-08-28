@@ -27,6 +27,11 @@ pub const SAMPLE_GEOJSON: &[u8] = include_bytes!("../assets/sample.geojson");
 /// 128 decoded-tile cache).
 const TILE_MESH_CACHE_SIZE: usize = 256;
 
+/// Max newly-arrived tiles handed off to tessellation per `drain_ready_tiles`
+/// call (once per frame) -- see the comment on its call site for why this
+/// matters most on wasm, where tessellation isn't actually backgrounded.
+const MAX_TESSELLATIONS_PER_FRAME: usize = 3;
+
 /// Extra vertical padding added above/below the sidebar tree row content.
 const ROW_VPAD: f32 = 5.0;
 /// Background fill painted behind a hovered sidebar tree row.
@@ -206,7 +211,19 @@ impl RgisApp {
     }
 
     fn drain_ready_tiles(&mut self) {
-        while let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() {
+        // Capped per frame: on wasm, `Promise::spawn_local` has no real
+        // background thread to run on -- its future body runs synchronously
+        // as a microtask, and ALL microtasks queued in one `update()` call
+        // run back-to-back before the browser can paint or handle input.
+        // Spawning a big burst of tessellation jobs at once (e.g. many
+        // tiles arriving together after a fast zoom) previously froze the
+        // tab for as long as all of them together took; capping how many
+        // start per frame spreads that cost across frames instead, keeping
+        // the UI responsive at the cost of tiles finishing a bit later.
+        for _ in 0..MAX_TESSELLATIONS_PER_FRAME {
+            let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() else {
+                break;
+            };
             let coord = ready.coord;
             let tile = ready.tile;
             #[cfg(not(target_arch = "wasm32"))]
