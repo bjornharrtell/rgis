@@ -51,13 +51,15 @@ pub struct RgisApp {
     /// panning/zooming over a large area doesn't grow memory forever.
     tile_meshes: LruCache<TileCoord, Arc<TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
-    /// Tessellation jobs in flight: a decoded tile arriving from
-    /// `vector_tile_fetcher` is tessellated on a background thread (native)
-    /// / spawned task (wasm) rather than inline in `drain_ready_tiles`,
-    /// since tessellating a complex tile can take long enough to visibly
-    /// stall input handling (e.g. zoom-wheel events) if done synchronously
-    /// in the UI update loop.
-    pending_tile_meshes: Vec<Promise<(TileCoord, TileMesh)>>,
+    /// Decode-and-tessellation jobs in flight: a tile arriving from
+    /// `vector_tile_fetcher` (either already decoded, from its cache, or as
+    /// raw bytes needing MVT decode first) is processed on a background
+    /// thread (native) / spawned task (wasm) rather than inline in
+    /// `drain_ready_tiles`, since decoding and tessellating a complex tile
+    /// can take long enough to visibly stall input handling (e.g.
+    /// zoom-wheel events) if done synchronously in the UI update loop. The
+    /// inner `Option` is `None` when decoding raw bytes failed.
+    pending_tile_meshes: Vec<Promise<(TileCoord, Option<TileMesh>)>>,
     pending_loads: Vec<Promise<LoadResults>>,
     cursor_lonlat: Option<(f64, f64)>,
     last_error: Option<String>,
@@ -215,36 +217,66 @@ impl RgisApp {
         // background thread to run on -- its future body runs synchronously
         // as a microtask, and ALL microtasks queued in one `update()` call
         // run back-to-back before the browser can paint or handle input.
-        // Spawning a big burst of tessellation jobs at once (e.g. many
-        // tiles arriving together after a fast zoom) previously froze the
-        // tab for as long as all of them together took; capping how many
-        // start per frame spreads that cost across frames instead, keeping
-        // the UI responsive at the cost of tiles finishing a bit later.
+        // Spawning a big burst of decode+tessellation jobs at once (e.g.
+        // many tiles arriving together after a fast zoom) previously froze
+        // the tab for as long as all of them together took; capping how
+        // many start per frame spreads that cost across frames instead,
+        // keeping the UI responsive at the cost of tiles finishing a bit
+        // later.
         for _ in 0..MAX_TESSELLATIONS_PER_FRAME {
-            let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() else {
+            if let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() {
+                let coord = ready.coord;
+                let tile = ready.tile;
+                #[cfg(not(target_arch = "wasm32"))]
+                let promise = Promise::spawn_thread("tessellate-tile", move || {
+                    (coord, Some(rgis_render::build_tile_mesh(&tile, coord)))
+                });
+                #[cfg(target_arch = "wasm32")]
+                let promise = Promise::spawn_local(async move {
+                    (coord, Some(rgis_render::build_tile_mesh(&tile, coord)))
+                });
+                self.pending_tile_meshes.push(promise);
+            } else if let Ok(fetched) = self.vector_tile_fetcher.raw_receiver.try_recv() {
+                // Raw network-fetched bytes: MVT decode (parsing every
+                // feature's geometry/properties out of the protobuf) is
+                // real CPU work too, so it's bundled into the same
+                // throttled background job as tessellation rather than
+                // running unconditionally in the network response callback
+                // (see `VectorTileFetcher::fetch_url`).
+                let coord = fetched.coord;
+                let bytes = fetched.bytes;
+                let fetcher = Arc::clone(&self.vector_tile_fetcher);
+                #[cfg(not(target_arch = "wasm32"))]
+                let promise =
+                    Promise::spawn_thread("decode-tessellate-tile", move || {
+                        match fetcher.decode_and_cache(coord, &bytes) {
+                            Ok(tile) => (coord, Some(rgis_render::build_tile_mesh(&tile, coord))),
+                            Err(_) => (coord, None),
+                        }
+                    });
+                #[cfg(target_arch = "wasm32")]
+                let promise = Promise::spawn_local(async move {
+                    match fetcher.decode_and_cache(coord, &bytes) {
+                        Ok(tile) => (coord, Some(rgis_render::build_tile_mesh(&tile, coord))),
+                        Err(_) => (coord, None),
+                    }
+                });
+                self.pending_tile_meshes.push(promise);
+            } else {
                 break;
-            };
-            let coord = ready.coord;
-            let tile = ready.tile;
-            #[cfg(not(target_arch = "wasm32"))]
-            let promise = Promise::spawn_thread("tessellate-tile", move || {
-                (coord, rgis_render::build_tile_mesh(&tile, coord))
-            });
-            #[cfg(target_arch = "wasm32")]
-            let promise =
-                Promise::spawn_local(
-                    async move { (coord, rgis_render::build_tile_mesh(&tile, coord)) },
-                );
-            self.pending_tile_meshes.push(promise);
+            }
         }
 
         let pending = std::mem::take(&mut self.pending_tile_meshes);
         let mut still_pending = Vec::new();
         for promise in pending {
             match promise.try_take() {
-                Ok((coord, mesh)) => {
+                Ok((coord, Some(mesh))) => {
                     self.pending_tiles.remove(&coord);
                     self.tile_meshes.put(coord, Arc::new(mesh));
+                }
+                Ok((coord, None)) => {
+                    self.pending_tiles.remove(&coord);
                 }
                 Err(promise) => still_pending.push(promise),
             }

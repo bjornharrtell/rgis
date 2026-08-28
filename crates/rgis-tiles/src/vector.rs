@@ -165,6 +165,19 @@ pub struct VectorTileReady {
     pub tile: Arc<VectorTile>,
 }
 
+/// A tile whose bytes have been fetched (from the network) but not yet
+/// decoded. MVT decoding parses every feature's geometry and properties out
+/// of the protobuf payload, which can be substantial CPU work for a busy
+/// tile -- deferring it here (rather than doing it inline in the network
+/// completion callback) lets callers decode it as part of their own
+/// throttled/backgrounded work, instead of it running unconditionally and
+/// synchronously the moment a response arrives (which, on wasm, is on the
+/// browser's single JS thread, with no way to time-slice it).
+pub struct VectorTileFetched {
+    pub coord: TileCoord,
+    pub bytes: Vec<u8>,
+}
+
 /// The `{z}/{x}/{y}` tile URL template, resolved asynchronously from a
 /// TileJSON document. Requests made before it resolves are queued.
 enum TemplateState {
@@ -179,6 +192,8 @@ pub struct VectorTileFetcher {
     cache: Arc<Mutex<LruCache<TileCoord, Arc<VectorTile>>>>,
     sender: Sender<VectorTileReady>,
     pub receiver: Receiver<VectorTileReady>,
+    raw_sender: Sender<VectorTileFetched>,
+    pub raw_receiver: Receiver<VectorTileFetched>,
     template: Arc<Mutex<TemplateState>>,
 }
 
@@ -187,12 +202,15 @@ impl VectorTileFetcher {
     /// kicking off the TileJSON resolution in the background.
     pub fn new_openfreemap() -> Arc<Self> {
         let (sender, receiver) = async_channel::bounded(256);
+        let (raw_sender, raw_receiver) = async_channel::bounded(256);
         let fetcher = Arc::new(Self {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE_SIZE).unwrap(),
             ))),
             sender,
             receiver,
+            raw_sender,
+            raw_receiver,
             template: Arc::new(Mutex::new(TemplateState::Loading(Vec::new()))),
         });
 
@@ -267,9 +285,22 @@ impl VectorTileFetcher {
         arc
     }
 
+    /// Decodes raw MVT bytes (as delivered via `raw_receiver`) and stores
+    /// the result in the decoded-tile cache, so a later `request()` for the
+    /// same coord can skip the network+decode entirely. Meant to be called
+    /// from whatever backgrounded/throttled job the caller uses to consume
+    /// `raw_receiver`, not inline on a UI/main thread.
+    pub fn decode_and_cache(
+        &self,
+        coord: TileCoord,
+        bytes: &[u8],
+    ) -> Result<Arc<VectorTile>, TileError> {
+        let tile = decode_vector_tile(bytes)?;
+        Ok(self.cache_insert(coord, tile))
+    }
+
     fn fetch_url(&self, coord: TileCoord, url: String) {
-        let cache = Arc::clone(&self.cache);
-        let sender = self.sender.clone();
+        let raw_sender = self.raw_sender.clone();
         let request = ehttp::Request::get(url);
 
         ehttp::fetch(request, move |result: ehttp::Result<ehttp::Response>| {
@@ -277,13 +308,11 @@ impl VectorTileFetcher {
             if !response.ok {
                 return;
             }
-            let Ok(tile) = decode_vector_tile(&response.bytes) else {
-                return;
-            };
             disk_cache::write(coord, &response.bytes);
-            let arc = Arc::new(tile);
-            cache.lock().unwrap().put(coord, Arc::clone(&arc));
-            let _ = sender.try_send(VectorTileReady { coord, tile: arc });
+            let _ = raw_sender.try_send(VectorTileFetched {
+                coord,
+                bytes: response.bytes,
+            });
         });
     }
 }
