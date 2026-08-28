@@ -1,0 +1,8 @@
+# wasm32 has no runtime feature detection, so the compiler defaults to the
+# most conservative baseline (no SIMD) unless told otherwise. `simd128` has
+# been supported in all browsers rgis targets for years, and lets LLVM
+# auto-vectorize hot loops (tessellation, image/tile decoding) on the wasm
+# build, which otherwise runs those scalar compared to native builds (which
+# already get the host CPU's native vector ISA).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

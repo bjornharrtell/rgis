@@ -3,11 +3,11 @@
 //! same wgpu device/surface as the rest of the (egui) UI — on native and in
 //! the browser (WebGPU/WebGL2) alike.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use rgis_tiles::TileCoord;
+use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::util::DeviceExt;
 
 use crate::basemap::{LineVertex, TileMesh};
@@ -77,10 +77,17 @@ struct SubMeshBuffers {
 /// Persistent GPU buffers for one basemap tile, uploaded once when the tile
 /// first appears and reused for every future draw of that tile (including
 /// during pan/zoom) until it's evicted. Either sub-mesh may be absent (e.g.
-/// a tile with no roads has no `lines`).
+/// a tile with no roads has no `lines`). `transform_buffer`/
+/// `transform_bind_group` are also created only once -- each frame just
+/// rewrites `transform_buffer`'s contents via `queue.write_buffer` instead
+/// of allocating a new buffer+bind group (cheap on native, but bind group
+/// creation is emulated/more expensive on wgpu's WebGL2 backend, so doing
+/// it once per tile instead of once per tile per frame matters more there).
 struct TileGpuMesh {
     fill: Option<SubMeshBuffers>,
     lines: Option<SubMeshBuffers>,
+    transform_buffer: wgpu::Buffer,
+    transform_bind_group: wgpu::BindGroup,
 }
 
 /// A single raster tile to draw this frame: its screen-pixel rectangle
@@ -106,12 +113,12 @@ pub struct MapRenderResources {
     basemap_pipeline: wgpu::RenderPipeline,
     basemap_line_pipeline: wgpu::RenderPipeline,
     tile_transform_bind_group_layout: wgpu::BindGroupLayout,
-    tile_gpu_meshes: HashMap<TileCoord, TileGpuMesh>,
+    tile_gpu_meshes: FxHashMap<TileCoord, TileGpuMesh>,
 
     tile_pipeline: wgpu::RenderPipeline,
     tile_bind_group_layout: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
-    tile_textures: HashMap<u64, TileGpuTexture>,
+    tile_textures: FxHashMap<u64, TileGpuTexture>,
 }
 
 impl MapRenderResources {
@@ -223,11 +230,11 @@ impl MapRenderResources {
             basemap_pipeline,
             basemap_line_pipeline,
             tile_transform_bind_group_layout,
-            tile_gpu_meshes: HashMap::new(),
+            tile_gpu_meshes: FxHashMap::default(),
             tile_pipeline,
             tile_bind_group_layout,
             tile_sampler,
-            tile_textures: HashMap::new(),
+            tile_textures: FxHashMap::default(),
         }
     }
 
@@ -298,13 +305,14 @@ impl MapRenderResources {
     /// Drops cached tile textures whose key wasn't requested this frame, so
     /// the GPU-side cache tracks whatever `rgis-tiles`'s CPU-side LRU cache
     /// currently holds instead of growing without bound.
-    fn evict_stale_tiles(&mut self, live_keys: &std::collections::HashSet<u64>) {
+    fn evict_stale_tiles(&mut self, live_keys: &FxHashSet<u64>) {
         self.tile_textures.retain(|key, _| live_keys.contains(key));
     }
 
-    /// Uploads a basemap tile's fill + line meshes to the GPU once; a
-    /// no-op if that tile's buffers already exist (the whole point --
-    /// pan/zoom never re-uploads).
+    /// Uploads a basemap tile's fill + line meshes to the GPU once, along
+    /// with a persistent transform uniform buffer/bind group for that tile;
+    /// a no-op if that tile's buffers already exist (the whole point --
+    /// pan/zoom never re-uploads or reallocates).
     fn ensure_basemap_tile_buffer(
         &mut self,
         device: &wgpu::Device,
@@ -340,14 +348,35 @@ impl MapRenderResources {
             }),
             index_count: mesh.lines.indices.len() as u32,
         });
-        self.tile_gpu_meshes
-            .insert(coord, TileGpuMesh { fill, lines });
+        let transform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rgis-basemap-tile-transform"),
+            size: std::mem::size_of::<TileTransformUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let transform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rgis-basemap-tile-transform-bind-group"),
+            layout: &self.tile_transform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: transform_buffer.as_entire_binding(),
+            }],
+        });
+        self.tile_gpu_meshes.insert(
+            coord,
+            TileGpuMesh {
+                fill,
+                lines,
+                transform_buffer,
+                transform_bind_group,
+            },
+        );
     }
 
     /// Drops persistent per-tile GPU mesh buffers for tiles not visible this
     /// frame, so GPU memory tracks the current view instead of growing
     /// unbounded as the user explores.
-    fn evict_stale_basemap_tiles(&mut self, live_coords: &std::collections::HashSet<TileCoord>) {
+    fn evict_stale_basemap_tiles(&mut self, live_coords: &FxHashSet<TileCoord>) {
         self.tile_gpu_meshes
             .retain(|coord, _| live_coords.contains(coord));
     }
@@ -387,14 +416,13 @@ impl egui_wgpu::CallbackTrait for MapCallback {
 
         resources.update_screen_size(queue, self.width, self.height);
 
-        let live_keys: std::collections::HashSet<u64> =
-            self.tiles.iter().map(|tile| tile.key).collect();
+        let live_keys: FxHashSet<u64> = self.tiles.iter().map(|tile| tile.key).collect();
         for tile in &self.tiles {
             resources.ensure_tile_texture(device, queue, tile);
         }
         resources.evict_stale_tiles(&live_keys);
 
-        let live_basemap_coords: std::collections::HashSet<TileCoord> =
+        let live_basemap_coords: FxHashSet<TileCoord> =
             self.basemap_tiles.iter().map(|draw| draw.coord).collect();
         for draw in &self.basemap_tiles {
             resources.ensure_basemap_tile_buffer(device, draw.coord, &draw.mesh);
@@ -404,33 +432,19 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         let basemap_draws = self
             .basemap_tiles
             .iter()
-            .filter(|draw| resources.tile_gpu_meshes.contains_key(&draw.coord))
-            .map(|draw| {
+            .filter_map(|draw| {
+                let tile_mesh = resources.tile_gpu_meshes.get(&draw.coord)?;
                 let uniform = TileTransformUniform {
                     offset: draw.offset,
                     scale: draw.scale,
                     width_scale: draw.width_scale,
                 };
-                let transform_buffer =
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("rgis-basemap-tile-transform"),
-                        contents: bytemuck::bytes_of(&uniform),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
-                let transform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("rgis-basemap-tile-transform-bind-group"),
-                    layout: &resources.tile_transform_bind_group_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: transform_buffer.as_entire_binding(),
-                    }],
-                });
-                BasemapDrawPrepared {
+                queue.write_buffer(&tile_mesh.transform_buffer, 0, bytemuck::bytes_of(&uniform));
+                Some(BasemapDrawPrepared {
                     coord: draw.coord,
-                    transform_bind_group,
                     offset: draw.offset,
                     size: draw.size,
-                }
+                })
             })
             .collect();
 
@@ -601,7 +615,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     && let Some((x, y, w, h)) = scissor_for(draw.offset, draw.size)
                 {
                     render_pass.set_scissor_rect(x, y, w, h);
-                    render_pass.set_bind_group(1, &draw.transform_bind_group, &[]);
+                    render_pass.set_bind_group(1, &tile_mesh.transform_bind_group, &[]);
                     render_pass.set_vertex_buffer(0, fill.vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(fill.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -616,7 +630,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     && let Some((x, y, w, h)) = scissor_for(draw.offset, draw.size)
                 {
                     render_pass.set_scissor_rect(x, y, w, h);
-                    render_pass.set_bind_group(1, &draw.transform_bind_group, &[]);
+                    render_pass.set_bind_group(1, &tile_mesh.transform_bind_group, &[]);
                     render_pass.set_vertex_buffer(0, lines.vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(lines.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -665,11 +679,10 @@ struct FramePrepared {
 }
 
 /// A basemap tile draw ready for `paint`: the persistent GPU mesh buffers
-/// live in `MapRenderResources::tile_gpu_meshes` (looked up by `coord`),
-/// only the transform bind group is rebuilt (cheaply) every frame.
+/// and transform bind group live in `MapRenderResources::tile_gpu_meshes`
+/// (looked up by `coord`) -- nothing tile-specific is allocated per frame.
 struct BasemapDrawPrepared {
     coord: TileCoord,
-    transform_bind_group: wgpu::BindGroup,
     offset: [f32; 2],
     size: f32,
 }

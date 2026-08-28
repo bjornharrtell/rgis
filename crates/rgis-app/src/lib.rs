@@ -47,6 +47,10 @@ pub struct RgisApp {
     cursor_lonlat: Option<(f64, f64)>,
     last_error: Option<String>,
     layers_expanded: bool,
+    /// e.g. "Vulkan"/"Metal" (native) or "BrowserWebGpu"/"Gl" (web) — shown
+    /// in the status bar since the web build silently falls back to WebGL2
+    /// (much higher per-draw-call overhead) when WebGPU isn't available.
+    gpu_backend_label: String,
 }
 
 impl RgisApp {
@@ -58,6 +62,7 @@ impl RgisApp {
         render_state.renderer.write().callback_resources.insert(
             rgis_render::MapRenderResources::new(&render_state.device, render_state.target_format),
         );
+        let gpu_backend_label = format!("{:?}", render_state.adapter.get_info().backend);
 
         Self {
             project: Project::default(),
@@ -69,6 +74,7 @@ impl RgisApp {
             cursor_lonlat: None,
             last_error: None,
             layers_expanded: true,
+            gpu_backend_label,
         }
     }
 
@@ -335,6 +341,8 @@ impl RgisApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label("EPSG:4326");
+                ui.separator();
+                ui.label(&self.gpu_backend_label);
                 ui.separator();
                 ui.label(status_bar::format_scale(self.project.viewport.resolution()));
                 ui.separator();
