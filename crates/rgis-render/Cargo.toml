@@ -12,7 +12,7 @@ image             = { workspace = true }
 wgpu              = { workspace = true }
 egui-wgpu         = "0.36.1"
 epaint            = "0.36.1"
-lyon              = { workspace = true }
+earcut            = { workspace = true }
 bytemuck          = { workspace = true }
 rustc-hash        = { workspace = true }
 lru               = { workspace = true }

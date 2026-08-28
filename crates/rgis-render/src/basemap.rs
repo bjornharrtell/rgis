@@ -7,10 +7,8 @@
 //! looks close to the reference MapLibre rendering.
 
 use bytemuck::{Pod, Zeroable};
+use earcut::Earcut;
 use geo_types::{Geometry, LineString, Polygon};
-use lyon::math::point;
-use lyon::path::{Builder, Path};
-use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
 use rgis_core::{EARTH_HALF_CIRC, Viewport};
 use rgis_tiles::{TileCoord, VectorFeature, VectorTile};
 
@@ -391,8 +389,9 @@ fn style_for(layer_name: &str, feature: &VectorFeature, zoom: f64) -> Option<Pai
 /// indefinitely (see [`tile_screen_transform`] for the cheap per-frame
 /// screen transform applied on the GPU).
 pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
-    let mut fill_buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-    let mut fill_tess = FillTessellator::new();
+    let mut fill_mesh = SceneMesh::default();
+    let mut earcut: Earcut<f32> = Earcut::new();
+    let mut earcut_buf: Vec<u32> = Vec::new();
     let mut lines = LineMesh::default();
     let zoom = coord.z as f64;
     let tile_size_m = TileMercatorBounds::for_coord(coord).size;
@@ -426,7 +425,14 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
 
         for (feature, paint) in &styled {
             if let Some(color) = paint.fill {
-                append_fill(&mut fill_buffers, &mut fill_tess, feature, &ctx, color);
+                append_fill(
+                    &mut fill_mesh,
+                    &mut earcut,
+                    &mut earcut_buf,
+                    feature,
+                    &ctx,
+                    color,
+                );
             }
         }
         for (feature, paint) in &styled {
@@ -449,10 +455,7 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
     let labels = extract_labels(tile, coord, tile_size_m, &mut lines);
 
     TileMesh {
-        fill: SceneMesh {
-            vertices: fill_buffers.vertices,
-            indices: fill_buffers.indices,
-        },
+        fill: fill_mesh,
         lines,
         labels,
     }
@@ -569,11 +572,11 @@ fn extract_labels(
             };
             let pos = ctx.project_point(p.x(), p.y());
             if marker_style(layer_name, feature, zoom) {
-                append_disc(lines, [pos.x, pos.y], MARKER_RADIUS_PX + 1.0, MARKER_HALO);
-                append_disc(lines, [pos.x, pos.y], MARKER_RADIUS_PX, MARKER_FILL);
+                append_disc(lines, pos, MARKER_RADIUS_PX + 1.0, MARKER_HALO);
+                append_disc(lines, pos, MARKER_RADIUS_PX, MARKER_FILL);
             }
             labels.push(TileLabel {
-                position: [pos.x, pos.y],
+                position: pos,
                 text: text.to_string(),
                 font_size,
                 color: [0.15, 0.15, 0.17, 1.0],
@@ -786,28 +789,31 @@ struct TileContext {
 }
 
 impl TileContext {
-    fn project_point(&self, local_x: i32, local_y: i32) -> lyon::math::Point {
+    fn project_point(&self, local_x: i32, local_y: i32) -> [f32; 2] {
         let fx = local_x as f64 / self.extent as f64;
         let fy = local_y as f64 / self.extent as f64;
-        point(
+        [
             (fx * self.tile_size_m) as f32,
             (fy * self.tile_size_m) as f32,
-        )
+        ]
     }
 }
 
 fn append_fill(
-    buffers: &mut VertexBuffers<Vertex, u32>,
-    fill_tess: &mut FillTessellator,
+    fill_mesh: &mut SceneMesh,
+    earcut: &mut Earcut<f32>,
+    earcut_buf: &mut Vec<u32>,
     feature: &VectorFeature,
     ctx: &TileContext,
     color: [f32; 4],
 ) {
     match &feature.geometry {
-        Geometry::Polygon(polygon) => fill_polygon(buffers, fill_tess, polygon, ctx, color),
+        Geometry::Polygon(polygon) => {
+            fill_polygon(fill_mesh, earcut, earcut_buf, polygon, ctx, color)
+        }
         Geometry::MultiPolygon(polygons) => {
             for polygon in &polygons.0 {
-                fill_polygon(buffers, fill_tess, polygon, ctx, color);
+                fill_polygon(fill_mesh, earcut, earcut_buf, polygon, ctx, color);
             }
         }
         _ => {}
@@ -815,15 +821,39 @@ fn append_fill(
 }
 
 fn fill_polygon(
-    buffers: &mut VertexBuffers<Vertex, u32>,
-    fill_tess: &mut FillTessellator,
+    fill_mesh: &mut SceneMesh,
+    earcut: &mut Earcut<f32>,
+    earcut_buf: &mut Vec<u32>,
     polygon: &Polygon<i32>,
     ctx: &TileContext,
     color: [f32; 4],
 ) {
-    if let Some(path) = ring_path(polygon, ctx) {
-        fill_path(buffers, fill_tess, path, color);
+    let mut data = ring_points_no_close(polygon.exterior(), ctx);
+    if data.len() < 3 {
+        return;
     }
+    let mut hole_indices: Vec<u32> = Vec::new();
+    for ring in polygon.interiors() {
+        let ring = ring_points_no_close(ring, ctx);
+        if ring.len() < 3 {
+            continue;
+        }
+        hole_indices.push(data.len() as u32);
+        data.extend(ring);
+    }
+
+    earcut.earcut(data.iter().copied(), &hole_indices, earcut_buf);
+    if earcut_buf.is_empty() {
+        return;
+    }
+
+    let base = fill_mesh.vertices.len() as u32;
+    fill_mesh
+        .vertices
+        .extend(data.iter().map(|&position| Vertex { position, color }));
+    fill_mesh
+        .indices
+        .extend(earcut_buf.iter().map(|&i| base + i));
 }
 
 fn append_outline(
@@ -870,28 +900,11 @@ fn ring_points(ring: &LineString<i32>, ctx: &TileContext) -> Vec<[f32; 2]> {
     points
 }
 
-/// Builds a `Path` covering a polygon's exterior + interior rings, for
-/// fill tessellation.
-fn ring_path(polygon: &Polygon<i32>, ctx: &TileContext) -> Option<Path> {
-    let mut builder = Path::builder();
-    let mut any_ring = build_ring(&mut builder, polygon.exterior(), ctx);
-    for ring in polygon.interiors() {
-        any_ring |= build_ring(&mut builder, ring, ctx);
-    }
-    any_ring.then(|| builder.build())
-}
-
-fn build_ring(builder: &mut Builder, ring: &LineString<i32>, ctx: &TileContext) -> bool {
-    let mut coords = ring.coords();
-    let Some(first) = coords.next() else {
-        return false;
-    };
-    builder.begin(ctx.project_point(first.x, first.y));
-    for coord in coords {
-        builder.line_to(ctx.project_point(coord.x, coord.y));
-    }
-    builder.end(true);
-    true
+/// Builds a polygon ring's projected points for `earcut`, without a
+/// duplicated closing coordinate (unlike [`ring_points`], which is used
+/// for line-stroke rendering and keeps it).
+fn ring_points_no_close(ring: &LineString<i32>, ctx: &TileContext) -> Vec<[f32; 2]> {
+    line_points(ring, ctx)
 }
 
 fn append_line(
@@ -915,12 +928,7 @@ fn append_line(
 }
 
 fn line_points(line: &LineString<i32>, ctx: &TileContext) -> Vec<[f32; 2]> {
-    line.coords()
-        .map(|c| {
-            let p = ctx.project_point(c.x, c.y);
-            [p.x, p.y]
-        })
-        .collect()
+    line.coords().map(|c| ctx.project_point(c.x, c.y)).collect()
 }
 
 /// Tessellates a polyline into a screen-pixel-width "ribbon": each segment
@@ -1127,25 +1135,6 @@ fn append_disc(buffers: &mut LineMesh, center: [f32; 2], radius: f32, color: [f3
             .indices
             .extend_from_slice(&[base, base + i + 1, base + next]);
     }
-}
-
-fn fill_path(
-    buffers: &mut VertexBuffers<Vertex, u32>,
-    fill_tess: &mut FillTessellator,
-    path: Path,
-    color: [f32; 4],
-) {
-    let _ = fill_tess.tessellate_path(
-        &path,
-        &FillOptions::default(),
-        &mut BuffersBuilder::new(buffers, move |vertex: FillVertex| {
-            let p = vertex.position();
-            Vertex {
-                position: [p.x, p.y],
-                color,
-            }
-        }),
-    );
 }
 
 #[cfg(test)]
