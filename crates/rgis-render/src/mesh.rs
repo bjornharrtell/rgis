@@ -1,19 +1,15 @@
 //! Converts `rgis_core` layer geometry into GPU-ready triangle meshes.
 //!
-//! Fills, strokes, and point markers for every visible layer are tessellated
-//! with `lyon` into a single vertex/index buffer (in screen-pixel space), so
-//! the whole scene can be drawn with one indexed draw call.
+//! Fills are tessellated with `earcut` and strokes/point markers are
+//! extruded by hand into quads/fans, all into a single vertex/index buffer
+//! (in screen-pixel space), so the whole scene can be drawn with one
+//! indexed draw call.
 
 use bytemuck::{Pod, Zeroable};
+use earcut::Earcut;
 use geo_types::{
     Coord, Geometry, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
     Triangle,
-};
-use lyon::math::point;
-use lyon::path::{Builder, Path};
-use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator,
-    StrokeVertex, VertexBuffers,
 };
 use rgis_core::{Layer, Viewport};
 
@@ -23,6 +19,10 @@ pub struct Vertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
 }
+
+/// Number of segments used to approximate circles (point markers and round
+/// line joins/caps).
+const CIRCLE_SEGMENTS: u32 = 16;
 
 /// A tessellated triangle mesh for the whole visible project, in screen-pixel
 /// space (already offset by the map viewport's on-screen origin).
@@ -55,17 +55,19 @@ pub fn build_scene_mesh_with_offset(
     let mut visible_layers: Vec<_> = layers.iter().filter(|layer| layer.visible).collect();
     visible_layers.sort_by_key(|layer| layer.z_order);
 
-    let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-    let mut fill_tess = FillTessellator::new();
-    let mut stroke_tess = StrokeTessellator::new();
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut earcut: Earcut<f32> = Earcut::new();
+    let mut earcut_buf: Vec<u32> = Vec::new();
 
     for layer in visible_layers {
         let mut ctx = LayerTessCtx {
             viewport,
             offset,
-            buffers: &mut buffers,
-            fill_tess: &mut fill_tess,
-            stroke_tess: &mut stroke_tess,
+            vertices: &mut vertices,
+            indices: &mut indices,
+            earcut: &mut earcut,
+            earcut_buf: &mut earcut_buf,
             fill_color: color_to_array(layer.style.fill),
             stroke_color: color_to_array(layer.style.stroke),
             stroke_width: layer.style.stroke_width.max(0.1),
@@ -76,18 +78,16 @@ pub fn build_scene_mesh_with_offset(
         }
     }
 
-    SceneMesh {
-        vertices: buffers.vertices,
-        indices: buffers.indices,
-    }
+    SceneMesh { vertices, indices }
 }
 
 struct LayerTessCtx<'a> {
     viewport: &'a Viewport,
     offset: [f32; 2],
-    buffers: &'a mut VertexBuffers<Vertex, u32>,
-    fill_tess: &'a mut FillTessellator,
-    stroke_tess: &'a mut StrokeTessellator,
+    vertices: &'a mut Vec<Vertex>,
+    indices: &'a mut Vec<u32>,
+    earcut: &'a mut Earcut<f32>,
+    earcut_buf: &'a mut Vec<u32>,
     fill_color: [f32; 4],
     stroke_color: [f32; 4],
     stroke_width: f32,
@@ -95,9 +95,9 @@ struct LayerTessCtx<'a> {
 }
 
 impl LayerTessCtx<'_> {
-    fn screen(&self, coord: Coord) -> lyon::math::Point {
+    fn screen(&self, coord: Coord) -> [f32; 2] {
         let [x, y] = self.viewport.world_to_screen(coord);
-        point(x + self.offset[0], y + self.offset[1])
+        [x + self.offset[0], y + self.offset[1]]
     }
 
     fn append_geometry(&mut self, geometry: &Geometry) {
@@ -126,34 +126,14 @@ impl LayerTessCtx<'_> {
     }
 
     fn append_point(&mut self, p: &Point) {
-        const SEGMENTS: u32 = 16;
         let center = self.screen(p.0);
-        let radius = self.point_radius;
-
-        let mut builder = Path::builder();
-        for i in 0..SEGMENTS {
-            let angle = (i as f32 / SEGMENTS as f32) * std::f32::consts::TAU;
-            let p = point(
-                center.x + radius * angle.cos(),
-                center.y + radius * angle.sin(),
-            );
-            if i == 0 {
-                builder.begin(p);
-            } else {
-                builder.line_to(p);
-            }
-        }
-        builder.end(true);
-
-        self.fill_path(builder.build(), self.fill_color);
+        let color = self.fill_color;
+        self.push_disc(center, self.point_radius, color);
     }
 
     fn append_line(&mut self, line: &Line) {
-        let mut builder = Path::builder();
-        builder.begin(self.screen(line.start));
-        builder.line_to(self.screen(line.end));
-        builder.end(false);
-        self.stroke_path(builder.build());
+        let points = [self.screen(line.start), self.screen(line.end)];
+        self.stroke_polyline(&points, false);
     }
 
     fn append_multilinestring(&mut self, lines: &MultiLineString) {
@@ -163,25 +143,26 @@ impl LayerTessCtx<'_> {
     }
 
     fn append_linestring(&mut self, line_string: &LineString) {
-        let Some(path) = self.build_open_path(line_string) else {
+        let points = self.line_string_points(line_string);
+        if points.len() < 2 {
             return;
-        };
-        self.stroke_path(path);
+        }
+        self.stroke_polyline(&points, false);
     }
 
     fn append_polygon(&mut self, polygon: &Polygon) {
-        let mut builder = Path::builder();
-        let mut any_ring = false;
-        any_ring |= self.build_ring(&mut builder, polygon.exterior());
+        self.fill_polygon(polygon);
+
+        let exterior = self.ring_points(polygon.exterior());
+        if exterior.len() >= 2 {
+            self.stroke_polyline(&exterior, true);
+        }
         for ring in polygon.interiors() {
-            any_ring |= self.build_ring(&mut builder, ring);
+            let ring = self.ring_points(ring);
+            if ring.len() >= 2 {
+                self.stroke_polyline(&ring, true);
+            }
         }
-        if !any_ring {
-            return;
-        }
-        let path = builder.build();
-        self.fill_path(path.clone(), self.fill_color);
-        self.stroke_path(path);
     }
 
     fn append_multipolygon(&mut self, polygons: &MultiPolygon) {
@@ -190,62 +171,128 @@ impl LayerTessCtx<'_> {
         }
     }
 
-    /// Builds an open (non-closed) path from a line string, for stroking.
-    fn build_open_path(&self, line_string: &LineString) -> Option<Path> {
-        let mut coords = line_string.coords();
-        let first = coords.next()?;
-        let mut builder = Path::builder();
-        builder.begin(self.screen(*first));
-        for coord in coords {
-            builder.line_to(self.screen(*coord));
+    /// Screen-space points of an open line string.
+    fn line_string_points(&self, line_string: &LineString) -> Vec<[f32; 2]> {
+        line_string.coords().map(|c| self.screen(*c)).collect()
+    }
+
+    /// Screen-space points of a closed ring, with the duplicated
+    /// closing coordinate (present on `geo_types` rings) dropped, since
+    /// `stroke_polyline`/`fill_polygon` close the loop themselves.
+    fn ring_points(&self, ring: &LineString) -> Vec<[f32; 2]> {
+        let mut coords: Vec<Coord> = ring.coords().copied().collect();
+        if coords.len() > 1 && coords.first() == coords.last() {
+            coords.pop();
         }
-        builder.end(false);
-        Some(builder.build())
+        coords.into_iter().map(|c| self.screen(c)).collect()
     }
 
-    /// Adds a closed ring's subpath to `builder`. Returns `true` if any
-    /// geometry was added.
-    fn build_ring(&self, builder: &mut Builder, ring: &LineString) -> bool {
-        let mut coords = ring.coords();
-        let Some(first) = coords.next() else {
-            return false;
-        };
-        builder.begin(self.screen(*first));
-        for coord in coords {
-            builder.line_to(self.screen(*coord));
+    /// Triangulates a polygon (exterior + holes) with `earcut` and appends
+    /// the resulting triangles using the layer's fill color.
+    fn fill_polygon(&mut self, polygon: &Polygon) {
+        let exterior = self.ring_points(polygon.exterior());
+        if exterior.len() < 3 {
+            return;
         }
-        builder.end(true);
-        true
+
+        let mut data = exterior;
+        let mut hole_indices: Vec<u32> = Vec::new();
+        for ring in polygon.interiors() {
+            let ring = self.ring_points(ring);
+            if ring.len() < 3 {
+                continue;
+            }
+            hole_indices.push(data.len() as u32);
+            data.extend(ring);
+        }
+
+        self.earcut
+            .earcut(data.iter().copied(), &hole_indices, self.earcut_buf);
+        if self.earcut_buf.is_empty() {
+            return;
+        }
+
+        let color = self.fill_color;
+        let base = self.vertices.len() as u32;
+        self.vertices
+            .extend(data.iter().map(|&position| Vertex { position, color }));
+        self.indices
+            .extend(self.earcut_buf.iter().map(|&i| base + i));
     }
 
-    fn fill_path(&mut self, path: Path, color: [f32; 4]) {
-        let _ = self.fill_tess.tessellate_path(
-            &path,
-            &FillOptions::default(),
-            &mut BuffersBuilder::new(self.buffers, move |vertex: FillVertex| {
-                let p = vertex.position();
-                Vertex {
-                    position: [p.x, p.y],
-                    color,
-                }
-            }),
-        );
-    }
-
-    fn stroke_path(&mut self, path: Path) {
+    /// Extrudes a polyline into stroke-width quads, with round joins/caps
+    /// (a disc at every vertex) so segments meet cleanly.
+    fn stroke_polyline(&mut self, points: &[[f32; 2]], closed: bool) {
+        let n = points.len();
+        if n < 2 {
+            return;
+        }
+        let half_width = self.stroke_width / 2.0;
         let color = self.stroke_color;
-        let options = StrokeOptions::default().with_line_width(self.stroke_width);
-        let _ = self.stroke_tess.tessellate_path(
-            &path,
-            &options,
-            &mut BuffersBuilder::new(self.buffers, move |vertex: StrokeVertex| {
-                let p = vertex.position();
-                Vertex {
-                    position: [p.x, p.y],
-                    color,
-                }
-            }),
-        );
+
+        let segment_count = if closed { n } else { n - 1 };
+        for i in 0..segment_count {
+            let a = points[i];
+            let b = points[(i + 1) % n];
+            self.push_segment_quad(a, b, half_width, color);
+        }
+        for &center in points {
+            self.push_disc(center, half_width, color);
+        }
+    }
+
+    fn push_segment_quad(&mut self, a: [f32; 2], b: [f32; 2], half_width: f32, color: [f32; 4]) {
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < f32::EPSILON {
+            return;
+        }
+        let nx = -dy / len * half_width;
+        let ny = dx / len * half_width;
+
+        let base = self.vertices.len() as u32;
+        self.vertices.push(Vertex {
+            position: [a[0] + nx, a[1] + ny],
+            color,
+        });
+        self.vertices.push(Vertex {
+            position: [a[0] - nx, a[1] - ny],
+            color,
+        });
+        self.vertices.push(Vertex {
+            position: [b[0] + nx, b[1] + ny],
+            color,
+        });
+        self.vertices.push(Vertex {
+            position: [b[0] - nx, b[1] - ny],
+            color,
+        });
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    fn push_disc(&mut self, center: [f32; 2], radius: f32, color: [f32; 4]) {
+        let base = self.vertices.len() as u32;
+        self.vertices.push(Vertex {
+            position: center,
+            color,
+        });
+        for i in 0..CIRCLE_SEGMENTS {
+            let angle = (i as f32 / CIRCLE_SEGMENTS as f32) * std::f32::consts::TAU;
+            self.vertices.push(Vertex {
+                position: [
+                    center[0] + radius * angle.cos(),
+                    center[1] + radius * angle.sin(),
+                ],
+                color,
+            });
+        }
+        for i in 0..CIRCLE_SEGMENTS {
+            let next = if i + 1 == CIRCLE_SEGMENTS { 1 } else { i + 2 };
+            self.indices
+                .extend_from_slice(&[base, base + i + 1, base + next]);
+        }
     }
 }
 
