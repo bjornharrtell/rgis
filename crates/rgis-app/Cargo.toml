@@ -25,6 +25,7 @@ wgpu        = { workspace = true }
 image       = { workspace = true }
 rfd         = { workspace = true }
 poll-promise = { workspace = true }
+lru         = { workspace = true }
 
 # Native file loading uses Promise::spawn_thread (blocking IO on a background
 # std::thread, needs no extra feature). The browser can't spawn OS threads, so

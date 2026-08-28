@@ -2,9 +2,10 @@
 //! binary ([`crate`] via `main.rs`) and the browser build (`rgis-web`, via
 //! `eframe::WebRunner`).
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lru::LruCache;
 use poll_promise::Promise;
 use rgis_core::{Layer, LayerId, Project, mercator_to_lonlat};
 use rgis_io::{IoError, LoadedLayer};
@@ -17,6 +18,14 @@ mod status_bar;
 /// so both the native app and the browser build have something to show
 /// without requiring a file picker.
 pub const SAMPLE_GEOJSON: &[u8] = include_bytes!("../assets/sample.geojson");
+
+/// Max number of tessellated tile meshes kept in `RgisApp::tile_meshes`.
+/// Without a bound this cache grows forever as the user pans/zooms over new
+/// areas (unlike the GPU-side buffers, which only ever hold the currently
+/// visible tiles) -- matches the order of magnitude of the other tile caches
+/// in this codebase (`rgis_tiles::TileCache`'s 256, `VectorTileFetcher`'s
+/// 128 decoded-tile cache).
+const TILE_MESH_CACHE_SIZE: usize = 256;
 
 /// Extra vertical padding added above/below the sidebar tree row content.
 const ROW_VPAD: f32 = 5.0;
@@ -33,8 +42,9 @@ pub struct RgisApp {
     /// Tessellated mesh per tile, in tile-local metres (viewport-independent
     /// — see `rgis_render::build_tile_mesh`) — built once per tile and
     /// reused across every pan/zoom, unlike the final screen-space mesh
-    /// which is cheap to recompute every frame from these.
-    tile_meshes: HashMap<TileCoord, Arc<TileMesh>>,
+    /// which is cheap to recompute every frame from these. Bounded (LRU) so
+    /// panning/zooming over a large area doesn't grow memory forever.
+    tile_meshes: LruCache<TileCoord, Arc<TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
     /// Tessellation jobs in flight: a decoded tile arriving from
     /// `vector_tile_fetcher` is tessellated on a background thread (native)
@@ -67,7 +77,7 @@ impl RgisApp {
         Self {
             project: Project::default(),
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
-            tile_meshes: HashMap::new(),
+            tile_meshes: LruCache::new(NonZeroUsize::new(TILE_MESH_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
             pending_loads: Vec::new(),
@@ -217,7 +227,7 @@ impl RgisApp {
             match promise.try_take() {
                 Ok((coord, mesh)) => {
                     self.pending_tiles.remove(&coord);
-                    self.tile_meshes.insert(coord, Arc::new(mesh));
+                    self.tile_meshes.put(coord, Arc::new(mesh));
                 }
                 Err(promise) => still_pending.push(promise),
             }
@@ -236,7 +246,7 @@ impl RgisApp {
             x /= 2;
             y /= 2;
             let ancestor = TileCoord { z, x, y };
-            if self.tile_meshes.contains_key(&ancestor) {
+            if self.tile_meshes.contains(&ancestor) {
                 return Some(ancestor);
             }
         }
