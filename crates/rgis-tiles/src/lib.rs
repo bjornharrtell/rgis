@@ -5,6 +5,12 @@ use image::RgbaImage;
 use lru::LruCache;
 use thiserror::Error;
 
+mod vector;
+pub use vector::{
+    OPENFREEMAP_ATTRIBUTION, OPENFREEMAP_MAX_ZOOM, PropertyValue, VectorFeature, VectorTile,
+    VectorTileFetched, VectorTileFetcher, VectorTileLayer, VectorTileReady, decode_vector_tile,
+};
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,6 +33,8 @@ pub enum TileError {
     Image(#[from] image::ImageError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("vector tile decode error: {0}")]
+    Mvt(String),
 }
 
 // ── TileSource trait ──────────────────────────────────────────────────────────
@@ -210,7 +218,13 @@ impl TileFetcher {
 use rgis_core::{EARTH_HALF_CIRC, Viewport};
 
 pub fn visible_tiles(viewport: &Viewport, source: &dyn TileSource) -> Vec<TileCoord> {
-    let z = (viewport.zoom.floor() as u8).min(source.max_zoom());
+    visible_tiles_for_zoom(viewport, source.max_zoom())
+}
+
+/// Like [`visible_tiles`], but for sources (e.g. [`VectorTileFetcher`]) that
+/// don't implement [`TileSource`].
+pub fn visible_tiles_for_zoom(viewport: &Viewport, max_zoom: u8) -> Vec<TileCoord> {
+    let z = (viewport.zoom.floor() as u8).min(max_zoom);
     let n = 2_u32.pow(z as u32) as f64;
 
     let merc_to_tile = |mx: f64, my: f64| -> (f64, f64) {

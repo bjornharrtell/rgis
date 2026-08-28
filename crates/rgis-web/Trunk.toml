@@ -5,10 +5,15 @@ dist = "dist"
 # so assets need to be referenced with that base path. This is overridden to
 # "/" for local `trunk serve`.
 public_url = "/rgis/"
+# The wasm build has no real background thread (tile tessellation runs on
+# the same thread as rendering/input), so an unoptimized debug build is
+# noticeably jankier than native; always build in release mode. Override
+# with `TRUNK_BUILD_RELEASE=false` if you need debug info.
+release = true
 
 [watch]
-watch = ["src", "assets", "index.html"]
+watch = ["src", "index.html"]
 
 [serve]
-address = "127.0.0.1"
+addresses = ["127.0.0.1"]
 port = 8080

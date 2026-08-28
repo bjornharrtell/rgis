@@ -12,6 +12,10 @@ image       = { workspace = true }
 lru         = { workspace = true }
 thiserror   = { workspace = true }
 ehttp = { workspace = true }
+serde_json  = { workspace = true }
+# Mapbox Vector Tile decoding. Reader-only: we never write/encode tiles, and
+# skip its `cli`/`json`/`arbitrary` extras.
+fast-mvt    = { version = "0.6", default-features = false, features = ["reader"] }
 
 # Disk tile cache is native-only; the browser has no filesystem to cache to.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

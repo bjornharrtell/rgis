@@ -26,10 +26,21 @@ pub struct Vertex {
 
 /// A tessellated triangle mesh for the whole visible project, in screen-pixel
 /// space (already offset by the map viewport's on-screen origin).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SceneMesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+}
+
+impl SceneMesh {
+    /// Appends `other`'s triangles after this mesh's, so `other` is drawn on
+    /// top (there's no depth test — draw order is paint order).
+    pub fn extend(&mut self, other: SceneMesh) {
+        let offset = self.vertices.len() as u32;
+        self.vertices.extend(other.vertices);
+        self.indices
+            .extend(other.indices.into_iter().map(|i| i + offset));
+    }
 }
 
 pub fn build_scene_mesh(layers: &[Layer], viewport: &Viewport) -> SceneMesh {

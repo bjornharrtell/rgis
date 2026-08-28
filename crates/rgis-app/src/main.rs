@@ -8,6 +8,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_title("rgis")
             .with_inner_size([1280.0, 800.0]),
+        multisampling: rgis_render::MSAA_SAMPLES as u16,
         ..Default::default()
     };
 
