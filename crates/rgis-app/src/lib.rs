@@ -758,7 +758,12 @@ impl RgisApp {
                         angle += std::f32::consts::PI;
                     }
                     let x = anchor.x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
-                    let y = anchor.y + label.font_size * 0.35
+                    // Center the label vertically on the road line itself
+                    // (matching MapLibre's line-placed labels): baseline is
+                    // pushed down from the line by roughly half the glyphs'
+                    // typical cap-height, so the ink's vertical midpoint --
+                    // not its baseline -- sits on the road.
+                    let y = anchor.y + label.font_size * 0.5
                         - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
                     let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
                     let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
