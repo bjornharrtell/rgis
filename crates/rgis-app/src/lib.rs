@@ -90,6 +90,11 @@ const ROW_HOVER_FILL: egui::Color32 = egui::Color32::from_gray(40);
 /// MapLibre/OpenFreeMap fontstack name used for all map labels for now.
 const LABEL_FONTSTACK: &str = "Noto Sans Regular";
 
+/// Screen width (logical points) below which the layer list switches from a
+/// docked side panel to a floating overlay toggled by a button, so the map
+/// gets the full viewport width on phones/narrow windows.
+const MOBILE_WIDTH_THRESHOLD: f32 = 600.0;
+
 /// One or more layers finished (or failed) loading, each tagged with a
 /// display name for error messages.
 type LoadResults = Vec<(String, Result<LoadedLayer, IoError>)>;
@@ -127,6 +132,10 @@ pub struct RgisApp {
     /// bounding-box zoom gesture (see `render_map`) -- `None` when no such
     /// gesture is active, in which case a plain drag pans the map instead.
     bbox_zoom_start: Option<egui::Pos2>,
+    /// Whether the floating layer-list overlay is shown on narrow/mobile
+    /// viewports (see `MOBILE_WIDTH_THRESHOLD`) — irrelevant on desktop,
+    /// where the layer list is always visible as a docked side panel.
+    mobile_layers_open: bool,
     /// e.g. "Vulkan"/"Metal" (native) or "BrowserWebGpu"/"Gl" (web) — shown
     /// in the status bar since the web build silently falls back to WebGL2
     /// (much higher per-draw-call overhead) when WebGPU isn't available.
@@ -158,6 +167,7 @@ impl RgisApp {
             last_error: None,
             layers_expanded: true,
             bbox_zoom_start: None,
+            mobile_layers_open: false,
             gpu_backend_label,
         }
     }
@@ -436,51 +446,91 @@ impl RgisApp {
         }
     }
 
+    /// The layer tree + error message, shared between the desktop docked
+    /// panel and the mobile floating overlay (see `render_sidebar`).
+    fn render_layers_content(&mut self, ui: &mut egui::Ui) {
+        let mut to_toggle: Option<LayerId> = None;
+        let mut to_remove: Option<LayerId> = None;
+        let mut show_tiles = self.project.show_tiles;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            self.render_layers_root_row(ui);
+
+            if self.layers_expanded {
+                // Listed top-to-bottom in draw order (topmost drawn
+                // layer first), with the OSM basemap last since it's
+                // always the bottom of the stack.
+                for layer in self.project.layers.iter().rev() {
+                    let mut visible = layer.visible;
+                    let (toggled, removed) = tree_row(ui, &mut visible, &layer.name, true);
+                    if toggled {
+                        to_toggle = Some(layer.id);
+                    }
+                    if removed {
+                        to_remove = Some(layer.id);
+                    }
+                }
+
+                tree_row(ui, &mut show_tiles, "OpenFreeMap Background", false);
+            }
+        });
+
+        self.project.show_tiles = show_tiles;
+        if let Some(id) = to_toggle
+            && let Some(layer) = self.project.get_layer_mut(id)
+        {
+            layer.visible = !layer.visible;
+        }
+        if let Some(id) = to_remove {
+            self.project.remove_layer(id);
+        }
+
+        if let Some(error) = &self.last_error {
+            ui.separator();
+            ui.colored_label(egui::Color32::from_rgb(0xe0, 0x6c, 0x75), error);
+        }
+    }
+
+    /// On desktop/wide viewports, renders the layer list as the usual
+    /// docked left panel. On narrow/mobile viewports it instead renders a
+    /// small floating toggle button plus (when opened) a floating overlay
+    /// window, so the map can use the full screen width -- see
+    /// `MOBILE_WIDTH_THRESHOLD`.
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("sidebar")
-            .default_size(280.0)
-            .show(ui, |ui| {
-                let mut to_toggle: Option<LayerId> = None;
-                let mut to_remove: Option<LayerId> = None;
-                let mut show_tiles = self.project.show_tiles;
+        let is_mobile = ui.ctx().input(|i| i.viewport_rect()).width() < MOBILE_WIDTH_THRESHOLD;
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.render_layers_root_row(ui);
+        if !is_mobile {
+            egui::Panel::left("sidebar")
+                .default_size(280.0)
+                .show(ui, |ui| self.render_layers_content(ui));
+            return;
+        }
 
-                    if self.layers_expanded {
-                        // Listed top-to-bottom in draw order (topmost drawn
-                        // layer first), with the OSM basemap last since it's
-                        // always the bottom of the stack.
-                        for layer in self.project.layers.iter().rev() {
-                            let mut visible = layer.visible;
-                            let (toggled, removed) = tree_row(ui, &mut visible, &layer.name, true);
-                            if toggled {
-                                to_toggle = Some(layer.id);
-                            }
-                            if removed {
-                                to_remove = Some(layer.id);
-                            }
-                        }
-
-                        tree_row(ui, &mut show_tiles, "OpenFreeMap Background", false);
+        egui::Area::new(egui::Id::new("mobile_layers_toggle"))
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    let label = if self.mobile_layers_open {
+                        "✕"
+                    } else {
+                        "☰"
+                    };
+                    if ui.button(label).clicked() {
+                        self.mobile_layers_open = !self.mobile_layers_open;
                     }
                 });
-
-                self.project.show_tiles = show_tiles;
-                if let Some(id) = to_toggle
-                    && let Some(layer) = self.project.get_layer_mut(id)
-                {
-                    layer.visible = !layer.visible;
-                }
-                if let Some(id) = to_remove {
-                    self.project.remove_layer(id);
-                }
-
-                if let Some(error) = &self.last_error {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::from_rgb(0xe0, 0x6c, 0x75), error);
-                }
             });
+
+        if self.mobile_layers_open {
+            egui::Window::new("Layers")
+                .id(egui::Id::new("mobile_layers_window"))
+                .default_pos(egui::pos2(8.0, 48.0))
+                .default_width(260.0)
+                .max_height(ui.ctx().input(|i| i.viewport_rect()).height() - 96.0)
+                .collapsible(false)
+                .resizable(true)
+                .show(ui.ctx(), |ui| self.render_layers_content(ui));
+        }
     }
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
