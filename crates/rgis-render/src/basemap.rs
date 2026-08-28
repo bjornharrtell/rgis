@@ -65,6 +65,85 @@ pub(crate) struct LineMesh {
     pub(crate) indices: Vec<u32>,
 }
 
+/// A flat, structured-clone-friendly wire representation of a [`TileMesh`],
+/// for shipping tessellation results across a Web Worker boundary (see
+/// `rgis-app`'s wasm-only worker pool) as plain `Float32Array`/`Uint32Array`
+/// typed arrays rather than `TileMesh` itself, whose fields are private to
+/// this crate and which embeds no serialization support of its own.
+#[derive(Debug, Default, Clone)]
+pub struct TileMeshWire {
+    /// Flattened `Vertex { position: [f32; 2], color: [f32; 4] }`, 6 floats
+    /// per vertex.
+    pub fill_vertices: Vec<f32>,
+    pub fill_indices: Vec<u32>,
+    /// Flattened `LineVertex { center: [f32; 2], extrude: [f32; 2], color:
+    /// [f32; 4] }`, 8 floats per vertex.
+    pub line_vertices: Vec<f32>,
+    pub line_indices: Vec<u32>,
+}
+
+impl From<&TileMesh> for TileMeshWire {
+    fn from(mesh: &TileMesh) -> Self {
+        let mut fill_vertices = Vec::with_capacity(mesh.fill.vertices.len() * 6);
+        for v in &mesh.fill.vertices {
+            fill_vertices.extend_from_slice(&v.position);
+            fill_vertices.extend_from_slice(&v.color);
+        }
+        let mut line_vertices = Vec::with_capacity(mesh.lines.vertices.len() * 8);
+        for v in &mesh.lines.vertices {
+            line_vertices.extend_from_slice(&v.center);
+            line_vertices.extend_from_slice(&v.extrude);
+            line_vertices.extend_from_slice(&v.color);
+        }
+        Self {
+            fill_vertices,
+            fill_indices: mesh.fill.indices.clone(),
+            line_vertices,
+            line_indices: mesh.lines.indices.clone(),
+        }
+    }
+}
+
+impl TileMeshWire {
+    /// Reconstructs the [`TileMesh`] this wire form was built from (see
+    /// `From<&TileMesh>`). Panics if the flat arrays' lengths aren't
+    /// multiples of the expected per-vertex float count -- only expected to
+    /// be called on data produced by `TileMeshWire::from`.
+    pub fn into_tile_mesh(self) -> TileMesh {
+        let fill_vertices = self
+            .fill_vertices
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|c| Vertex {
+                position: [c[0], c[1]],
+                color: [c[2], c[3], c[4], c[5]],
+            })
+            .collect();
+        let line_vertices = self
+            .line_vertices
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| LineVertex {
+                center: [c[0], c[1]],
+                extrude: [c[2], c[3]],
+                color: [c[4], c[5], c[6], c[7]],
+            })
+            .collect();
+        TileMesh {
+            fill: SceneMesh {
+                vertices: fill_vertices,
+                indices: self.fill_indices,
+            },
+            lines: LineMesh {
+                vertices: line_vertices,
+                indices: self.line_indices,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Paint {
     fill: Option<[f32; 4]>,

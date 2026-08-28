@@ -3,6 +3,8 @@
 //! `eframe::WebRunner`).
 
 use std::num::NonZeroUsize;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 use std::sync::Arc;
 
 use lru::LruCache;
@@ -13,6 +15,8 @@ use rgis_render::{SceneMesh, TileMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
 mod status_bar;
+#[cfg(target_arch = "wasm32")]
+mod tile_worker_pool;
 
 /// A demo dataset (a few simple shapes over Europe) bundled with the binary
 /// so both the native app and the browser build have something to show
@@ -60,6 +64,11 @@ pub struct RgisApp {
     /// zoom-wheel events) if done synchronously in the UI update loop. The
     /// inner `Option` is `None` when decoding raw bytes failed.
     pending_tile_meshes: Vec<Promise<(TileCoord, Option<TileMesh>)>>,
+    /// wasm-only pool of dedicated Web Workers used to decode+tessellate
+    /// tiles arriving as raw network bytes off the main thread -- see
+    /// `tile_worker_pool` module docs.
+    #[cfg(target_arch = "wasm32")]
+    tile_worker_pool: Rc<tile_worker_pool::TileWorkerPool>,
     pending_loads: Vec<Promise<LoadResults>>,
     cursor_lonlat: Option<(f64, f64)>,
     last_error: Option<String>,
@@ -87,6 +96,8 @@ impl RgisApp {
             tile_meshes: LruCache::new(NonZeroUsize::new(TILE_MESH_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            tile_worker_pool: Rc::new(tile_worker_pool::TileWorkerPool::new()),
             pending_loads: Vec::new(),
             cursor_lonlat: None,
             last_error: None,
@@ -239,28 +250,38 @@ impl RgisApp {
             } else if let Ok(fetched) = self.vector_tile_fetcher.raw_receiver.try_recv() {
                 // Raw network-fetched bytes: MVT decode (parsing every
                 // feature's geometry/properties out of the protobuf) is
-                // real CPU work too, so it's bundled into the same
-                // throttled background job as tessellation rather than
-                // running unconditionally in the network response callback
-                // (see `VectorTileFetcher::fetch_url`).
+                // real CPU work too, so it's handled together with
+                // tessellation rather than running unconditionally in the
+                // network response callback (see
+                // `VectorTileFetcher::fetch_url`). On wasm this whole
+                // decode+tessellate step runs on a pooled Web Worker (see
+                // `tile_worker_pool`) instead of the main thread; note this
+                // bypasses `VectorTileFetcher`'s decoded-tile cache (the
+                // worker never reports the decoded `VectorTile` back, only
+                // the final mesh) -- an accepted trade-off, since that
+                // cache only matters for the rare case of the final mesh
+                // cache having evicted a tile the fetcher's own cache still
+                // holds (see the `tile_worker_pool` module docs).
                 let coord = fetched.coord;
                 let bytes = fetched.bytes;
-                let fetcher = Arc::clone(&self.vector_tile_fetcher);
                 #[cfg(not(target_arch = "wasm32"))]
-                let promise =
+                let promise = {
+                    let fetcher = Arc::clone(&self.vector_tile_fetcher);
                     Promise::spawn_thread("decode-tessellate-tile", move || {
                         match fetcher.decode_and_cache(coord, &bytes) {
                             Ok(tile) => (coord, Some(rgis_render::build_tile_mesh(&tile, coord))),
                             Err(_) => (coord, None),
                         }
-                    });
+                    })
+                };
                 #[cfg(target_arch = "wasm32")]
-                let promise = Promise::spawn_local(async move {
-                    match fetcher.decode_and_cache(coord, &bytes) {
-                        Ok(tile) => (coord, Some(rgis_render::build_tile_mesh(&tile, coord))),
-                        Err(_) => (coord, None),
-                    }
-                });
+                let promise = {
+                    let pool = Rc::clone(&self.tile_worker_pool);
+                    Promise::spawn_local(async move {
+                        let mesh = pool.tessellate(coord, bytes).await;
+                        (coord, mesh)
+                    })
+                };
                 self.pending_tile_meshes.push(promise);
             } else {
                 break;

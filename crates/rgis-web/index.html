@@ -18,7 +18,8 @@
         height: 100vh;
       }
     </style>
-    <link data-trunk rel="rust" href="Cargo.toml" />
+    <link data-trunk rel="rust" href="Cargo.toml" data-target-name="rgis_web" />
+    <link data-trunk rel="rust" href="Cargo.toml" data-bin="tile_worker" data-type="worker" />
   </head>
   <body>
     <canvas id="rgis-canvas"></canvas>
