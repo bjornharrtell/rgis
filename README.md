@@ -1,6 +1,6 @@
 # rgis
 
-A Rust GIS desktop application built on [egui](https://crates.io/crates/egui)/[eframe](https://crates.io/crates/eframe) for UI and [wgpu](https://crates.io/crates/wgpu) (with [lyon](https://crates.io/crates/lyon) tessellation) for map rendering. The same app runs natively and compiles to `wasm32-unknown-unknown` for the browser.
+A Rust GIS desktop application built on [egui](https://crates.io/crates/egui)/[eframe](https://crates.io/crates/eframe) for UI and [wgpu](https://crates.io/crates/wgpu) (with [earcut](https://crates.io/crates/earcut) tessellation) for map rendering. The same app runs natively and compiles to `wasm32-unknown-unknown` for the browser.
 
 ## Features
 
@@ -94,7 +94,7 @@ publishes to GitHub Pages on every push to `main`.
 ## Architecture notes
 
 - `rgis-core`, `rgis-io`, and `rgis-tiles` stay backend-agnostic.
-- `rgis-render` tessellates `rgis-core::Layer` geometry (via `lyon`) into a `SceneMesh`, then draws it each frame from an `egui-wgpu` `MapCallback` paint callback.
+- `rgis-render` tessellates `rgis-core::Layer` geometry (via `earcut` for fills, with hand-extruded stroke/point quads) into a `SceneMesh`, then draws it each frame from an `egui-wgpu` `MapCallback` paint callback.
 - `rgis-app` owns the `eframe::App` implementation: the layer panel, status bar, tile image cache, and pan/zoom interactions, shared verbatim between the native binary and the wasm build.
 
 ## Development
