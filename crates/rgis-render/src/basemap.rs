@@ -65,6 +65,85 @@ pub(crate) struct LineMesh {
     pub(crate) indices: Vec<u32>,
 }
 
+/// A flat, structured-clone-friendly wire representation of a [`TileMesh`],
+/// for shipping tessellation results across a Web Worker boundary (see
+/// `rgis-app`'s wasm-only worker pool) as plain `Float32Array`/`Uint32Array`
+/// typed arrays rather than `TileMesh` itself, whose fields are private to
+/// this crate and which embeds no serialization support of its own.
+#[derive(Debug, Default, Clone)]
+pub struct TileMeshWire {
+    /// Flattened `Vertex { position: [f32; 2], color: [f32; 4] }`, 6 floats
+    /// per vertex.
+    pub fill_vertices: Vec<f32>,
+    pub fill_indices: Vec<u32>,
+    /// Flattened `LineVertex { center: [f32; 2], extrude: [f32; 2], color:
+    /// [f32; 4] }`, 8 floats per vertex.
+    pub line_vertices: Vec<f32>,
+    pub line_indices: Vec<u32>,
+}
+
+impl From<&TileMesh> for TileMeshWire {
+    fn from(mesh: &TileMesh) -> Self {
+        let mut fill_vertices = Vec::with_capacity(mesh.fill.vertices.len() * 6);
+        for v in &mesh.fill.vertices {
+            fill_vertices.extend_from_slice(&v.position);
+            fill_vertices.extend_from_slice(&v.color);
+        }
+        let mut line_vertices = Vec::with_capacity(mesh.lines.vertices.len() * 8);
+        for v in &mesh.lines.vertices {
+            line_vertices.extend_from_slice(&v.center);
+            line_vertices.extend_from_slice(&v.extrude);
+            line_vertices.extend_from_slice(&v.color);
+        }
+        Self {
+            fill_vertices,
+            fill_indices: mesh.fill.indices.clone(),
+            line_vertices,
+            line_indices: mesh.lines.indices.clone(),
+        }
+    }
+}
+
+impl TileMeshWire {
+    /// Reconstructs the [`TileMesh`] this wire form was built from (see
+    /// `From<&TileMesh>`). Panics if the flat arrays' lengths aren't
+    /// multiples of the expected per-vertex float count -- only expected to
+    /// be called on data produced by `TileMeshWire::from`.
+    pub fn into_tile_mesh(self) -> TileMesh {
+        let fill_vertices = self
+            .fill_vertices
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|c| Vertex {
+                position: [c[0], c[1]],
+                color: [c[2], c[3], c[4], c[5]],
+            })
+            .collect();
+        let line_vertices = self
+            .line_vertices
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| LineVertex {
+                center: [c[0], c[1]],
+                extrude: [c[2], c[3]],
+                color: [c[4], c[5], c[6], c[7]],
+            })
+            .collect();
+        TileMesh {
+            fill: SceneMesh {
+                vertices: fill_vertices,
+                indices: self.fill_indices,
+            },
+            lines: LineMesh {
+                vertices: line_vertices,
+                indices: self.line_indices,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Paint {
     fill: Option<[f32; 4]>,
@@ -502,8 +581,10 @@ fn line_points(line: &LineString<i32>, ctx: &TileContext) -> Vec<[f32; 2]> {
 
 /// Tessellates a polyline into a screen-pixel-width "ribbon": each segment
 /// becomes a quad extruded perpendicular to its direction, and a small
-/// round disc is added at every point (endpoints and interior joints
-/// alike) to approximate round caps/joins without miter-angle math.
+/// round disc is added at the two endpoints (round caps) plus any interior
+/// point where the path actually changes direction (a real join) — see
+/// the loop below for why collinear interior points can safely skip the
+/// disc entirely, not just approximately.
 /// `center` stays in tile-local metres (scaled like fill vertices);
 /// `extrude` is a direction+magnitude offset in that same local space,
 /// applied in SCREEN PIXELS by the shader (see [`LineVertex`]) — since the
@@ -517,15 +598,22 @@ fn append_polyline(buffers: &mut LineMesh, points: &[[f32; 2]], color: [f32; 4],
     }
     let half_width = width_px * 0.5;
 
+    // One entry per segment; `None` marks a degenerate (near-zero-length)
+    // segment, in which case the neighboring joints are conservatively
+    // treated as real joins below (rather than trying to divide by ~0).
+    let mut directions: Vec<Option<[f32; 2]>> = Vec::with_capacity(points.len() - 1);
     for pair in points.windows(2) {
         let (p0, p1) = (pair[0], pair[1]);
         let dx = p1[0] - p0[0];
         let dy = p1[1] - p0[1];
         let len = (dx * dx + dy * dy).sqrt();
         if len <= f32::EPSILON {
+            directions.push(None);
             continue;
         }
-        let extrude = [-dy / len * half_width, dx / len * half_width];
+        let dir = [dx / len, dy / len];
+        directions.push(Some(dir));
+        let extrude = [-dir[1] * half_width, dir[0] * half_width];
         let neg_extrude = [-extrude[0], -extrude[1]];
         let base = buffers.vertices.len() as u32;
         buffers.vertices.push(LineVertex {
@@ -558,11 +646,29 @@ fn append_polyline(buffers: &mut LineMesh, points: &[[f32; 2]], color: [f32; 4],
         ]);
     }
 
-    for &center in points {
-        append_disc(buffers, center, half_width, color);
+    // Endpoints always get a cap disc. Interior points only get one where
+    // the path actually turns: two collinear segments' extrusions already
+    // meet exactly with no gap or overlap, so a join disc there would be
+    // pure waste -- and real-world OSM ways are frequently densely sampled
+    // with long near-straight runs of interior points, so this matters.
+    append_disc(buffers, points[0], half_width, color);
+    let last = points.len() - 1;
+    for i in 1..last {
+        let needs_join = match (directions[i - 1], directions[i]) {
+            (Some(a), Some(b)) => a[0] * b[0] + a[1] * b[1] < JOIN_COS_THRESHOLD,
+            _ => true,
+        };
+        if needs_join {
+            append_disc(buffers, points[i], half_width, color);
+        }
     }
+    append_disc(buffers, points[last], half_width, color);
 }
 
+/// Below this cosine of the angle between two consecutive segment
+/// directions, a join disc is added at their shared point (~2.5 degrees of
+/// deviation is imperceptible without one, given typical road widths).
+const JOIN_COS_THRESHOLD: f32 = 0.999;
 const LINE_DISC_SEGMENTS: u32 = 8;
 
 fn append_disc(buffers: &mut LineMesh, center: [f32; 2], radius: f32, color: [f32; 4]) {
@@ -609,4 +715,40 @@ fn fill_path(
             }
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Vertex/index count contributed by exactly one join/cap disc.
+    const DISC_VERTS: usize = 1 + LINE_DISC_SEGMENTS as usize;
+    const DISC_INDICES: usize = LINE_DISC_SEGMENTS as usize * 3;
+    /// Vertex/index count contributed by exactly one segment quad.
+    const SEGMENT_VERTS: usize = 4;
+    const SEGMENT_INDICES: usize = 6;
+
+    #[test]
+    fn collinear_interior_points_get_no_join_disc() {
+        let mut mesh = LineMesh::default();
+        let points = [[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
+        append_polyline(&mut mesh, &points, [1.0, 1.0, 1.0, 1.0], 2.0);
+
+        // 3 segments + only the 2 endpoint caps (no interior joins, since
+        // all 3 segments share the same direction).
+        assert_eq!(mesh.vertices.len(), 3 * SEGMENT_VERTS + 2 * DISC_VERTS);
+        assert_eq!(mesh.indices.len(), 3 * SEGMENT_INDICES + 2 * DISC_INDICES);
+    }
+
+    #[test]
+    fn real_turn_gets_a_join_disc() {
+        let mut mesh = LineMesh::default();
+        let points = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]];
+        append_polyline(&mut mesh, &points, [1.0, 1.0, 1.0, 1.0], 2.0);
+
+        // 2 segments + 2 endpoint caps + 1 interior join disc for the
+        // 90-degree turn.
+        assert_eq!(mesh.vertices.len(), 2 * SEGMENT_VERTS + 3 * DISC_VERTS);
+        assert_eq!(mesh.indices.len(), 2 * SEGMENT_INDICES + 3 * DISC_INDICES);
+    }
 }

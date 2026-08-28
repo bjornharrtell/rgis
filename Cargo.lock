@@ -3306,16 +3306,21 @@ dependencies = [
 name = "rgis-app"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "eframe",
  "egui",
  "egui-wgpu",
  "image",
+ "js-sys",
+ "lru",
  "poll-promise",
  "rfd",
  "rgis-core",
  "rgis-io",
  "rgis-render",
  "rgis-tiles",
+ "wasm-bindgen",
+ "web-sys",
  "wgpu",
 ]
 
@@ -3355,9 +3360,11 @@ dependencies = [
  "epaint",
  "geo-types",
  "image",
+ "lru",
  "lyon",
  "rgis-core",
  "rgis-tiles",
+ "rustc-hash 2.1.3",
  "wgpu",
 ]
 
@@ -3383,7 +3390,10 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "eframe",
+ "js-sys",
  "rgis-app",
+ "rgis-render",
+ "rgis-tiles",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

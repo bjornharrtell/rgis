@@ -25,9 +25,24 @@ wgpu        = { workspace = true }
 image       = { workspace = true }
 rfd         = { workspace = true }
 poll-promise = { workspace = true }
+lru         = { workspace = true }
 
 # Native file loading uses Promise::spawn_thread (blocking IO on a background
 # std::thread, needs no extra feature). The browser can't spawn OS threads, so
 # wasm uses Promise::spawn_local backed by wasm-bindgen-futures instead.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 poll-promise = { workspace = true, features = ["web"] }
+wasm-bindgen  = "0.2"
+js-sys        = "0.3"
+async-channel = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "Blob",
+    "BlobPropertyBag",
+    "MessageEvent",
+    "Url",
+    "Window",
+    "Worker",
+]

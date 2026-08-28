@@ -8,7 +8,7 @@ use thiserror::Error;
 mod vector;
 pub use vector::{
     OPENFREEMAP_ATTRIBUTION, OPENFREEMAP_MAX_ZOOM, PropertyValue, VectorFeature, VectorTile,
-    VectorTileFetcher, VectorTileLayer, VectorTileReady, decode_vector_tile,
+    VectorTileFetched, VectorTileFetcher, VectorTileLayer, VectorTileReady, decode_vector_tile,
 };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
