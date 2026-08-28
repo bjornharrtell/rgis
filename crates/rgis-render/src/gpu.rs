@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
+use lru::LruCache;
 use rgis_tiles::TileCoord;
 use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::util::DeviceExt;
@@ -108,7 +109,12 @@ pub struct MapRenderResources {
 
     basemap_pipeline: wgpu::RenderPipeline,
     basemap_line_pipeline: wgpu::RenderPipeline,
-    tile_gpu_meshes: FxHashMap<TileCoord, TileGpuMesh>,
+    /// Bounded LRU rather than an exact-per-frame-visible set: tiles that
+    /// scroll just off screen keep their GPU buffers for a while, so
+    /// panning back over recently-visited ground reuses them instead of
+    /// re-uploading (which real pan gestures do constantly, since tiles
+    /// leave visibility one at a time along the trailing edge).
+    tile_gpu_meshes: LruCache<TileCoord, TileGpuMesh>,
     /// One shared uniform buffer holding every currently-visible basemap
     /// tile's [`TileTransformUniform`], each at a `tile_transform_stride`-
     /// aligned offset, bound via `tile_transform_bind_group` with a
@@ -261,7 +267,9 @@ impl MapRenderResources {
             screen_bind_group,
             basemap_pipeline,
             basemap_line_pipeline,
-            tile_gpu_meshes: FxHashMap::default(),
+            tile_gpu_meshes: LruCache::new(
+                std::num::NonZeroUsize::new(TILE_GPU_MESH_CACHE_SIZE).unwrap(),
+            ),
             tile_transform_pool_buffer,
             tile_transform_bind_group,
             tile_transform_bind_group_layout,
@@ -347,14 +355,15 @@ impl MapRenderResources {
 
     /// Uploads a basemap tile's fill + line meshes to the GPU once; a no-op
     /// if that tile's buffers already exist (the whole point -- pan/zoom
-    /// never re-uploads or reallocates).
+    /// never re-uploads or reallocates). Touches the LRU entry so tiles
+    /// still being drawn stay recently-used and aren't the first evicted.
     fn ensure_basemap_tile_buffer(
         &mut self,
         device: &wgpu::Device,
         coord: TileCoord,
         mesh: &TileMesh,
     ) {
-        if self.tile_gpu_meshes.contains_key(&coord) {
+        if self.tile_gpu_meshes.get(&coord).is_some() {
             return;
         }
         let fill = (!mesh.fill.indices.is_empty()).then(|| SubMeshBuffers {
@@ -383,16 +392,7 @@ impl MapRenderResources {
             }),
             index_count: mesh.lines.indices.len() as u32,
         });
-        self.tile_gpu_meshes
-            .insert(coord, TileGpuMesh { fill, lines });
-    }
-
-    /// Drops persistent per-tile GPU mesh buffers for tiles not visible this
-    /// frame, so GPU memory tracks the current view instead of growing
-    /// unbounded as the user explores.
-    fn evict_stale_basemap_tiles(&mut self, live_coords: &FxHashSet<TileCoord>) {
-        self.tile_gpu_meshes
-            .retain(|coord, _| live_coords.contains(coord));
+        self.tile_gpu_meshes.put(coord, TileGpuMesh { fill, lines });
     }
 
     /// Grows `tile_transform_pool_buffer` (and recreates the bind group
@@ -419,6 +419,12 @@ impl MapRenderResources {
 
 /// Initial number of tile slots in `MapRenderResources::tile_transform_pool_buffer`.
 const INITIAL_TILE_TRANSFORM_CAPACITY: u64 = 64;
+
+/// Number of basemap tiles' GPU mesh buffers kept alive at once. Larger than
+/// a typical viewport's visible-tile count so tiles that scroll just off
+/// screen (the common case during panning) don't need re-uploading if the
+/// user pans back before they'd be evicted.
+const TILE_GPU_MESH_CACHE_SIZE: usize = 512;
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment.max(1)) * alignment.max(1)
@@ -496,12 +502,9 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         }
         resources.evict_stale_tiles(&live_keys);
 
-        let live_basemap_coords: FxHashSet<TileCoord> =
-            self.basemap_tiles.iter().map(|draw| draw.coord).collect();
         for draw in &self.basemap_tiles {
             resources.ensure_basemap_tile_buffer(device, draw.coord, &draw.mesh);
         }
-        resources.evict_stale_basemap_tiles(&live_basemap_coords);
 
         resources.ensure_tile_transform_capacity(device, self.basemap_tiles.len() as u64);
         let stride = resources.tile_transform_stride;
@@ -510,7 +513,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             .iter()
             .enumerate()
             .filter_map(|(slot, draw)| {
-                if !resources.tile_gpu_meshes.contains_key(&draw.coord) {
+                if !resources.tile_gpu_meshes.contains(&draw.coord) {
                     return None;
                 }
                 let uniform = TileTransformUniform {
@@ -695,7 +698,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             render_pass.set_pipeline(&resources.basemap_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
             for draw in &frame.basemap_draws {
-                if let Some(tile_mesh) = resources.tile_gpu_meshes.get(&draw.coord)
+                if let Some(tile_mesh) = resources.tile_gpu_meshes.peek(&draw.coord)
                     && let Some(fill) = &tile_mesh.fill
                     && let Some((x, y, w, h)) = scissor_for(draw.offset, draw.size)
                 {
@@ -714,7 +717,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
 
             render_pass.set_pipeline(&resources.basemap_line_pipeline);
             for draw in &frame.basemap_draws {
-                if let Some(tile_mesh) = resources.tile_gpu_meshes.get(&draw.coord)
+                if let Some(tile_mesh) = resources.tile_gpu_meshes.peek(&draw.coord)
                     && let Some(lines) = &tile_mesh.lines
                     && let Some((x, y, w, h)) = scissor_for(draw.offset, draw.size)
                 {

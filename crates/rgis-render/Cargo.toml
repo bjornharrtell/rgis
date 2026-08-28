@@ -15,6 +15,7 @@ epaint            = "0.36.1"
 lyon              = { workspace = true }
 bytemuck          = { workspace = true }
 rustc-hash        = { workspace = true }
+lru               = { workspace = true }
 
 # WebGL2 is a fallback for browsers without WebGPU support (Safari, older
 # Firefox); native builds only need Vulkan/Metal/DX12 (already default).

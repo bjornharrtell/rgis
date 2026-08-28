@@ -3356,6 +3356,7 @@ dependencies = [
  "epaint",
  "geo-types",
  "image",
+ "lru",
  "lyon",
  "rgis-core",
  "rgis-tiles",
