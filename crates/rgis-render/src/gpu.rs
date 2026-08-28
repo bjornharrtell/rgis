@@ -23,8 +23,8 @@ pub const MSAA_SAMPLES: u32 = if cfg!(target_arch = "wasm32") { 1 } else { 4 };
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
 
-const LINE_VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+const LINE_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Float32x4];
 
 const TILE_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
@@ -139,6 +139,16 @@ pub struct MapRenderResources {
     tile_bind_group_layout: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
     tile_textures: FxHashMap<u64, TileGpuTexture>,
+    /// Raster tiles' quad vertices, rewritten (not reallocated, unless the
+    /// visible tile count grows) every frame.
+    tile_vertex_buffer: GrowableBuffer,
+    /// `UNIT_QUAD_INDICES` uploaded once -- every raster tile quad shares
+    /// the same index pattern, so this never changes after `new`.
+    tile_index_buffer: wgpu::Buffer,
+    /// Background quad + user vector layers' geometry, rewritten every
+    /// frame.
+    scene_vertex_buffer: GrowableBuffer,
+    scene_index_buffer: GrowableBuffer,
 }
 
 impl MapRenderResources {
@@ -261,6 +271,12 @@ impl MapRenderResources {
             &tile_bind_group_layout,
         );
 
+        let tile_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rgis-tile-indices"),
+            contents: bytemuck::cast_slice(&UNIT_QUAD_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
         Self {
             vector_pipeline,
             screen_uniform_buffer,
@@ -279,6 +295,19 @@ impl MapRenderResources {
             tile_bind_group_layout,
             tile_sampler,
             tile_textures: FxHashMap::default(),
+            tile_vertex_buffer: GrowableBuffer::new(
+                wgpu::BufferUsages::VERTEX,
+                "rgis-tile-vertices",
+            ),
+            tile_index_buffer,
+            scene_vertex_buffer: GrowableBuffer::new(
+                wgpu::BufferUsages::VERTEX,
+                "rgis-vector-vertices",
+            ),
+            scene_index_buffer: GrowableBuffer::new(
+                wgpu::BufferUsages::INDEX,
+                "rgis-vector-indices",
+            ),
         }
     }
 
@@ -430,6 +459,67 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment.max(1)) * alignment.max(1)
 }
 
+/// Indices for a single axis-aligned quad drawn as two triangles, shared by
+/// every raster tile (each tile only differs in its vertex positions/UVs).
+const UNIT_QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
+
+/// A GPU buffer for content that's rebuilt from scratch every frame (the
+/// scene mesh and raster-tile quads, whose vertex/index counts change with
+/// the current viewport/layers) -- as opposed to a basemap tile's mesh,
+/// which is uploaded once and reused. Grows (reallocating) when new data no
+/// longer fits, but never shrinks, so the common case (data fits in the
+/// existing buffer) is just a `queue.write_buffer` instead of creating and
+/// immediately discarding a brand new buffer every frame. WebGL2 drivers
+/// can lag in reclaiming deleted buffers' memory, so constant per-frame
+/// reallocation was ratcheting up GPU memory use over a long session even
+/// though each individual buffer was short-lived.
+struct GrowableBuffer {
+    buffer: Option<wgpu::Buffer>,
+    capacity: u64,
+    len: u64,
+    usage: wgpu::BufferUsages,
+    label: &'static str,
+}
+
+impl GrowableBuffer {
+    fn new(usage: wgpu::BufferUsages, label: &'static str) -> Self {
+        Self {
+            buffer: None,
+            capacity: 0,
+            len: 0,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            label,
+        }
+    }
+
+    fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
+        self.len = data.len() as u64;
+        if self.len == 0 {
+            return;
+        }
+        if self.len > self.capacity {
+            let capacity = self.len.next_power_of_two();
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: capacity,
+                usage: self.usage,
+                mapped_at_creation: false,
+            }));
+            self.capacity = capacity;
+        }
+        queue.write_buffer(self.buffer.as_ref().expect("just ensured"), 0, data);
+    }
+
+    fn slice(&self) -> Option<wgpu::BufferSlice<'_>> {
+        (self.len > 0).then(|| {
+            self.buffer
+                .as_ref()
+                .expect("len > 0 implies a buffer was allocated")
+                .slice(..self.len)
+        })
+    }
+}
+
 fn create_tile_transform_pool_buffer(
     device: &wgpu::Device,
     stride: u64,
@@ -536,28 +626,14 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             })
             .collect();
 
-        let vertex_buffer = if self.mesh.vertices.is_empty() {
-            None
-        } else {
-            Some(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("rgis-vector-vertices"),
-                    contents: bytemuck::cast_slice(&self.mesh.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-            )
-        };
-        let index_buffer = if self.mesh.indices.is_empty() {
-            None
-        } else {
-            Some(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("rgis-vector-indices"),
-                    contents: bytemuck::cast_slice(&self.mesh.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-            )
-        };
+        resources.scene_vertex_buffer.write(
+            device,
+            queue,
+            bytemuck::cast_slice(&self.mesh.vertices),
+        );
+        resources
+            .scene_index_buffer
+            .write(device, queue, bytemuck::cast_slice(&self.mesh.indices));
 
         let mut tile_vertices = Vec::with_capacity(self.tiles.len() * 4);
         for tile in &self.tiles {
@@ -579,32 +655,14 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 uv: [0.0, 1.0],
             });
         }
-        let tile_vertex_buffer = if tile_vertices.is_empty() {
-            None
-        } else {
-            Some(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("rgis-tile-vertices"),
-                    contents: bytemuck::cast_slice(&tile_vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-            )
-        };
-        const UNIT_QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
-        let tile_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rgis-tile-indices"),
-            contents: bytemuck::cast_slice(&UNIT_QUAD_INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        resources
+            .tile_vertex_buffer
+            .write(device, queue, bytemuck::cast_slice(&tile_vertices));
 
         callback_resources.insert(FramePrepared {
-            vertex_buffer,
-            index_buffer,
             index_count: self.mesh.indices.len() as u32,
             background_index_count: self.background_index_count,
             basemap_draws,
-            tile_vertex_buffer,
-            tile_index_buffer,
             tile_keys: self.tiles.iter().map(|tile| tile.key).collect(),
         });
 
@@ -626,12 +684,14 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         // OSM tiles are the map background, so draw them first; the vector
         // background quad, basemap tiles, and vector layers are then drawn
         // on top so layers stay visible above the basemap.
-        if let Some(tile_vertex_buffer) = &frame.tile_vertex_buffer {
+        if let Some(tile_vertex_slice) = resources.tile_vertex_buffer.slice() {
             render_pass.set_pipeline(&resources.tile_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, tile_vertex_buffer.slice(..));
-            render_pass
-                .set_index_buffer(frame.tile_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_vertex_buffer(0, tile_vertex_slice);
+            render_pass.set_index_buffer(
+                resources.tile_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
             for (i, key) in frame.tile_keys.iter().enumerate() {
                 if let Some(texture) = resources.tile_textures.get(key) {
                     render_pass.set_bind_group(1, &texture.bind_group, &[]);
@@ -640,13 +700,14 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             }
         }
 
-        if let (Some(vertex_buffer), Some(index_buffer)) =
-            (&frame.vertex_buffer, &frame.index_buffer)
-        {
+        if let (Some(vertex_slice), Some(index_slice)) = (
+            resources.scene_vertex_buffer.slice(),
+            resources.scene_index_buffer.slice(),
+        ) {
             render_pass.set_pipeline(&resources.vector_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.set_vertex_buffer(0, vertex_slice);
+            render_pass.set_index_buffer(index_slice, wgpu::IndexFormat::Uint32);
             if frame.background_index_count > 0 {
                 render_pass.draw_indexed(0..frame.background_index_count, 0, 0..1);
             }
@@ -746,31 +807,30 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             }
         }
 
-        if let (Some(vertex_buffer), Some(index_buffer)) =
-            (&frame.vertex_buffer, &frame.index_buffer)
-            && frame.background_index_count < frame.index_count
+        if let (Some(vertex_buffer), Some(index_buffer)) = (
+            resources.scene_vertex_buffer.slice(),
+            resources.scene_index_buffer.slice(),
+        ) && frame.background_index_count < frame.index_count
         {
             render_pass.set_pipeline(&resources.vector_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.set_vertex_buffer(0, vertex_buffer);
+            render_pass.set_index_buffer(index_buffer, wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(frame.background_index_count..frame.index_count, 0, 0..1);
         }
     }
 }
 
-/// Scratch GPU buffers rebuilt every frame in `prepare` and consumed in
-/// `paint`. Stored in `CallbackResources` since `paint` only has an immutable
-/// `&CallbackResources` (the buffers themselves are still mutated via
-/// interior mutability of the type map's insert-per-frame overwrite).
+/// Per-frame draw metadata computed in `prepare` and consumed in `paint`.
+/// The actual GPU buffers live as persistent fields on
+/// `MapRenderResources` (`scene_vertex_buffer`/`scene_index_buffer`/
+/// `tile_vertex_buffer`/`tile_index_buffer`) instead of here, since they're
+/// reused (grown, never reallocated from scratch) across frames rather
+/// than rebuilt every time.
 struct FramePrepared {
-    vertex_buffer: Option<wgpu::Buffer>,
-    index_buffer: Option<wgpu::Buffer>,
     index_count: u32,
     background_index_count: u32,
     basemap_draws: Vec<BasemapDrawPrepared>,
-    tile_vertex_buffer: Option<wgpu::Buffer>,
-    tile_index_buffer: wgpu::Buffer,
     tile_keys: Vec<u64>,
 }
 

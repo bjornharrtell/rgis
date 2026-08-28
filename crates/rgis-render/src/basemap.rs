@@ -45,17 +45,38 @@ pub struct TileMesh {
     pub(crate) lines: LineMesh,
 }
 
+impl TileMesh {
+    /// (fill vertices, fill indices, line vertices, line indices) -- used by
+    /// the `tile_mesh_byte_budget` regression test to measure per-tile
+    /// tessellation output.
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.fill.vertices.len(),
+            self.fill.indices.len(),
+            self.lines.vertices.len(),
+            self.lines.indices.len(),
+        )
+    }
+}
+
 /// A line/stroke vertex: `center` is the tile-local-metres position
 /// (transformed exactly like fill vertices), while `extrude` is a
 /// direction+magnitude offset applied by the vertex shader in SCREEN
 /// PIXELS after scaling `center` (see `shaders/basemap_line.wgsl`), so
 /// line width stays constant in device pixels instead of stretching with
-/// the tile's own position scale.
+/// the tile's own position scale. `half_width` is the same (unmargined)
+/// half-width the vertex's `extrude` was derived from -- signed on the two
+/// sides of a straight segment (+ on the `extrude` side, - on the
+/// `neg_extrude` side), unsigned (0 at the hub, +radius at the rim) for a
+/// join/cap disc -- so the shader can push geometry out by a constant
+/// device-pixel margin and compute a matching normalized distance for
+/// analytic (MSAA-independent) edge antialiasing; see `basemap_line.wgsl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct LineVertex {
     pub center: [f32; 2],
     pub extrude: [f32; 2],
+    pub half_width: f32,
     pub color: [f32; 4],
 }
 
@@ -76,8 +97,8 @@ pub struct TileMeshWire {
     /// per vertex.
     pub fill_vertices: Vec<f32>,
     pub fill_indices: Vec<u32>,
-    /// Flattened `LineVertex { center: [f32; 2], extrude: [f32; 2], color:
-    /// [f32; 4] }`, 8 floats per vertex.
+    /// Flattened `LineVertex { center: [f32; 2], extrude: [f32; 2],
+    /// half_width: f32, color: [f32; 4] }`, 9 floats per vertex.
     pub line_vertices: Vec<f32>,
     pub line_indices: Vec<u32>,
 }
@@ -89,10 +110,11 @@ impl From<&TileMesh> for TileMeshWire {
             fill_vertices.extend_from_slice(&v.position);
             fill_vertices.extend_from_slice(&v.color);
         }
-        let mut line_vertices = Vec::with_capacity(mesh.lines.vertices.len() * 8);
+        let mut line_vertices = Vec::with_capacity(mesh.lines.vertices.len() * 9);
         for v in &mesh.lines.vertices {
             line_vertices.extend_from_slice(&v.center);
             line_vertices.extend_from_slice(&v.extrude);
+            line_vertices.push(v.half_width);
             line_vertices.extend_from_slice(&v.color);
         }
         Self {
@@ -122,13 +144,14 @@ impl TileMeshWire {
             .collect();
         let line_vertices = self
             .line_vertices
-            .as_chunks::<8>()
+            .as_chunks::<9>()
             .0
             .iter()
             .map(|c| LineVertex {
                 center: [c[0], c[1]],
                 extrude: [c[2], c[3]],
-                color: [c[4], c[5], c[6], c[7]],
+                half_width: c[4],
+                color: [c[5], c[6], c[7], c[8]],
             })
             .collect();
         TileMesh {
@@ -157,8 +180,15 @@ struct Paint {
     rank: u8,
 }
 
+/// Line-width scale factor relative to zoom 10 (where `base_width` values in
+/// `style_for` are calibrated). Previously clamped to 1.0 below zoom 10, so
+/// e.g. a motorway that just became visible around z5-7 was already drawn
+/// at its full "high zoom" width — MapLibre's own line-width stops instead
+/// keep shrinking below zoom 10 too (fading toward 0 as a road approaches
+/// its own appear-zoom), so this now keeps scaling down continuously,
+/// floored at 0 (fully invisible) rather than pinned at 1.0.
 fn zoom_scale(zoom: f64) -> f32 {
-    (1.0 + (zoom - 10.0).max(0.0) * 0.15) as f32
+    (1.0 + (zoom - 10.0) * 0.15).max(0.0) as f32
 }
 
 fn style_for(layer_name: &str, feature: &VectorFeature, zoom: f64) -> Option<Paint> {
@@ -268,18 +298,32 @@ fn style_for(layer_name: &str, feature: &VectorFeature, zoom: f64) -> Option<Pai
             }
             let casing_major = [0.914, 0.675, 0.467, 1.00];
             let casing_minor = [0.812, 0.804, 0.792, 1.00];
-            let (casing, fill, base_width, rank) = match feature.get_str("class").unwrap_or("") {
-                "motorway" => (Some(casing_major), [1.000, 0.800, 0.533, 1.00], 2.2, 6),
-                "trunk" => (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.9, 5),
-                "primary" => (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.8, 4),
-                "secondary" | "tertiary" => {
-                    (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.4, 3)
-                }
-                "minor" => (Some(casing_minor), [1.0, 1.0, 1.0, 1.0], 1.0, 2),
-                "service" | "track" => (Some(casing_minor), [1.0, 1.0, 1.0, 1.0], 0.6, 1),
-                "path" | "pedestrian" => (None, [0.85, 0.85, 0.85, 1.0], 0.5, 0),
-                "rail" | "transit" => (None, [0.733, 0.733, 0.733, 1.0], 0.8, 0),
-                _ => return None,
+            // In MapLibre's own "liberty" style, a road class's casing/fill
+            // pair don't fade in together: the casing line-width ramps up
+            // from ~1-2 zoom levels *before* the fill line-width does (e.g.
+            // `road_minor_casing` fades in from z12, but `road_minor` stays
+            // width-0 until z13.5). So a road first appears as a single
+            // plain-colored line, only gaining the two-tone "outline" look
+            // once you zoom in further. `casing_min_zoom` approximates that
+            // per-class delay.
+            let (casing, fill, base_width, rank, casing_min_zoom) =
+                match feature.get_str("class").unwrap_or("") {
+                    "motorway" => (Some(casing_major), [1.000, 0.800, 0.533, 1.00], 2.2, 6, 7.0),
+                    "trunk" => (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.9, 5, 7.0),
+                    "primary" => (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.8, 4, 7.0),
+                    "secondary" | "tertiary" => {
+                        (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.4, 3, 9.0)
+                    }
+                    "minor" => (Some(casing_minor), [1.0, 1.0, 1.0, 1.0], 1.0, 2, 14.0),
+                    "service" | "track" => (Some(casing_minor), [1.0, 1.0, 1.0, 1.0], 0.6, 1, 16.0),
+                    "path" | "pedestrian" => (None, [0.85, 0.85, 0.85, 1.0], 0.5, 0, 0.0),
+                    "rail" | "transit" => (None, [0.733, 0.733, 0.733, 1.0], 0.8, 0, 0.0),
+                    _ => return None,
+                };
+            let casing = if zoom >= casing_min_zoom {
+                casing
+            } else {
+                None
             };
             Some(Paint {
                 casing: casing.map(|c| (c, base_width + 0.8)),
@@ -315,7 +359,16 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
         };
         let mut styled: Vec<(&VectorFeature, Paint)> = Vec::new();
         for feature in &layer.features {
-            if let Some(paint) = style_for(layer_name, feature, zoom) {
+            if let Some(mut paint) = style_for(layer_name, feature, zoom) {
+                // Every fill gets a thin same-color edge by default (unless
+                // a layer already styled its own, e.g. buildings) so its
+                // tessellated boundary gets the same analytic antialiasing
+                // as stroked lines (see `LineVertex`), instead of a raw
+                // jaggy triangle edge -- mirrors MapLibre's default
+                // `fill-antialias` behavior.
+                if paint.fill.is_some() && paint.fill_outline.is_none() {
+                    paint.fill_outline = paint.fill;
+                }
                 styled.push((feature, paint));
             }
         }
@@ -497,15 +550,23 @@ fn append_outline(
     color: [f32; 4],
     width_px: f32,
 ) {
+    // No join/cap discs: this is the automatic 1px fill-antialiasing edge
+    // added to every polygon feature (see `build_tile_mesh`), so with
+    // potentially thousands of many-cornered polygons per tile (buildings,
+    // landuse, water...) the disc-per-corner cost used for genuinely
+    // visible stroked lines below would dominate tile memory for an
+    // effect that's imperceptible at 1px -- see repo memory notes on the
+    // OOM investigation.
     let mut outline = |polygon: &Polygon<i32>| {
         append_polyline(
             buffers,
             &ring_points(polygon.exterior(), ctx),
             color,
             width_px,
+            false,
         );
         for ring in polygon.interiors() {
-            append_polyline(buffers, &ring_points(ring, ctx), color, width_px);
+            append_polyline(buffers, &ring_points(ring, ctx), color, width_px, false);
         }
     };
     match &feature.geometry {
@@ -559,11 +620,11 @@ fn append_line(
 ) {
     match &feature.geometry {
         Geometry::LineString(line) => {
-            append_polyline(buffers, &line_points(line, ctx), color, width_px)
+            append_polyline(buffers, &line_points(line, ctx), color, width_px, true)
         }
         Geometry::MultiLineString(lines) => {
             for line in &lines.0 {
-                append_polyline(buffers, &line_points(line, ctx), color, width_px);
+                append_polyline(buffers, &line_points(line, ctx), color, width_px, true);
             }
         }
         _ => {}
@@ -592,7 +653,13 @@ fn line_points(line: &LineString<i32>, ctx: &TileContext) -> Vec<[f32; 2]> {
 /// direction computed here is identical to its screen-space direction, so
 /// this is valid even though `extrude`'s on-screen magnitude is meant to
 /// stay constant regardless of that scale.
-fn append_polyline(buffers: &mut LineMesh, points: &[[f32; 2]], color: [f32; 4], width_px: f32) {
+fn append_polyline(
+    buffers: &mut LineMesh,
+    points: &[[f32; 2]],
+    color: [f32; 4],
+    width_px: f32,
+    with_joins: bool,
+) {
     if points.len() < 2 || width_px <= 0.0 {
         return;
     }
@@ -619,21 +686,25 @@ fn append_polyline(buffers: &mut LineMesh, points: &[[f32; 2]], color: [f32; 4],
         buffers.vertices.push(LineVertex {
             center: p0,
             extrude,
+            half_width,
             color,
         });
         buffers.vertices.push(LineVertex {
             center: p0,
             extrude: neg_extrude,
+            half_width: -half_width,
             color,
         });
         buffers.vertices.push(LineVertex {
             center: p1,
             extrude,
+            half_width,
             color,
         });
         buffers.vertices.push(LineVertex {
             center: p1,
             extrude: neg_extrude,
+            half_width: -half_width,
             color,
         });
         buffers.indices.extend_from_slice(&[
@@ -646,36 +717,112 @@ fn append_polyline(buffers: &mut LineMesh, points: &[[f32; 2]], color: [f32; 4],
         ]);
     }
 
-    // Endpoints always get a cap disc. Interior points only get one where
-    // the path actually turns: two collinear segments' extrusions already
-    // meet exactly with no gap or overlap, so a join disc there would be
-    // pure waste -- and real-world OSM ways are frequently densely sampled
-    // with long near-straight runs of interior points, so this matters.
-    append_disc(buffers, points[0], half_width, color);
+    if !with_joins {
+        return;
+    }
+
+    // No cap discs: this matches MapLibre's own default `line-cap: butt`
+    // -- a flat end needs no extra geometry at all, since the segment
+    // quad's own perpendicular edge already forms it. Real-world OSM ways
+    // are frequently split into many short adjoining LineString features
+    // (way segments), so a per-endpoint round cap disc would multiply
+    // cost by roughly 2x the total line count for a visual effect
+    // MapLibre itself doesn't apply here.
+    //
+    // Interior points get a join: skipped entirely if collinear-enough
+    // that the gap would be sub-pixel (see `join_cos_threshold`),
+    // otherwise filled with a single cheap 3-vertex bevel triangle on the
+    // turn's outer side (matching MapLibre's default `line-join: miter`
+    // behavior, approximated with a bevel) rather than a full round join
+    // disc -- avoids ~9 vertices/24 indices per turn for ~3 vertices/3
+    // indices.
+    let join_cos_threshold = join_cos_threshold(half_width);
     let last = points.len() - 1;
     for i in 1..last {
-        let needs_join = match (directions[i - 1], directions[i]) {
-            (Some(a), Some(b)) => a[0] * b[0] + a[1] * b[1] < JOIN_COS_THRESHOLD,
-            _ => true,
-        };
-        if needs_join {
+        if let (Some(a), Some(b)) = (directions[i - 1], directions[i]) {
+            let cos = a[0] * b[0] + a[1] * b[1];
+            if cos < join_cos_threshold {
+                append_bevel_join(buffers, points[i], a, b, half_width, color);
+            }
+        } else {
+            // Degenerate (near-zero-length) neighboring segment: fall back
+            // to a disc since there's no reliable direction to bevel from.
             append_disc(buffers, points[i], half_width, color);
         }
     }
-    append_disc(buffers, points[last], half_width, color);
 }
 
-/// Below this cosine of the angle between two consecutive segment
-/// directions, a join disc is added at their shared point (~2.5 degrees of
-/// deviation is imperceptible without one, given typical road widths).
-const JOIN_COS_THRESHOLD: f32 = 0.999;
+/// A join disc's outer corner leaves a gap of about `half_width * angle`
+/// (small-angle approx) if skipped; solving `half_width * angle =
+/// MAX_JOIN_GAP_PX` for the angle gives the largest deviation that's still
+/// sub-pixel for a given width. Clamped to a sane range so hairline widths
+/// don't skip joins outright and very wide ones don't regress past the old
+/// fixed tolerance.
+const MAX_JOIN_GAP_PX: f32 = 0.5;
 const LINE_DISC_SEGMENTS: u32 = 8;
+
+fn join_cos_threshold(half_width: f32) -> f32 {
+    let angle = (MAX_JOIN_GAP_PX / half_width.max(0.05)).clamp(0.0, 1.05);
+    angle.cos()
+}
+
+/// Fills the wedge-shaped gap left on a turn's outer side by two segments'
+/// straight-extruded quads (see `append_polyline`) with a single triangle:
+/// the shared point plus each segment's extrude endpoint on the outer
+/// side. Cheap bevel-style join (3 vertices/3 indices) vs. a full round
+/// disc (`1 + LINE_DISC_SEGMENTS` vertices) -- visually indistinguishable
+/// from a round join at typical road widths (a few px), since the
+/// difference is confined to the tiny wedge itself.
+fn append_bevel_join(
+    buffers: &mut LineMesh,
+    center: [f32; 2],
+    dir_in: [f32; 2],
+    dir_out: [f32; 2],
+    half_width: f32,
+    color: [f32; 4],
+) {
+    // Cross product's sign tells us which side is the "outer" (convex)
+    // side of the turn -- extrude is a +90-degree rotation of direction.
+    let cross = dir_in[0] * dir_out[1] - dir_in[1] * dir_out[0];
+    let side = if cross < 0.0 { 1.0 } else { -1.0 };
+    let extrude_in = [
+        -dir_in[1] * half_width * side,
+        dir_in[0] * half_width * side,
+    ];
+    let extrude_out = [
+        -dir_out[1] * half_width * side,
+        dir_out[0] * half_width * side,
+    ];
+    let base = buffers.vertices.len() as u32;
+    buffers.vertices.push(LineVertex {
+        center,
+        extrude: [0.0, 0.0],
+        half_width: 0.0,
+        color,
+    });
+    buffers.vertices.push(LineVertex {
+        center,
+        extrude: extrude_in,
+        half_width: half_width * side,
+        color,
+    });
+    buffers.vertices.push(LineVertex {
+        center,
+        extrude: extrude_out,
+        half_width: half_width * side,
+        color,
+    });
+    buffers
+        .indices
+        .extend_from_slice(&[base, base + 1, base + 2]);
+}
 
 fn append_disc(buffers: &mut LineMesh, center: [f32; 2], radius: f32, color: [f32; 4]) {
     let base = buffers.vertices.len() as u32;
     buffers.vertices.push(LineVertex {
         center,
         extrude: [0.0, 0.0],
+        half_width: 0.0,
         color,
     });
     for i in 0..LINE_DISC_SEGMENTS {
@@ -683,6 +830,7 @@ fn append_disc(buffers: &mut LineMesh, center: [f32; 2], radius: f32, color: [f3
         buffers.vertices.push(LineVertex {
             center,
             extrude: [radius * angle.cos(), radius * angle.sin()],
+            half_width: radius,
             color,
         });
     }
@@ -721,9 +869,9 @@ fn fill_path(
 mod tests {
     use super::*;
 
-    /// Vertex/index count contributed by exactly one join/cap disc.
-    const DISC_VERTS: usize = 1 + LINE_DISC_SEGMENTS as usize;
-    const DISC_INDICES: usize = LINE_DISC_SEGMENTS as usize * 3;
+    /// Vertex/index count contributed by exactly one bevel join triangle.
+    const BEVEL_VERTS: usize = 3;
+    const BEVEL_INDICES: usize = 3;
     /// Vertex/index count contributed by exactly one segment quad.
     const SEGMENT_VERTS: usize = 4;
     const SEGMENT_INDICES: usize = 6;
@@ -732,23 +880,95 @@ mod tests {
     fn collinear_interior_points_get_no_join_disc() {
         let mut mesh = LineMesh::default();
         let points = [[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
-        append_polyline(&mut mesh, &points, [1.0, 1.0, 1.0, 1.0], 2.0);
+        append_polyline(&mut mesh, &points, [1.0, 1.0, 1.0, 1.0], 2.0, true);
 
-        // 3 segments + only the 2 endpoint caps (no interior joins, since
-        // all 3 segments share the same direction).
-        assert_eq!(mesh.vertices.len(), 3 * SEGMENT_VERTS + 2 * DISC_VERTS);
-        assert_eq!(mesh.indices.len(), 3 * SEGMENT_INDICES + 2 * DISC_INDICES);
+        // 3 segments, no caps (butt caps need no extra geometry) and no
+        // interior joins, since all 3 segments share the same direction.
+        assert_eq!(mesh.vertices.len(), 3 * SEGMENT_VERTS);
+        assert_eq!(mesh.indices.len(), 3 * SEGMENT_INDICES);
     }
 
     #[test]
-    fn real_turn_gets_a_join_disc() {
+    fn real_turn_gets_a_bevel_join() {
         let mut mesh = LineMesh::default();
         let points = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]];
-        append_polyline(&mut mesh, &points, [1.0, 1.0, 1.0, 1.0], 2.0);
+        append_polyline(&mut mesh, &points, [1.0, 1.0, 1.0, 1.0], 2.0, true);
 
-        // 2 segments + 2 endpoint caps + 1 interior join disc for the
-        // 90-degree turn.
-        assert_eq!(mesh.vertices.len(), 2 * SEGMENT_VERTS + 3 * DISC_VERTS);
-        assert_eq!(mesh.indices.len(), 2 * SEGMENT_INDICES + 3 * DISC_INDICES);
+        // 2 segments, no caps, + 1 interior bevel join for the 90-degree
+        // turn.
+        assert_eq!(mesh.vertices.len(), 2 * SEGMENT_VERTS + BEVEL_VERTS);
+        assert_eq!(mesh.indices.len(), 2 * SEGMENT_INDICES + BEVEL_INDICES);
+    }
+
+    #[test]
+    fn with_joins_false_skips_all_joins() {
+        let mut mesh = LineMesh::default();
+        let points = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]];
+        append_polyline(&mut mesh, &points, [1.0, 1.0, 1.0, 1.0], 2.0, false);
+
+        assert_eq!(mesh.vertices.len(), 2 * SEGMENT_VERTS);
+        assert_eq!(mesh.indices.len(), 2 * SEGMENT_INDICES);
+    }
+
+    /// Offline, deterministic reproduction of the "multi-GB memory on dense
+    /// urban tiles" investigation, using real MVT fixtures checked into
+    /// `fixtures/` (fetched once from OpenFreeMap; see `fixtures/README.md`)
+    /// rather than a browser stress test. Run with
+    /// `cargo test -p rgis-render tile_mesh_byte_budget -- --nocapture` to
+    /// see a per-tile breakdown; the assertions guard against regressions
+    /// that would blow the per-tile memory budget back up.
+    #[test]
+    fn tile_mesh_byte_budget() {
+        // (name, raw .pbf byte size, max acceptable total mesh bytes).
+        // Budgets are generous headroom above current measured output,
+        // just tight enough to catch a regression back toward the
+        // multi-ten-MB-per-tile behaviour seen before the `with_joins`
+        // fix (auto-antialiasing outlines emitting full round-join discs
+        // on every polygon corner, e.g. every building).
+        const FIXTURES: &[(&str, &str, usize)] = &[
+            ("paris_12", "fixtures/paris_12.pbf", 5_000_000),
+            ("paris_14", "fixtures/paris_14.pbf", 15_000_000),
+            ("london_14", "fixtures/london_14.pbf", 9_000_000),
+            ("nyc_14", "fixtures/nyc_14.pbf", 9_000_000),
+            ("tokyo_14", "fixtures/tokyo_14.pbf", 16_000_000),
+        ];
+
+        let mut total_bytes = 0usize;
+        for (name, path, budget) in FIXTURES {
+            let full_path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path);
+            let bytes = std::fs::read(&full_path)
+                .unwrap_or_else(|e| panic!("failed to read fixture {full_path}: {e}"));
+            let tile = rgis_tiles::decode_vector_tile(&bytes).expect("decode fixture MVT");
+            let coord = TileCoord { z: 14, x: 0, y: 0 };
+            let mesh = build_tile_mesh(&tile, coord);
+
+            let (fv, fi, lv, li) = mesh.counts();
+            let mesh_bytes = fv * std::mem::size_of::<Vertex>()
+                + fi * std::mem::size_of::<u32>()
+                + lv * std::mem::size_of::<LineVertex>()
+                + li * std::mem::size_of::<u32>();
+            total_bytes += mesh_bytes;
+
+            println!(
+                "{name}: raw={} bytes, fill_verts={fv} fill_idx={fi} line_verts={lv} line_idx={li} mesh_bytes={mesh_bytes} ({:.1} MB)",
+                bytes.len(),
+                mesh_bytes as f64 / 1_048_576.0
+            );
+
+            assert!(
+                mesh_bytes <= *budget,
+                "{name}: mesh_bytes={mesh_bytes} exceeds budget={budget} \
+                 ({:.1} MB > {:.1} MB) -- tessellation output grew, check for \
+                 an unnecessary source of extra vertices/discs",
+                mesh_bytes as f64 / 1_048_576.0,
+                *budget as f64 / 1_048_576.0
+            );
+        }
+        println!(
+            "total mesh bytes across {} fixtures: {} ({:.1} MB)",
+            FIXTURES.len(),
+            total_bytes,
+            total_bytes as f64 / 1_048_576.0
+        );
     }
 }

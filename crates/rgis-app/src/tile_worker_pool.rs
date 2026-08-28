@@ -52,6 +52,16 @@ use web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker};
 /// Number of dedicated workers kept warm for tile decode+tessellation.
 const POOL_SIZE: usize = 4;
 
+/// Max jobs allowed to sit in `PoolState::queue` awaiting a free worker.
+/// Without this, a sustained burst of tile fetches outpacing the 4 workers'
+/// tessellation throughput (e.g. panning/zooming quickly across many
+/// detailed tiles for a while) queues an ever-growing backlog of raw MVT
+/// byte buffers, eventually exhausting the wasm heap. When the queue is
+/// full, `tessellate` gives up on the newest request immediately (treated
+/// the same as a decode failure by callers) rather than growing it further
+/// -- the tile just gets re-requested later if it's still visible.
+const MAX_QUEUE_LEN: usize = POOL_SIZE * 4;
+
 type Job = (TileCoord, Vec<u8>);
 type ReplyTx = async_channel::Sender<Option<TileMesh>>;
 
@@ -109,13 +119,17 @@ impl TileWorkerPool {
     }
 
     /// Decodes and tessellates `bytes` (raw MVT for `coord`) on a pooled
-    /// worker, returning `None` if decoding failed.
+    /// worker, returning `None` if decoding failed (or if the pool's queue
+    /// is already saturated, see [`MAX_QUEUE_LEN`]).
     pub async fn tessellate(&self, coord: TileCoord, bytes: Vec<u8>) -> Option<TileMesh> {
         let (tx, rx) = async_channel::bounded(1);
-        self.state
-            .borrow_mut()
-            .queue
-            .push_back(((coord, bytes), tx));
+        {
+            let mut s = self.state.borrow_mut();
+            if s.queue.len() >= MAX_QUEUE_LEN {
+                return None;
+            }
+            s.queue.push_back(((coord, bytes), tx));
+        }
         pump(&self.state);
         rx.recv().await.ok().flatten()
     }

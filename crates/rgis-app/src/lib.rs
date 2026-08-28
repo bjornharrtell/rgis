@@ -18,6 +18,50 @@ mod status_bar;
 #[cfg(target_arch = "wasm32")]
 mod tile_worker_pool;
 
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Debug-only hook so automated browser testing can jump the viewport
+    /// directly to a `(lon, lat, zoom)` instead of simulating imprecise
+    /// wheel/drag input -- see `rgis-web`'s `start`, which exposes this to
+    /// the page as `window.debugJumpViewport(lon, lat, zoom)`.
+    static DEBUG_VIEWPORT_JUMP: std::cell::Cell<Option<(f64, f64, f64)>> =
+        const { std::cell::Cell::new(None) };
+}
+#[cfg(target_arch = "wasm32")]
+pub fn debug_jump_viewport(lon: f64, lat: f64, zoom: f64) {
+    DEBUG_VIEWPORT_JUMP.set(Some((lon, lat, zoom)));
+}
+
+/// Debug-only hook so automated browser testing can read the main thread's
+/// current wasm linear memory size on demand (bytes), instead of scraping
+/// periodic console logging -- see `rgis-web`'s `start`, which exposes this
+/// as `window.debugMemBytes()`.
+#[cfg(target_arch = "wasm32")]
+pub fn debug_wasm_memory_bytes() -> u32 {
+    wasm_memory_bytes()
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Every distinct tile coord ever successfully tessellated this session,
+    /// regardless of later LRU eviction from `RgisApp::tile_meshes` --
+    /// diagnostic-only, to distinguish "memory grows because an ever-larger
+    /// number of distinct tiles has been visited" (expected, not a leak)
+    /// from "memory keeps growing even though few/no new tiles are being
+    /// seen" (an actual leak) -- see repo memory notes on the ongoing OOM
+    /// investigation.
+    static DISTINCT_TILES_SEEN: std::cell::RefCell<std::collections::HashSet<TileCoord>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Debug-only hook so automated browser testing can read the cumulative
+/// count of distinct tiles ever tessellated this session, via
+/// `window.debugDistinctTileCount()`.
+#[cfg(target_arch = "wasm32")]
+pub fn debug_distinct_tile_count() -> u32 {
+    DISTINCT_TILES_SEEN.with(|s| s.borrow().len() as u32)
+}
+
 /// A demo dataset (a few simple shapes over Europe) bundled with the binary
 /// so both the native app and the browser build have something to show
 /// without requiring a file picker.
@@ -294,6 +338,8 @@ impl RgisApp {
             match promise.try_take() {
                 Ok((coord, Some(mesh))) => {
                     self.pending_tiles.remove(&coord);
+                    #[cfg(target_arch = "wasm32")]
+                    DISTINCT_TILES_SEEN.with(|s| s.borrow_mut().insert(coord));
                     self.tile_meshes.put(coord, Arc::new(mesh));
                 }
                 Ok((coord, None)) => {
@@ -544,6 +590,12 @@ impl eframe::App for RgisApp {
         self.poll_pending_loads();
         self.drain_ready_tiles();
 
+        #[cfg(target_arch = "wasm32")]
+        if let Some((lon, lat, zoom)) = DEBUG_VIEWPORT_JUMP.take() {
+            self.project.viewport.center = rgis_core::lonlat_to_mercator(lon, lat);
+            self.project.viewport.zoom = zoom;
+        }
+
         // Bottom panel must be added before the side panel so it spans the
         // full window width instead of just the area right of the sidebar.
         self.render_status_bar(ui);
@@ -554,6 +606,18 @@ impl eframe::App for RgisApp {
             ui.ctx().request_repaint();
         }
     }
+}
+
+/// Current byte size of the main thread's own wasm linear memory -- exposed
+/// via `debug_wasm_memory_bytes`/`window.debugMemBytes()` for manual memory
+/// profiling in the browser (see `rgis-render`'s `tile_mesh_byte_budget`
+/// test for the offline, automatable equivalent).
+#[cfg(target_arch = "wasm32")]
+fn wasm_memory_bytes() -> u32 {
+    use wasm_bindgen::JsCast;
+    let memory: js_sys::WebAssembly::Memory = wasm_bindgen::memory().unchecked_into();
+    let buffer: js_sys::ArrayBuffer = memory.buffer().unchecked_into();
+    buffer.byte_length()
 }
 
 fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool) -> (bool, bool) {

@@ -12,6 +12,13 @@ use rgis_tiles::{TileCoord, decode_vector_tile};
 use wasm_bindgen::{JsCast, JsValue, prelude::Closure};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
+// Same allocator swap as the main thread's module (`rgis-web/src/lib.rs`)
+// -- this worker is a SEPARATE wasm instance with its own linear memory, so
+// it needs its own `#[global_allocator]`.
+#[cfg(all(not(target_feature = "atomics"), target_family = "wasm"))]
+#[global_allocator]
+static TALC: talc::wasm::WasmDynamicTalc = talc::wasm::new_wasm_dynamic_allocator();
+
 fn main() {
     console_error_panic_hook::set_once();
 
