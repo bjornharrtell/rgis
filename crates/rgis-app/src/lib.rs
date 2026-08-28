@@ -722,6 +722,25 @@ impl RgisApp {
                     Some(glyph.advance as f32 * scale)
                 })
                 .sum::<f32>();
+            // Baseline-relative vertical center of this label's actual ink
+            // (not a guessed constant): `top` is how far each glyph's ink
+            // rises above the baseline and `height - top` is how far it
+            // dips below, so the tallest ascender/descender across the
+            // string's glyphs gives the true cap-height box to center on
+            // the road line, matching how MapLibre centers line-placed
+            // text vertically on the line itself rather than hanging it
+            // below like point labels.
+            let (mut max_ascent, mut max_descent) = (0i32, 0i32);
+            for codepoint in &codepoints {
+                if let Some(glyph) = ranges
+                    .get(&glyph_range_start(*codepoint))
+                    .and_then(|range| range.get(codepoint))
+                {
+                    max_ascent = max_ascent.max(glyph.top);
+                    max_descent = max_descent.max(glyph.height as i32 - glyph.top);
+                }
+            }
+            let baseline_offset = (max_ascent - max_descent) as f32 * 0.5 * scale;
             let mut label_glyphs = Vec::with_capacity(codepoints.len());
             let mut bounds: Option<egui::Rect> = None;
 
@@ -758,12 +777,7 @@ impl RgisApp {
                         angle += std::f32::consts::PI;
                     }
                     let x = anchor.x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
-                    // Center the label vertically on the road line itself
-                    // (matching MapLibre's line-placed labels): baseline is
-                    // pushed down from the line by roughly half the glyphs'
-                    // typical cap-height, so the ink's vertical midpoint --
-                    // not its baseline -- sits on the road.
-                    let y = anchor.y + label.font_size * 0.5
+                    let y = anchor.y + baseline_offset
                         - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
                     let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
                     let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
