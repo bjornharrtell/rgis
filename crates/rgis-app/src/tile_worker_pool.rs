@@ -22,8 +22,12 @@
 //!   sent to a worker before this point are silently dropped).
 //! - `[z, x, y]` (length 3): MVT decode failed for that tile.
 //! - `[z, x, y, fill_vertices, fill_indices, line_vertices, line_indices]`
-//!   (length 7, all four as typed arrays, transferred): the tessellated
-//!   [`TileMeshWire`].
+//!   (length 7, all four as typed arrays, transferred) or
+//!   `[z, x, y, fill_vertices, fill_indices, line_vertices, line_indices,
+//!   labels_json]` (length 8, `labels_json` a plain JSON string of
+//!   `Vec<rgis_render::TileLabel>`): the tessellated
+//!   [`TileMeshWire`]. Older/newer workers omitting the 8th element just
+//!   get no labels for that tile.
 //!
 //! Each worker only ever has one job in flight at a time (enforced by this
 //! pool), so a worker's own identity is enough to route its reply back to
@@ -178,11 +182,17 @@ fn handle_message(state: &Rc<RefCell<PoolState>>, worker_idx: usize, msg: Messag
 
     if len >= 3 {
         let mesh = if len >= 7 {
+            let labels_json = if len >= 8 {
+                data.get(7).as_string().unwrap_or_default()
+            } else {
+                String::new()
+            };
             let wire = TileMeshWire {
                 fill_vertices: Float32Array::from(data.get(3)).to_vec(),
                 fill_indices: Uint32Array::from(data.get(4)).to_vec(),
                 line_vertices: Float32Array::from(data.get(5)).to_vec(),
                 line_indices: Uint32Array::from(data.get(6)).to_vec(),
+                labels_json,
             };
             Some(wire.into_tile_mesh())
         } else {

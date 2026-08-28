@@ -1,18 +1,19 @@
-//! wgpu render resources for drawing the tessellated vector mesh and raster
-//! tile images inside an `egui_wgpu::Callback`, so the map renders on the
-//! same wgpu device/surface as the rest of the (egui) UI — on native and in
-//! the browser (WebGPU/WebGL2) alike.
+//! wgpu render resources for drawing the tessellated vector mesh, raster
+//! tile images, and SDF text labels inside an `egui_wgpu::Callback`, so the
+//! map renders on the same wgpu device/surface as the rest of the (egui) UI
+//! — on native and in the browser (WebGPU/WebGL2) alike.
 
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use lru::LruCache;
-use rgis_tiles::TileCoord;
+use rgis_tiles::{GLYPH_BUFFER, Glyph, TileCoord, glyph_range_start};
 use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::util::DeviceExt;
 
 use crate::basemap::{LineVertex, TileMesh};
 use crate::mesh::{SceneMesh, Vertex};
+use crate::text::{GlyphBitmapRanges, LabelGlyphInstance};
 
 /// MSAA sample count for the map's wgpu pipelines. Must match whatever
 /// sample count eframe's shared renderer was created with (native: set via
@@ -29,11 +30,23 @@ const LINE_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
 const TILE_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
 
+const TEXT_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4];
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct TileVertex {
     position: [f32; 2],
     uv: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct TextVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+    color: [f32; 4],
+    halo_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -100,6 +113,145 @@ struct TileGpuTexture {
     bind_group: wgpu::BindGroup,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AtlasRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// Shelf-packed R8 atlas shared across all map-label draws.
+struct GlyphAtlas {
+    _texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    size: u32,
+    cursor_x: u32,
+    cursor_y: u32,
+    shelf_height: u32,
+    packed: FxHashMap<(String, u32), AtlasRect>,
+}
+
+impl GlyphAtlas {
+    fn new(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        size: u32,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rgis-glyph-atlas"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rgis-glyph-atlas-bind-group"),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        Self {
+            _texture: texture,
+            _view: view,
+            bind_group,
+            size,
+            cursor_x: 0,
+            cursor_y: 0,
+            shelf_height: 0,
+            packed: FxHashMap::default(),
+        }
+    }
+
+    fn ensure(
+        &mut self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fontstack: &str,
+        codepoint: u32,
+        glyph: &Glyph,
+    ) -> Option<AtlasRect> {
+        let key = (fontstack.to_string(), codepoint);
+        if let Some(rect) = self.packed.get(&key).copied() {
+            return Some(rect);
+        }
+
+        let w = glyph.width + 2 * GLYPH_BUFFER;
+        let h = glyph.height + 2 * GLYPH_BUFFER;
+        if w == 0
+            || h == 0
+            || w > self.size
+            || h > self.size
+            || glyph.bitmap.len() != (w * h) as usize
+        {
+            return None;
+        }
+
+        if self.cursor_x + w > self.size {
+            self.cursor_x = 0;
+            self.cursor_y += self.shelf_height;
+            self.shelf_height = 0;
+        }
+        if self.cursor_y + h > self.size {
+            return None;
+        }
+
+        let rect = AtlasRect {
+            x: self.cursor_x,
+            y: self.cursor_y,
+            w,
+            h,
+        };
+        self.cursor_x += w;
+        self.shelf_height = self.shelf_height.max(h);
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self._texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &glyph.bitmap,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.packed.insert(key, rect);
+        Some(rect)
+    }
+}
+
 /// Persistent GPU resources for the map. Created once and stored in eframe's
 /// `egui_wgpu::CallbackResources`, then reused every frame by [`MapCallback`].
 pub struct MapRenderResources {
@@ -149,6 +301,12 @@ pub struct MapRenderResources {
     /// frame.
     scene_vertex_buffer: GrowableBuffer,
     scene_index_buffer: GrowableBuffer,
+    glyph_atlas: GlyphAtlas,
+    text_pipeline: wgpu::RenderPipeline,
+    _text_atlas_bind_group_layout: wgpu::BindGroupLayout,
+    _text_atlas_sampler: wgpu::Sampler,
+    text_vertex_buffer: GrowableBuffer,
+    text_index_buffer: GrowableBuffer,
 }
 
 impl MapRenderResources {
@@ -271,6 +429,50 @@ impl MapRenderResources {
             &tile_bind_group_layout,
         );
 
+        let text_atlas_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rgis-text-atlas-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let text_atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("rgis-text-atlas-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let text_pipeline = create_text_pipeline(
+            device,
+            target_format,
+            &screen_bind_group_layout,
+            &text_atlas_bind_group_layout,
+        );
+
+        let glyph_atlas = GlyphAtlas::new(
+            device,
+            &text_atlas_bind_group_layout,
+            &text_atlas_sampler,
+            GLYPH_ATLAS_SIZE,
+        );
+
         let tile_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("rgis-tile-indices"),
             contents: bytemuck::cast_slice(&UNIT_QUAD_INDICES),
@@ -308,6 +510,15 @@ impl MapRenderResources {
                 wgpu::BufferUsages::INDEX,
                 "rgis-vector-indices",
             ),
+            glyph_atlas,
+            text_pipeline,
+            _text_atlas_bind_group_layout: text_atlas_bind_group_layout,
+            _text_atlas_sampler: text_atlas_sampler,
+            text_vertex_buffer: GrowableBuffer::new(
+                wgpu::BufferUsages::VERTEX,
+                "rgis-text-vertices",
+            ),
+            text_index_buffer: GrowableBuffer::new(wgpu::BufferUsages::INDEX, "rgis-text-indices"),
         }
     }
 
@@ -449,6 +660,9 @@ impl MapRenderResources {
 /// Initial number of tile slots in `MapRenderResources::tile_transform_pool_buffer`.
 const INITIAL_TILE_TRANSFORM_CAPACITY: u64 = 64;
 
+/// Fixed-size shared glyph atlas; new glyphs are shelf-packed until full.
+const GLYPH_ATLAS_SIZE: u32 = 2048;
+
 /// Number of basemap tiles' GPU mesh buffers kept alive at once. Larger than
 /// a typical viewport's visible-tile count so tiles that scroll just off
 /// screen (the common case during panning) don't need re-uploading if the
@@ -567,6 +781,8 @@ pub struct MapCallback {
     /// `offset`/`scale` transform is refreshed every frame.
     pub basemap_tiles: Vec<BasemapTileDraw>,
     pub tiles: Vec<TileDraw>,
+    pub labels: Vec<LabelGlyphInstance>,
+    pub glyph_bitmaps: GlyphBitmapRanges,
     pub width: f32,
     pub height: f32,
 }
@@ -659,11 +875,81 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             .tile_vertex_buffer
             .write(device, queue, bytemuck::cast_slice(&tile_vertices));
 
+        let mut text_vertices = Vec::with_capacity(self.labels.len() * 4);
+        let mut text_indices = Vec::with_capacity(self.labels.len() * 6);
+        for label in &self.labels {
+            let range_start = glyph_range_start(label.codepoint);
+            let Some(range) = self
+                .glyph_bitmaps
+                .get(&(label.fontstack.clone(), range_start))
+            else {
+                continue;
+            };
+            let Some(glyph) = range.get(&label.codepoint) else {
+                continue;
+            };
+            let Some(atlas_rect) = resources.glyph_atlas.ensure(
+                device,
+                queue,
+                &label.fontstack,
+                label.codepoint,
+                glyph,
+            ) else {
+                continue;
+            };
+
+            let [x, y, w, h] = label.rect;
+            let atlas_size = resources.glyph_atlas.size as f32;
+            let u0 = atlas_rect.x as f32 / atlas_size;
+            let v0 = atlas_rect.y as f32 / atlas_size;
+            let u1 = (atlas_rect.x + atlas_rect.w) as f32 / atlas_size;
+            let v1 = (atlas_rect.y + atlas_rect.h) as f32 / atlas_size;
+            let base = text_vertices.len() as u32;
+            text_vertices.extend_from_slice(&[
+                TextVertex {
+                    position: [x, y],
+                    uv: [u0, v0],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+                TextVertex {
+                    position: [x + w, y],
+                    uv: [u1, v0],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+                TextVertex {
+                    position: [x + w, y + h],
+                    uv: [u1, v1],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+                TextVertex {
+                    position: [x, y + h],
+                    uv: [u0, v1],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+            ]);
+            text_indices.extend(
+                UNIT_QUAD_INDICES
+                    .iter()
+                    .map(|&index| base + u32::from(index)),
+            );
+        }
+        resources
+            .text_vertex_buffer
+            .write(device, queue, bytemuck::cast_slice(&text_vertices));
+        resources
+            .text_index_buffer
+            .write(device, queue, bytemuck::cast_slice(&text_indices));
+
         callback_resources.insert(FramePrepared {
             index_count: self.mesh.indices.len() as u32,
             background_index_count: self.background_index_count,
             basemap_draws,
             tile_keys: self.tiles.iter().map(|tile| tile.key).collect(),
+            text_index_count: text_indices.len() as u32,
         });
 
         Vec::new()
@@ -818,6 +1104,20 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             render_pass.set_index_buffer(index_buffer, wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(frame.background_index_count..frame.index_count, 0, 0..1);
         }
+
+        if frame.text_index_count > 0
+            && let (Some(vertex_buffer), Some(index_buffer)) = (
+                resources.text_vertex_buffer.slice(),
+                resources.text_index_buffer.slice(),
+            )
+        {
+            render_pass.set_pipeline(&resources.text_pipeline);
+            render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
+            render_pass.set_bind_group(1, &resources.glyph_atlas.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, vertex_buffer);
+            render_pass.set_index_buffer(index_buffer, wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..frame.text_index_count, 0, 0..1);
+        }
     }
 }
 
@@ -832,6 +1132,7 @@ struct FramePrepared {
     background_index_count: u32,
     basemap_draws: Vec<BasemapDrawPrepared>,
     tile_keys: Vec<u64>,
+    text_index_count: u32,
 }
 
 /// A basemap tile draw ready for `paint`: the persistent GPU mesh buffers
@@ -1031,6 +1332,60 @@ fn create_tile_pipeline(
                 array_stride: std::mem::size_of::<TileVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &TILE_VERTEX_ATTRS,
+            })],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: MSAA_SAMPLES,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_text_pipeline(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+    screen_bind_group_layout: &wgpu::BindGroupLayout,
+    atlas_bind_group_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("rgis-text-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/text.wgsl").into()),
+    });
+
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("rgis-text-pipeline-layout"),
+        bind_group_layouts: &[
+            Some(screen_bind_group_layout),
+            Some(atlas_bind_group_layout),
+        ],
+        immediate_size: 0,
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("rgis-text-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<TextVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &TEXT_VERTEX_ATTRS,
             })],
             compilation_options: Default::default(),
         },

@@ -57,6 +57,10 @@ fn main() {
                 reply.push(&fill_indices);
                 reply.push(&line_vertices);
                 reply.push(&line_indices);
+                // Plain JSON string, not transferred (strings are
+                // structured-cloned, not backed by a transferable
+                // ArrayBuffer) -- see `TileMeshWire::labels_json`.
+                reply.push(&JsValue::from_str(&wire.labels_json));
 
                 scope_clone
                     .post_message_with_transfer(&reply.into(), &transfer.into())

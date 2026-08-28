@@ -11,8 +11,11 @@ use lru::LruCache;
 use poll_promise::Promise;
 use rgis_core::{Layer, LayerId, Project, mercator_to_lonlat};
 use rgis_io::{IoError, LoadedLayer};
-use rgis_render::{SceneMesh, TileMesh};
-use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
+use rgis_render::{GlyphBitmapRanges, LabelGlyphInstance, SceneMesh, TileMesh};
+use rgis_tiles::{
+    GLYPH_BUFFER, GLYPH_PIXELS_PER_EM, GlyphFetcher, OPENFREEMAP_MAX_ZOOM, TileCoord,
+    VectorTileFetcher, glyph_range_start, visible_tiles_for_zoom,
+};
 
 mod status_bar;
 #[cfg(target_arch = "wasm32")]
@@ -84,6 +87,8 @@ const MAX_TESSELLATIONS_PER_FRAME: usize = 3;
 const ROW_VPAD: f32 = 5.0;
 /// Background fill painted behind a hovered sidebar tree row.
 const ROW_HOVER_FILL: egui::Color32 = egui::Color32::from_gray(40);
+/// MapLibre/OpenFreeMap fontstack name used for all map labels for now.
+const LABEL_FONTSTACK: &str = "Noto Sans Regular";
 
 /// One or more layers finished (or failed) loading, each tagged with a
 /// display name for error messages.
@@ -92,6 +97,7 @@ type LoadResults = Vec<(String, Result<LoadedLayer, IoError>)>;
 pub struct RgisApp {
     project: Project,
     vector_tile_fetcher: Arc<VectorTileFetcher>,
+    glyph_fetcher: Arc<GlyphFetcher>,
     /// Tessellated mesh per tile, in tile-local metres (viewport-independent
     /// — see `rgis_render::build_tile_mesh`) — built once per tile and
     /// reused across every pan/zoom, unlike the final screen-space mesh
@@ -137,6 +143,7 @@ impl RgisApp {
         Self {
             project: Project::default(),
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
+            glyph_fetcher: GlyphFetcher::new(),
             tile_meshes: LruCache::new(NonZeroUsize::new(TILE_MESH_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
@@ -349,6 +356,14 @@ impl RgisApp {
             }
         }
         self.pending_tile_meshes = still_pending;
+    }
+
+    fn drain_ready_glyphs(&mut self) -> bool {
+        let mut drained_any = false;
+        while self.glyph_fetcher.receiver.try_recv().is_ok() {
+            drained_any = true;
+        }
+        drained_any
     }
 
     /// Walks up from `coord` to find the closest already-cached ancestor
@@ -571,17 +586,173 @@ impl RgisApp {
                     &self.project.viewport,
                 ));
 
+                // Screen-space label glyph quads must be collected before
+                // `basemap_tiles` moves into the paint callback below.
+                let (label_glyphs, glyph_bitmaps, pending_glyphs) =
+                    self.collect_label_draws(&basemap_tiles, rect);
+
                 let callback = rgis_render::MapCallback {
                     mesh,
                     background_index_count,
                     basemap_tiles,
                     tiles: Vec::new(),
+                    labels: label_glyphs,
+                    glyph_bitmaps,
                     width: rect.width(),
                     height: rect.height(),
                 };
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, callback));
+                if pending_glyphs {
+                    ui.ctx().request_repaint();
+                }
             });
+    }
+
+    /// Projects visible basemap labels into screen space, performs
+    /// priority-ordered greedy decluttering, and expands every surviving
+    /// string into per-glyph screen quads ready for the map callback's SDF
+    /// text pipeline.
+    fn collect_label_draws(
+        &self,
+        basemap_tiles: &[rgis_render::BasemapTileDraw],
+        rect: egui::Rect,
+    ) -> (Vec<LabelGlyphInstance>, GlyphBitmapRanges, bool) {
+        struct ProjectedLabel {
+            priority: i32,
+            pos: egui::Pos2,
+            text: String,
+            font_size: f32,
+            color: [f32; 4],
+            halo_color: [f32; 4],
+        }
+
+        // A little slack beyond the viewport rect so a label whose anchor
+        // point is just off-screen (but whose text would still be
+        // partially visible) isn't dropped before the overlap pass even
+        // sees it.
+        let cull_rect = rect.expand(64.0);
+        let mut projected = Vec::new();
+        for draw in basemap_tiles {
+            for label in &draw.mesh.labels {
+                let pos = egui::pos2(
+                    rect.min.x + label.position[0] * draw.scale + draw.offset[0],
+                    rect.min.y + label.position[1] * draw.scale + draw.offset[1],
+                );
+                if !cull_rect.contains(pos) {
+                    continue;
+                }
+                projected.push(ProjectedLabel {
+                    priority: label.priority,
+                    pos,
+                    text: label.text.clone(),
+                    font_size: label.font_size,
+                    color: label.color,
+                    halo_color: label.halo_color,
+                });
+            }
+        }
+        projected.sort_by_key(|l| l.priority);
+
+        let mut placed: Vec<egui::Rect> = Vec::with_capacity(projected.len());
+        let mut glyphs = Vec::new();
+        let mut glyph_bitmaps = GlyphBitmapRanges::default();
+        let mut pending_glyphs = false;
+        let fontstack = LABEL_FONTSTACK.to_string();
+
+        for label in projected {
+            if label.text.is_empty() {
+                continue;
+            }
+
+            let mut codepoints = Vec::with_capacity(label.text.chars().count());
+            let mut ranges = std::collections::HashMap::new();
+            let mut missing = false;
+            for ch in label.text.chars() {
+                let codepoint = ch as u32;
+                codepoints.push(codepoint);
+                let range_start = glyph_range_start(codepoint);
+                let Some(range) = self.glyph_fetcher.get_cached(LABEL_FONTSTACK, codepoint) else {
+                    self.glyph_fetcher.request(LABEL_FONTSTACK, codepoint);
+                    pending_glyphs = true;
+                    missing = true;
+                    continue;
+                };
+                if !range.contains_key(&codepoint) {
+                    self.glyph_fetcher.request(LABEL_FONTSTACK, codepoint);
+                    pending_glyphs = true;
+                    missing = true;
+                    continue;
+                }
+                ranges.entry(range_start).or_insert(range);
+            }
+            if missing {
+                continue;
+            }
+
+            let scale = label.font_size / GLYPH_PIXELS_PER_EM;
+            let total_advance = codepoints
+                .iter()
+                .filter_map(|codepoint| {
+                    let range = ranges.get(&glyph_range_start(*codepoint))?;
+                    let glyph = range.get(codepoint)?;
+                    Some(glyph.advance as f32 * scale)
+                })
+                .sum::<f32>();
+            let baseline_y = label.pos.y + label.font_size * 0.35;
+            let mut pen_x = label.pos.x - total_advance * 0.5;
+            let mut label_glyphs = Vec::with_capacity(codepoints.len());
+            let mut bounds: Option<egui::Rect> = None;
+
+            for codepoint in codepoints {
+                let range_start = glyph_range_start(codepoint);
+                let Some(range) = ranges.get(&range_start) else {
+                    continue;
+                };
+                let Some(glyph) = range.get(&codepoint) else {
+                    continue;
+                };
+
+                // `left`/`top` describe the ink box, while the packed atlas
+                // rect includes the standard SDF padding around it, so shift
+                // the screen quad by that buffer to keep the ink aligned with
+                // the layout metrics.
+                let x = pen_x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
+                let y = baseline_y - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
+                let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
+                let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
+                let glyph_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                bounds = Some(match bounds {
+                    Some(existing) => existing.union(glyph_rect),
+                    None => glyph_rect,
+                });
+                label_glyphs.push(LabelGlyphInstance {
+                    rect: [x, y, w, h],
+                    fontstack: fontstack.clone(),
+                    codepoint,
+                    color: label.color,
+                    halo_color: label.halo_color,
+                });
+                glyph_bitmaps
+                    .entry((fontstack.clone(), range_start))
+                    .or_insert_with(|| Arc::clone(range));
+                pen_x += glyph.advance as f32 * scale;
+            }
+
+            let Some(label_rect) = bounds.map(|rect| rect.expand2(egui::vec2(2.0, 2.0))) else {
+                continue;
+            };
+            if placed
+                .iter()
+                .any(|placed_rect| placed_rect.intersects(label_rect))
+            {
+                continue;
+            }
+            placed.push(label_rect);
+            glyphs.extend(label_glyphs);
+        }
+
+        (glyphs, glyph_bitmaps, pending_glyphs)
     }
 }
 
@@ -589,6 +760,7 @@ impl eframe::App for RgisApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_pending_loads();
         self.drain_ready_tiles();
+        let ready_glyphs = self.drain_ready_glyphs();
 
         #[cfg(target_arch = "wasm32")]
         if let Some((lon, lat, zoom)) = DEBUG_VIEWPORT_JUMP.take() {
@@ -602,7 +774,7 @@ impl eframe::App for RgisApp {
         self.render_sidebar(ui);
         self.render_map(ui);
 
-        if !self.pending_loads.is_empty() || !self.pending_tiles.is_empty() {
+        if ready_glyphs || !self.pending_loads.is_empty() || !self.pending_tiles.is_empty() {
             ui.ctx().request_repaint();
         }
     }
