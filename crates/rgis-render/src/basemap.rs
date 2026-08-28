@@ -465,15 +465,25 @@ fn place_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
     Some((font_size, class_priority * 1000 + rank))
 }
 
-/// OpenMapTiles `poi` layer: only labeled from a fairly high zoom, since
-/// there can be dozens of points-of-interest per tile block (far denser
-/// than `place`) -- keeps the per-frame label count manageable for the
-/// screen-space text overlay that draws these (see `rgis-app`).
+/// OpenMapTiles `poi` layer: gated by both zoom and the feature's own
+/// `rank` (lower = more important), mirroring the "liberty" style's
+/// `poi_r1`/`poi_r7`/`poi_r20` layers (rank 1-6 from z15, 7-19 from z16,
+/// 20+ only from z17) rather than showing every POI regardless of rank
+/// once some single zoom threshold is reached -- without this tiering,
+/// far more POIs show up per zoom level than the reference style/MapLibre
+/// client renders, which is why labels looked over-dense.
 fn poi_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
-    if zoom < 15.0 {
+    let rank = feature.get_number("rank").unwrap_or(30.0) as i32;
+    let min_zoom = if rank >= 20 {
+        17.0
+    } else if rank >= 7 {
+        16.0
+    } else {
+        15.0
+    };
+    if zoom < min_zoom {
         return None;
     }
-    let rank = feature.get_number("rank").unwrap_or(30.0) as i32;
     Some((10.0, 10_000 + rank))
 }
 

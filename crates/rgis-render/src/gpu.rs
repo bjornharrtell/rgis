@@ -121,6 +121,12 @@ struct AtlasRect {
     h: u32,
 }
 
+/// Extra gap (px) left between adjacent glyphs' reserved rects in
+/// [`GlyphAtlas`]'s shelf packing, on top of each glyph's own
+/// `GLYPH_BUFFER` -- prevents bilinear sampling at one glyph's edge from
+/// picking up a neighboring glyph's texels.
+const ATLAS_PADDING: u32 = 2;
+
 /// Shelf-packed R8 atlas shared across all map-label draws.
 struct GlyphAtlas {
     _texture: wgpu::Texture,
@@ -205,9 +211,16 @@ impl GlyphAtlas {
             return None;
         }
 
-        if self.cursor_x + w > self.size {
+        // Reserve `w + ATLAS_PADDING`/`h + ATLAS_PADDING` in the shelf
+        // layout (not just `w`/`h`) so adjacent glyphs' texels are never
+        // direct neighbors in the atlas -- bilinear filtering (needed for
+        // smooth SDF edges) otherwise blends a glyph's edge pixels with
+        // whatever unrelated glyph happens to be packed right next to it,
+        // which showed up as faint ghosting/smearing artifacts around
+        // glyphs sharing a shelf.
+        if self.cursor_x + w + ATLAS_PADDING > self.size {
             self.cursor_x = 0;
-            self.cursor_y += self.shelf_height;
+            self.cursor_y += self.shelf_height + ATLAS_PADDING;
             self.shelf_height = 0;
         }
         if self.cursor_y + h > self.size {
@@ -220,7 +233,7 @@ impl GlyphAtlas {
             w,
             h,
         };
-        self.cursor_x += w;
+        self.cursor_x += w + ATLAS_PADDING;
         self.shelf_height = self.shelf_height.max(h);
 
         queue.write_texture(
