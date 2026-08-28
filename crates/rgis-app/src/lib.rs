@@ -518,8 +518,14 @@ impl RgisApp {
                     self.bbox_zoom_start = response.interact_pointer_pos();
                 }
 
+                // Skip single-finger-drag panning while a bbox-zoom drag or
+                // a pinch/two-finger gesture is active -- otherwise the
+                // emulated primary pointer (which tracks one of the
+                // touches) would apply a second, conflicting pan on top of
+                // the two-finger translation handled below.
+                let multi_touch_active = ui.ctx().multi_touch().is_some();
                 if response.dragged() {
-                    if self.bbox_zoom_start.is_none() {
+                    if self.bbox_zoom_start.is_none() && !multi_touch_active {
                         let delta = response.drag_delta();
                         self.project.viewport.pan(delta.x, delta.y);
                     }
@@ -562,6 +568,29 @@ impl RgisApp {
                         self.project
                             .viewport
                             .zoom_toward([local.x, local.y], zoom_delta);
+                    }
+                }
+
+                // Two-finger pinch-to-zoom (touch devices). `multi_touch` is
+                // a global gesture (not tied to a specific widget response),
+                // so it's gated on the gesture's center falling within the
+                // map rect -- otherwise a pinch elsewhere (e.g. over the
+                // mobile floating layer list) would also zoom the map.
+                if let Some(touch) = ui.ctx().multi_touch()
+                    && rect.contains(touch.center_pos)
+                {
+                    let local = touch.center_pos - rect.min;
+                    if (touch.zoom_delta - 1.0).abs() > f32::EPSILON {
+                        let zoom_delta = (touch.zoom_delta as f64).log2();
+                        self.project
+                            .viewport
+                            .zoom_toward([local.x, local.y], zoom_delta);
+                    }
+                    // Two-finger drag also pans, in addition to pinch-zoom.
+                    if touch.translation_delta != egui::Vec2::ZERO {
+                        self.project
+                            .viewport
+                            .pan(touch.translation_delta.x, touch.translation_delta.y);
                     }
                 }
 
