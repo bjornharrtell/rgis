@@ -627,17 +627,25 @@ impl RgisApp {
             halo_color: [f32; 4],
         }
 
-        // A little slack beyond the viewport rect so a label whose anchor
-        // point is just off-screen (but whose text would still be
-        // partially visible) isn't dropped before the overlap pass even
-        // sees it.
-        let cull_rect = rect.expand(64.0);
+        // Label positions feed the wgpu `MapCallback` (same as basemap
+        // tiles' own `offset`/`scale`), which places everything in
+        // rect-*local* pixel space (0,0 at the map panel's own top-left,
+        // matching `width`/`height`) -- NOT absolute window space, unlike
+        // the old egui-painter-based approach this replaced. So `rect.min`
+        // must NOT be added here (that previously caused labels to drift
+        // by the sidebar's width and desync from the tiles under
+        // zoom/pan). The cull rect is likewise expressed in that same
+        // rect-local space, with a little slack beyond the viewport so a
+        // label whose anchor point is just off-screen (but whose text
+        // would still be partially visible) isn't dropped before the
+        // overlap pass even sees it.
+        let cull_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, rect.size()).expand(64.0);
         let mut projected = Vec::new();
         for draw in basemap_tiles {
             for label in &draw.mesh.labels {
                 let pos = egui::pos2(
-                    rect.min.x + label.position[0] * draw.scale + draw.offset[0],
-                    rect.min.y + label.position[1] * draw.scale + draw.offset[1],
+                    label.position[0] * draw.scale + draw.offset[0],
+                    label.position[1] * draw.scale + draw.offset[1],
                 );
                 if !cull_rect.contains(pos) {
                     continue;
