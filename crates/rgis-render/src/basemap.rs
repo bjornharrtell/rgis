@@ -86,10 +86,17 @@ pub struct TileLabel {
     pub priority: i32,
     /// Clockwise rotation in radians applied around `position` when laying
     /// out the label's glyphs (see `LabelGlyphInstance::angle`); `0.0` for
-    /// point labels (place/poi), non-zero for road names, which follow
-    /// their line's on-screen direction like MapLibre's `symbol-placement:
-    /// line` road labels.
+    /// point labels (place/poi). Ignored when `path` is `Some` (road
+    /// labels), which instead follow the path's own local tangent per
+    /// glyph.
     pub angle: f32,
+    /// For road-name labels (`symbol-placement: line`, mirroring MapLibre):
+    /// the full road polyline in the same tile-local-metres space as
+    /// `position`, so the label's glyphs can be threaded along the actual
+    /// road geometry (curving with it) instead of sitting on one flat,
+    /// straight quad. `None` for point labels (place/poi), which are laid
+    /// out as a single horizontal run instead.
+    pub path: Option<Vec<[f32; 2]>>,
 }
 
 /// A line/stroke vertex: `center` is the tile-local-metres position
@@ -573,6 +580,7 @@ fn extract_labels(
                 halo_color,
                 priority,
                 angle: 0.0,
+                path: None,
             });
         }
     }
@@ -600,10 +608,10 @@ fn road_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
 }
 
 /// Extracts road-name labels (`transportation_name` layer) from a decoded
-/// tile, placing each label at the midpoint of its line's longest segment
-/// and rotating it to follow that segment's on-screen direction, like
-/// MapLibre's `symbol-placement: line` road labels -- unlike `place`/`poi`
-/// labels (see `extract_labels`), these aren't drawn axis-aligned.
+/// tile, threading each label along its full road polyline (`path`) so the
+/// glyphs curve with the actual geometry, like MapLibre's
+/// `symbol-placement: line` road labels -- unlike `place`/`poi` labels
+/// (see `extract_labels`), these aren't drawn as a single flat quad.
 fn extract_road_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) -> Vec<TileLabel> {
     let zoom = coord.z as f64;
     let Some(layer) = tile.layers.iter().find(|l| l.name == "transportation_name") else {
@@ -634,25 +642,9 @@ fn extract_road_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) ->
         if points.len() < 2 {
             continue;
         }
-        // Longest single segment, so the label sits on the straightest run
-        // of road rather than spanning a sharp bend.
-        let (mut a, mut b, mut best_len) = (points[0], points[1], 0.0f32);
-        for pair in points.windows(2) {
-            let [p0, p1] = [pair[0], pair[1]];
-            let len = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
-            if len > best_len {
-                best_len = len;
-                a = p0;
-                b = p1;
-            }
-        }
-        let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
-        let mut angle = (b[1] - a[1]).atan2(b[0] - a[0]);
-        // Keep text upright (never upside-down) by flipping direction when
-        // it would otherwise point into the left half-plane.
-        if angle > std::f32::consts::FRAC_PI_2 || angle < -std::f32::consts::FRAC_PI_2 {
-            angle += std::f32::consts::PI;
-        }
+        // Anchor at the arc-length midpoint of the whole road, matching
+        // where MapLibre centers a line-placed label along its geometry.
+        let mid = point_at_arc_length(&points, line_length_points(&points) * 0.5);
         labels.push(TileLabel {
             position: mid,
             text: text.to_string(),
@@ -660,18 +652,42 @@ fn extract_road_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) ->
             color: [0.15, 0.15, 0.17, 1.0],
             halo_color: [1.0, 1.0, 1.0, 0.9],
             priority: 20_000 + class_priority,
-            angle,
+            angle: 0.0,
+            path: Some(points),
         });
     }
     labels
 }
 
 fn line_length(line: &LineString<i32>, ctx: &TileContext) -> f32 {
-    let points = line_points(line, ctx);
+    line_length_points(&line_points(line, ctx))
+}
+
+fn line_length_points(points: &[[f32; 2]]) -> f32 {
     points
         .windows(2)
         .map(|pair| ((pair[1][0] - pair[0][0]).powi(2) + (pair[1][1] - pair[0][1]).powi(2)).sqrt())
         .sum()
+}
+
+/// Walks `points` by cumulative arc length and returns the point at
+/// `target_len` along the polyline (clamped to its endpoints).
+fn point_at_arc_length(points: &[[f32; 2]], target_len: f32) -> [f32; 2] {
+    let mut walked = 0.0f32;
+    for pair in points.windows(2) {
+        let [p0, p1] = [pair[0], pair[1]];
+        let seg_len = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
+        if walked + seg_len >= target_len || seg_len <= f32::EPSILON {
+            let t = if seg_len > f32::EPSILON {
+                (target_len - walked) / seg_len
+            } else {
+                0.0
+            };
+            return [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
+        }
+        walked += seg_len;
+    }
+    points.last().copied().unwrap_or([0.0, 0.0])
 }
 
 /// The small per-tile screen transform needed to position an already

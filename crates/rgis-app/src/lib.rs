@@ -626,6 +626,9 @@ impl RgisApp {
             color: [f32; 4],
             halo_color: [f32; 4],
             angle: f32,
+            /// Screen-space road polyline for line-placed labels (see
+            /// `TileLabel::path`); `None` for point (place/poi) labels.
+            path: Option<Vec<egui::Pos2>>,
         }
 
         // Label positions feed the wgpu `MapCallback` (same as basemap
@@ -659,6 +662,16 @@ impl RgisApp {
                     color: label.color,
                     halo_color: label.halo_color,
                     angle: label.angle,
+                    path: label.path.as_ref().map(|path| {
+                        path.iter()
+                            .map(|p| {
+                                egui::pos2(
+                                    p[0] * draw.scale + draw.offset[0],
+                                    p[1] * draw.scale + draw.offset[1],
+                                )
+                            })
+                            .collect()
+                    }),
                 });
             }
         }
@@ -709,46 +722,105 @@ impl RgisApp {
                     Some(glyph.advance as f32 * scale)
                 })
                 .sum::<f32>();
-            let baseline_y = label.pos.y + label.font_size * 0.35;
-            let mut pen_x = label.pos.x - total_advance * 0.5;
             let mut label_glyphs = Vec::with_capacity(codepoints.len());
             let mut bounds: Option<egui::Rect> = None;
 
-            for codepoint in codepoints {
-                let range_start = glyph_range_start(codepoint);
-                let Some(range) = ranges.get(&range_start) else {
+            if let Some(path) = &label.path {
+                // Road label: thread glyphs along the actual line geometry
+                // (like MapLibre's `symbol-placement: line`) instead of one
+                // flat quad, so text curves with bends in the road.
+                let Some(total_len) = path_length(path) else {
                     continue;
                 };
-                let Some(glyph) = range.get(&codepoint) else {
-                    continue;
-                };
+                let mid_len = total_len * 0.5;
+                // Sample the tangent near the anchor to decide whether
+                // walking the path forward would lay the text out upside
+                // down; if so, walk it in the other direction instead so
+                // the label always reads left-to-right, upright.
+                let (_, probe_angle) = point_and_angle_at(path, mid_len);
+                let forward = probe_angle.cos() >= 0.0;
+                let mut pen_len = mid_len - total_advance * 0.5;
+                for codepoint in codepoints {
+                    let range_start = glyph_range_start(codepoint);
+                    let Some(range) = ranges.get(&range_start) else {
+                        continue;
+                    };
+                    let Some(glyph) = range.get(&codepoint) else {
+                        continue;
+                    };
+                    let sample_len = if forward {
+                        pen_len
+                    } else {
+                        total_len - pen_len
+                    };
+                    let (anchor, mut angle) = point_and_angle_at(path, sample_len);
+                    if !forward {
+                        angle += std::f32::consts::PI;
+                    }
+                    let x = anchor.x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
+                    let y = anchor.y + label.font_size * 0.35
+                        - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
+                    let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let glyph_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                    bounds = Some(match bounds {
+                        Some(existing) => existing.union(glyph_rect),
+                        None => glyph_rect,
+                    });
+                    label_glyphs.push(LabelGlyphInstance {
+                        rect: [x, y, w, h],
+                        anchor: [anchor.x, anchor.y],
+                        angle,
+                        fontstack: fontstack.clone(),
+                        codepoint,
+                        color: label.color,
+                        halo_color: label.halo_color,
+                    });
+                    glyph_bitmaps
+                        .entry((fontstack.clone(), range_start))
+                        .or_insert_with(|| Arc::clone(range));
+                    pen_len += glyph.advance as f32 * scale;
+                }
+            } else {
+                let baseline_y = label.pos.y + label.font_size * 0.35;
+                let mut pen_x = label.pos.x - total_advance * 0.5;
 
-                // `left`/`top` describe the ink box, while the packed atlas
-                // rect includes the standard SDF padding around it, so shift
-                // the screen quad by that buffer to keep the ink aligned with
-                // the layout metrics.
-                let x = pen_x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
-                let y = baseline_y - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
-                let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
-                let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
-                let glyph_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
-                bounds = Some(match bounds {
-                    Some(existing) => existing.union(glyph_rect),
-                    None => glyph_rect,
-                });
-                label_glyphs.push(LabelGlyphInstance {
-                    rect: [x, y, w, h],
-                    anchor: [label.pos.x, label.pos.y],
-                    angle: label.angle,
-                    fontstack: fontstack.clone(),
-                    codepoint,
-                    color: label.color,
-                    halo_color: label.halo_color,
-                });
-                glyph_bitmaps
-                    .entry((fontstack.clone(), range_start))
-                    .or_insert_with(|| Arc::clone(range));
-                pen_x += glyph.advance as f32 * scale;
+                for codepoint in codepoints {
+                    let range_start = glyph_range_start(codepoint);
+                    let Some(range) = ranges.get(&range_start) else {
+                        continue;
+                    };
+                    let Some(glyph) = range.get(&codepoint) else {
+                        continue;
+                    };
+
+                    // `left`/`top` describe the ink box, while the packed
+                    // atlas rect includes the standard SDF padding around
+                    // it, so shift the screen quad by that buffer to keep
+                    // the ink aligned with the layout metrics.
+                    let x = pen_x + (glyph.left - GLYPH_BUFFER as i32) as f32 * scale;
+                    let y = baseline_y - (glyph.top + GLYPH_BUFFER as i32) as f32 * scale;
+                    let w = (glyph.width + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let h = (glyph.height + 2 * GLYPH_BUFFER) as f32 * scale;
+                    let glyph_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                    bounds = Some(match bounds {
+                        Some(existing) => existing.union(glyph_rect),
+                        None => glyph_rect,
+                    });
+                    label_glyphs.push(LabelGlyphInstance {
+                        rect: [x, y, w, h],
+                        anchor: [label.pos.x, label.pos.y],
+                        angle: label.angle,
+                        fontstack: fontstack.clone(),
+                        codepoint,
+                        color: label.color,
+                        halo_color: label.halo_color,
+                    });
+                    glyph_bitmaps
+                        .entry((fontstack.clone(), range_start))
+                        .or_insert_with(|| Arc::clone(range));
+                    pen_x += glyph.advance as f32 * scale;
+                }
             }
 
             let Some(label_rect) = bounds.map(|rect| rect.expand2(egui::vec2(2.0, 2.0))) else {
@@ -765,6 +837,42 @@ impl RgisApp {
         }
 
         (glyphs, glyph_bitmaps, pending_glyphs)
+    }
+}
+
+/// Total length of a polyline, or `None` for degenerate (single-point/
+/// zero-length) paths that can't host line-following text.
+fn path_length(path: &[egui::Pos2]) -> Option<f32> {
+    let len: f32 = path.windows(2).map(|pair| pair[0].distance(pair[1])).sum();
+    (len > f32::EPSILON).then_some(len)
+}
+
+/// Walks `path` by cumulative arc length and returns `(point, tangent
+/// angle)` at `target_len` (clamped to the path's endpoints), used to
+/// thread road-name glyphs along the actual line geometry.
+fn point_and_angle_at(path: &[egui::Pos2], target_len: f32) -> (egui::Pos2, f32) {
+    let mut walked = 0.0f32;
+    for pair in path.windows(2) {
+        let (p0, p1) = (pair[0], pair[1]);
+        let seg_len = p0.distance(p1);
+        if walked + seg_len >= target_len || seg_len <= f32::EPSILON {
+            let t = if seg_len > f32::EPSILON {
+                ((target_len - walked) / seg_len).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let point = p0 + (p1 - p0) * t;
+            let angle = (p1.y - p0.y).atan2(p1.x - p0.x);
+            return (point, angle);
+        }
+        walked += seg_len;
+    }
+    let n = path.len();
+    if n >= 2 {
+        let (p0, p1) = (path[n - 2], path[n - 1]);
+        (*path.last().unwrap(), (p1.y - p0.y).atan2(p1.x - p0.x))
+    } else {
+        (*path.last().unwrap(), 0.0)
     }
 }
 
