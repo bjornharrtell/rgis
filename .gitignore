@@ -1,2 +1,4 @@
 /target
 /crates/rgis-web/dist
+/crates/rgis-render/target
+node_modules/

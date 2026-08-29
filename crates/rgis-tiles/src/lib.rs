@@ -17,6 +17,9 @@ pub use glyphs::{
     glyph_range_start,
 };
 
+mod sprite;
+pub use sprite::{SpriteAtlas, SpriteAtlasReady, SpriteFetcher, SpriteRect};
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,6 +74,47 @@ impl TileSource for OsmTileSource {
     }
     fn max_zoom(&self) -> u8 {
         19
+    }
+}
+
+/// A `TileSource` backed by a `"type": "raster"` style source's own
+/// `{z}/{x}/{y}` tile URL template (e.g. `natural_earth` in OpenFreeMap's
+/// liberty style), letting a style-spec `raster` layer reuse the existing
+/// [`TileFetcher`]/disk-cache pipeline unchanged.
+pub struct StyleRasterSource {
+    template: String,
+    max_zoom: u8,
+    tile_size: u32,
+}
+
+impl StyleRasterSource {
+    /// `max_zoom` should come from the raster source's own `maxzoom` (tiles
+    /// aren't published beyond it; overzooming reuses the last level, same
+    /// as [`visible_tiles_for_zoom`]'s clamping).
+    pub fn new(template: String, max_zoom: u8, tile_size: u32) -> Self {
+        Self {
+            template,
+            max_zoom,
+            tile_size,
+        }
+    }
+}
+
+impl TileSource for StyleRasterSource {
+    fn url(&self, c: TileCoord) -> String {
+        self.template
+            .replace("{z}", &c.z.to_string())
+            .replace("{x}", &c.x.to_string())
+            .replace("{y}", &c.y.to_string())
+    }
+    fn attribution(&self) -> &str {
+        ""
+    }
+    fn max_zoom(&self) -> u8 {
+        self.max_zoom
+    }
+    fn tile_size_px(&self) -> u32 {
+        self.tile_size
     }
 }
 
@@ -182,6 +226,10 @@ impl TileFetcher {
 
     pub fn attribution(&self) -> &str {
         self.source.attribution()
+    }
+
+    pub fn max_zoom(&self) -> u8 {
+        self.source.max_zoom()
     }
 
     /// Request a tile. Delivery is asynchronous: the result (if any) shows up

@@ -1,0 +1,14 @@
+{
+  "name": "rgis-parity-goldens",
+  "private": true,
+  "version": "1.0.0",
+  "description": "One-off generator for maplibre-gl-js golden screenshots used by rgis's visual-parity Rust test (crates/rgis-render/tests/parity.rs). Not run in CI -- see README.md.",
+  "type": "module",
+  "scripts": {
+    "generate": "node generate-goldens.mjs"
+  },
+  "devDependencies": {
+    "maplibre-gl": "^4.7.1",
+    "playwright": "^1.48.0"
+  }
+}

@@ -51,6 +51,16 @@ impl VectorFeature {
     }
 }
 
+impl rgis_style::FeatureProperties for VectorFeature {
+    fn get_property(&self, key: &str) -> Option<rgis_style::Value> {
+        match self.properties.get(key)? {
+            PropertyValue::String(s) => Some(rgis_style::Value::String(s.clone())),
+            PropertyValue::Number(n) => Some(rgis_style::Value::Number(*n)),
+            PropertyValue::Bool(b) => Some(rgis_style::Value::Bool(*b)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorTileLayer {
     pub name: String,

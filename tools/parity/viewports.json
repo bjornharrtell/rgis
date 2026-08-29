@@ -1,0 +1,29 @@
+[
+  {
+    "name": "city",
+    "description": "Dense urban core (Zurich) at a high zoom: exercises buildings (fill-extrusion), dense road network (line), and land-use fills.",
+    "lon": 8.5417,
+    "lat": 47.3769,
+    "zoom": 15,
+    "width": 768,
+    "height": 512
+  },
+  {
+    "name": "region",
+    "description": "Country/region-level overview (Central Europe) at a low zoom: exercises country/state fills, coastlines, and sparse major roads.",
+    "lon": 10.0,
+    "lat": 50.0,
+    "zoom": 6,
+    "width": 768,
+    "height": 512
+  },
+  {
+    "name": "rural",
+    "description": "Low-density rural area (Swiss countryside) at a middling zoom: exercises terrain-ish land-cover fills, forest, and minor roads with few buildings.",
+    "lon": 8.2,
+    "lat": 46.8,
+    "zoom": 12,
+    "width": 768,
+    "height": 512
+  }
+]
