@@ -5,6 +5,7 @@ members = [
     "crates/rgis-core",
     "crates/rgis-io",
     "crates/rgis-render",
+    "crates/rgis-style",
     "crates/rgis-tiles",
     "crates/rgis-web",
 ]
@@ -16,6 +17,7 @@ default-members = [
     "crates/rgis-core",
     "crates/rgis-io",
     "crates/rgis-render",
+    "crates/rgis-style",
     "crates/rgis-tiles",
 ]
 

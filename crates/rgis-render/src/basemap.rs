@@ -1,37 +1,22 @@
-//! Tessellates decoded OpenFreeMap vector tiles (OpenMapTiles schema) into
-//! the same `Vertex`/`SceneMesh` used for regular layers, via a small static
-//! per-layer style table rather than a full MapLibre style-spec interpreter.
+//! Tessellates decoded vector tiles into the same `Vertex`/`SceneMesh` used
+//! for regular layers, driven by a runtime-parsed MapLibre/Mapbox style
+//! document (see `rgis_style`) rather than a hardcoded per-layer style
+//! table -- so any style-spec-compliant style JSON can be rendered, and
+//! switched live by swapping the `StyleSheet` passed to [`build_tile_mesh`].
 //!
-//! Colors and widths are ported from OpenFreeMap's own "liberty" MapLibre
-//! style (<https://tiles.openfreemap.org/styles/liberty>) so the basemap
-//! looks close to the reference MapLibre rendering.
+//! Defaults to OpenFreeMap's own "liberty" MapLibre style
+//! (<https://tiles.openfreemap.org/styles/liberty>), matching the
+//! OpenMapTiles-schema vector tiles this app fetches, but nothing here is
+//! specific to that style beyond that default.
 
 use bytemuck::{Pod, Zeroable};
 use earcut::Earcut;
 use geo_types::{Geometry, LineString, Polygon};
 use rgis_core::{EARTH_HALF_CIRC, Viewport};
+use rgis_style::{Color, EvalContext, Layer, StyleSheet};
 use rgis_tiles::{TileCoord, VectorFeature, VectorTile};
 
 use crate::mesh::{SceneMesh, Vertex};
-
-/// `liberty` style's `background` layer color.
-const BACKGROUND: [f32; 4] = [0.973, 0.957, 0.941, 1.0];
-
-/// Bottom-to-top paint order, mirroring OpenMapTiles-based basemaps
-/// (positron/liberty/bright). Layers not listed here (e.g. road-label line
-/// placement, house numbers) are skipped because this renderer currently
-/// only extracts point labels (`place`/`poi`) plus vector geometry.
-const LAYER_ORDER: &[&str] = &[
-    "landcover",
-    "landuse",
-    "park",
-    "water",
-    "waterway",
-    "aeroway",
-    "building",
-    "transportation",
-    "boundary",
-];
 
 /// A basemap tile's tessellated geometry, split into fills (polygons —
 /// scale naturally with zoom, like MapLibre fill layers) and lines (roads,
@@ -95,6 +80,14 @@ pub struct TileLabel {
     /// straight quad. `None` for point labels (place/poi), which are laid
     /// out as a single horizontal run instead.
     pub path: Option<Vec<[f32; 2]>>,
+    /// Evaluated `icon-image` sprite name (e.g. `"circle_11_black"`),
+    /// looked up in the fetched sprite atlas by the caller; `None`/empty
+    /// means no icon for this feature. Point labels only -- MapLibre only
+    /// places icons for point symbols, not line-placed ones.
+    pub icon: Option<String>,
+    /// Evaluated `icon-size` multiplier applied to the sprite's native
+    /// pixel dimensions (`1.0` if the style doesn't specify one).
+    pub icon_size: f32,
 }
 
 /// A line/stroke vertex: `center` is the tile-local-metres position
@@ -213,182 +206,79 @@ impl TileMeshWire {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Paint {
-    fill: Option<[f32; 4]>,
-    /// Thin stroke around a filled polygon's own outline (buildings, parks).
-    fill_outline: Option<[f32; 4]>,
-    /// Wider stroke drawn under `stroke`, giving roads a two-tone casing.
-    casing: Option<([f32; 4], f32)>,
-    stroke: Option<([f32; 4], f32)>,
-    /// Paint order within a layer: higher draws on top (e.g. motorways over
-    /// residential streets at intersections).
-    rank: u8,
+/// Line-width scale factor for continuous (device-pixel-stable) zoom
+/// behaviour: baked line half-widths are evaluated once at the *tile's
+/// own* zoom (`coord.z`, the zoom a style's `line-width` expression is
+/// designed to produce a "correct" screen-pixel width for), then this
+/// factor rescales them for the *current* viewport zoom every frame
+/// (see [`TileTransform::width_scale`]) so overzoomed tiles keep growing
+/// continuously instead of snapping when a new, more-detailed tile loads.
+/// `delta` is `viewport.zoom - tile.z`.
+fn zoom_scale(delta: f64) -> f32 {
+    (1.0 + delta * 0.15).max(0.0) as f32
 }
 
-/// Line-width scale factor relative to zoom 10 (where `base_width` values in
-/// `style_for` are calibrated). Previously clamped to 1.0 below zoom 10, so
-/// e.g. a motorway that just became visible around z5-7 was already drawn
-/// at its full "high zoom" width — MapLibre's own line-width stops instead
-/// keep shrinking below zoom 10 too (fading toward 0 as a road approaches
-/// its own appear-zoom), so this now keeps scaling down continuously,
-/// floored at 0 (fully invisible) rather than pinned at 1.0.
-fn zoom_scale(zoom: f64) -> f32 {
-    (1.0 + (zoom - 10.0) * 0.15).max(0.0) as f32
+/// Evaluates `layer`'s fill paint properties for `feature` at `zoom`:
+/// `fill-color`/`fill-opacity` for `fill` layers, or
+/// `fill-extrusion-color`/`fill-extrusion-opacity` for `fill-extrusion`
+/// layers -- rendered identically (flat, top-down) since this app has no
+/// camera pitch/tilt, matching how MapLibre itself renders an extrusion at
+/// pitch 0 (no visible side walls, just the flat top polygon).
+fn eval_fill_paint(layer: &Layer, ctx: &EvalContext) -> [f32; 4] {
+    let (color_key, opacity_key) = if layer.kind == "fill-extrusion" {
+        ("fill-extrusion-color", "fill-extrusion-opacity")
+    } else {
+        ("fill-color", "fill-opacity")
+    };
+    let mut color = layer
+        .paint(color_key)
+        .eval_color(ctx, Color([0.0, 0.0, 0.0, 1.0]));
+    let opacity = layer.paint(opacity_key).eval_f64(ctx, 1.0) as f32;
+    color.0[3] *= opacity;
+    color.to_array()
 }
 
-fn style_for(layer_name: &str, feature: &VectorFeature, zoom: f64) -> Option<Paint> {
-    match layer_name {
-        "landcover" => {
-            let fill = match feature.get_str("class").unwrap_or("") {
-                "wood" => [0.675, 0.891, 0.549, 0.28],
-                "grass" => [0.690, 0.835, 0.604, 0.30],
-                "ice" | "glacier" => [0.878, 0.925, 0.925, 0.80],
-                "sand" => [0.969, 0.937, 0.765, 1.00],
-                _ => return None,
-            };
-            Some(Paint {
-                fill: Some(fill),
-                ..Default::default()
-            })
-        }
-        "landuse" => {
-            let fill = match feature.get_str("class").unwrap_or("") {
-                "residential" => [0.950, 0.890, 0.810, 0.50],
-                "commercial" => [0.94, 0.87, 0.87, 0.60],
-                "industrial" => [0.90, 0.87, 0.90, 0.50],
-                "cemetery" => [0.845, 0.880, 0.740, 1.00],
-                "hospital" => [1.00, 0.867, 0.933, 1.00],
-                "school" => [0.925, 0.933, 0.800, 1.00],
-                "pitch" | "track" => [0.871, 0.890, 0.804, 1.00],
-                _ => return None,
-            };
-            Some(Paint {
-                fill: Some(fill),
-                ..Default::default()
-            })
-        }
-        "park" => Some(Paint {
-            fill: Some([0.847, 0.910, 0.784, 0.70]),
-            ..Default::default()
-        }),
-        "water" => Some(Paint {
-            fill: Some([0.620, 0.741, 1.000, 1.00]),
-            ..Default::default()
-        }),
-        "waterway" => Some(Paint {
-            stroke: Some(([0.627, 0.784, 0.941, 1.00], 1.0)),
-            ..Default::default()
-        }),
-        "building" => {
-            if zoom < 13.0 {
-                return None;
-            }
-            Some(Paint {
-                fill: Some([0.862, 0.852, 0.838, 1.00]),
-                fill_outline: Some([0.803, 0.792, 0.777, 0.60]),
-                ..Default::default()
-            })
-        }
-        "aeroway" => {
-            if zoom < 11.0 {
-                return None;
-            }
-            match &feature.geometry {
-                Geometry::Polygon(_) | Geometry::MultiPolygon(_) => Some(Paint {
-                    fill: Some([0.898, 0.894, 0.878, 0.70]),
-                    ..Default::default()
-                }),
-                Geometry::LineString(_) | Geometry::MultiLineString(_) => {
-                    let width = match feature.get_str("class").unwrap_or("") {
-                        "runway" => 3.0,
-                        "taxiway" => 1.2,
-                        _ => return None,
-                    };
-                    Some(Paint {
-                        stroke: Some(([0.941, 0.929, 0.914, 1.00], width)),
-                        ..Default::default()
-                    })
-                }
-                _ => None,
-            }
-        }
-        "boundary" => {
-            let admin_level = feature.get_number("admin_level").unwrap_or(10.0) as i64;
-            if admin_level <= 2 {
-                Some(Paint {
-                    stroke: Some(([0.40, 0.40, 0.42, 0.90], 1.4)),
-                    rank: 1,
-                    ..Default::default()
-                })
-            } else if admin_level <= 6 {
-                if zoom < 5.0 {
-                    return None;
-                }
-                Some(Paint {
-                    stroke: Some(([0.70, 0.70, 0.70, 0.80], 0.8)),
-                    ..Default::default()
-                })
-            } else {
-                None
-            }
-        }
-        "transportation" => {
-            if !matches!(
-                &feature.geometry,
-                Geometry::LineString(_) | Geometry::MultiLineString(_)
-            ) {
-                // `road_area_pattern` (pedestrian plazas, etc): needs a
-                // fill-pattern texture we don't support; skip.
-                return None;
-            }
-            let casing_major = [0.914, 0.675, 0.467, 1.00];
-            let casing_minor = [0.812, 0.804, 0.792, 1.00];
-            // In MapLibre's own "liberty" style, a road class's casing/fill
-            // pair don't fade in together: the casing line-width ramps up
-            // from ~1-2 zoom levels *before* the fill line-width does (e.g.
-            // `road_minor_casing` fades in from z12, but `road_minor` stays
-            // width-0 until z13.5). So a road first appears as a single
-            // plain-colored line, only gaining the two-tone "outline" look
-            // once you zoom in further. `casing_min_zoom` approximates that
-            // per-class delay.
-            let (casing, fill, base_width, rank, casing_min_zoom) =
-                match feature.get_str("class").unwrap_or("") {
-                    "motorway" => (Some(casing_major), [1.000, 0.800, 0.533, 1.00], 2.2, 6, 7.0),
-                    "trunk" => (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.9, 5, 7.0),
-                    "primary" => (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.8, 4, 7.0),
-                    "secondary" | "tertiary" => {
-                        (Some(casing_major), [1.000, 0.933, 0.667, 1.00], 1.4, 3, 9.0)
-                    }
-                    "minor" => (Some(casing_minor), [1.0, 1.0, 1.0, 1.0], 1.0, 2, 14.0),
-                    "service" | "track" => (Some(casing_minor), [1.0, 1.0, 1.0, 1.0], 0.6, 1, 16.0),
-                    "path" | "pedestrian" => (None, [0.85, 0.85, 0.85, 1.0], 0.5, 0, 0.0),
-                    "rail" | "transit" => (None, [0.733, 0.733, 0.733, 1.0], 0.8, 0, 0.0),
-                    _ => return None,
-                };
-            let casing = if zoom >= casing_min_zoom {
-                casing
-            } else {
-                None
-            };
-            Some(Paint {
-                casing: casing.map(|c| (c, base_width + 0.8)),
-                stroke: Some((fill, base_width)),
-                rank,
-                ..Default::default()
-            })
-        }
-        _ => None,
-    }
+/// Evaluates `layer`'s `fill-outline-color`, defaulting (per the style
+/// spec) to the layer's own `fill-color` when unset -- this default is also
+/// what gives every fill its analytic-antialiased boundary edge (see
+/// `append_outline`'s doc comment). Unlike real MapLibre this ignores an
+/// explicit `fill-antialias: false`: this renderer's line-based edge
+/// antialiasing is a different technique from MapLibre's coverage-based
+/// one, and turning it off here would only make edges jaggier without
+/// reproducing MapLibre's actual look.
+fn eval_fill_outline_paint(layer: &Layer, ctx: &EvalContext, fill_color: [f32; 4]) -> [f32; 4] {
+    layer
+        .paint("fill-outline-color")
+        .eval(ctx)
+        .and_then(|v| v.as_color())
+        .map(Color::to_array)
+        .unwrap_or(fill_color)
 }
 
+/// Evaluates `layer`'s `line-color`/`line-opacity`/`line-width` paint
+/// properties for `feature` at `zoom`, returning `(color, width_px)`.
+fn eval_line_paint(layer: &Layer, ctx: &EvalContext) -> ([f32; 4], f32) {
+    let mut color = layer
+        .paint("line-color")
+        .eval_color(ctx, Color([0.0, 0.0, 0.0, 1.0]));
+    let opacity = layer.paint("line-opacity").eval_f64(ctx, 1.0) as f32;
+    color.0[3] *= opacity;
+    let width = layer.paint("line-width").eval_f64(ctx, 1.0) as f32;
+    (color.to_array(), width)
+}
 /// Tessellates a single decoded vector tile into fill + line meshes whose
 /// vertex positions are in mercator METRES relative to the tile's own
 /// top-left corner, NOT screen space — this makes the result independent
 /// of the viewport, so callers can tessellate a tile once and cache it
 /// indefinitely (see [`tile_screen_transform`] for the cheap per-frame
 /// screen transform applied on the GPU).
-pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
+///
+/// Iterates `style`'s layers in their own bottom-to-top order (skipping
+/// `background`/`raster`, handled separately -- see [`build_background_mesh`]
+/// -- and `symbol`, handled by [`extract_labels`]), so draw/blend order
+/// across the whole tile always matches the style document's own layer
+/// order, exactly like MapLibre, rather than a fixed hardcoded pass order.
+pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) -> TileMesh {
     let mut fill_mesh = SceneMesh::default();
     let mut earcut: Earcut<f32> = Earcut::new();
     let mut earcut_buf: Vec<u32> = Vec::new();
@@ -396,63 +286,66 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
     let zoom = coord.z as f64;
     let tile_size_m = TileMercatorBounds::for_coord(coord).size;
 
-    for layer_name in LAYER_ORDER {
-        let Some(layer) = tile.layers.iter().find(|l| &l.name == layer_name) else {
+    for layer in &style.layers {
+        if !matches!(layer.kind.as_str(), "fill" | "fill-extrusion" | "line") {
+            continue;
+        }
+        if !layer.matches_zoom(zoom) {
+            continue;
+        }
+        // `fill-pattern` (a tiled sprite texture instead of a solid color)
+        // isn't implemented -- these layers have no `fill-color` to fall
+        // back to, so without this check `eval_fill_paint`'s color-eval
+        // failure would silently default to opaque black, painting solid
+        // black blobs over e.g. pedestrian plazas/bridge decks. Skipping
+        // the layer entirely (closest to "just don't draw the pattern")
+        // is a much closer visual approximation than that.
+        if layer.paint("fill-pattern").0.is_some() {
+            continue;
+        }
+        let Some(source_layer_name) = layer.source_layer.as_deref() else {
+            continue;
+        };
+        let Some(tile_layer) = tile.layers.iter().find(|l| l.name == source_layer_name) else {
             continue;
         };
         let ctx = TileContext {
-            extent: layer.extent,
+            extent: tile_layer.extent,
             tile_size_m,
         };
-        let mut styled: Vec<(&VectorFeature, Paint)> = Vec::new();
-        for feature in &layer.features {
-            if let Some(mut paint) = style_for(layer_name, feature, zoom) {
-                // Every fill gets a thin same-color edge by default (unless
-                // a layer already styled its own, e.g. buildings) so its
-                // tessellated boundary gets the same analytic antialiasing
-                // as stroked lines (see `LineVertex`), instead of a raw
-                // jaggy triangle edge -- mirrors MapLibre's default
-                // `fill-antialias` behavior.
-                if paint.fill.is_some() && paint.fill_outline.is_none() {
-                    paint.fill_outline = paint.fill;
-                }
-                styled.push((feature, paint));
-            }
-        }
-        // Draw more important features (e.g. motorways) last within each
-        // pass, so they render on top of less important ones at junctions.
-        styled.sort_by_key(|(_, paint)| paint.rank);
 
-        for (feature, paint) in &styled {
-            if let Some(color) = paint.fill {
-                append_fill(
-                    &mut fill_mesh,
-                    &mut earcut,
-                    &mut earcut_buf,
-                    feature,
-                    &ctx,
-                    color,
-                );
+        for feature in &tile_layer.features {
+            if !layer.matches_feature(feature, zoom) {
+                continue;
             }
-        }
-        for (feature, paint) in &styled {
-            if let Some(color) = paint.fill_outline {
-                append_outline(&mut lines, feature, &ctx, color, 1.0);
-            }
-        }
-        for (feature, paint) in &styled {
-            if let Some((color, width)) = paint.casing {
+            let eval_ctx = EvalContext::with_feature(zoom, feature);
+
+            if layer.kind == "line" {
+                let (color, width) = eval_line_paint(layer, &eval_ctx);
                 append_line(&mut lines, feature, &ctx, color, width);
+                continue;
             }
-        }
-        for (feature, paint) in &styled {
-            if let Some((color, width)) = paint.stroke {
-                append_line(&mut lines, feature, &ctx, color, width);
-            }
+
+            // "fill" or "fill-extrusion".
+            let fill_color = eval_fill_paint(layer, &eval_ctx);
+            append_fill(
+                &mut fill_mesh,
+                &mut earcut,
+                &mut earcut_buf,
+                feature,
+                &ctx,
+                fill_color,
+            );
+            // Every fill gets a same-color (by default) edge so its
+            // tessellated boundary gets the same analytic antialiasing as
+            // stroked lines (see `LineVertex`), instead of a raw jaggy
+            // triangle edge -- see `eval_fill_outline_paint`.
+            let outline_color = eval_fill_outline_paint(layer, &eval_ctx, fill_color);
+            append_outline(&mut lines, feature, &ctx, outline_color, 1.0);
         }
     }
 
-    let labels = extract_labels(tile, coord, tile_size_m, &mut lines);
+    let labels = extract_labels(tile, coord, tile_size_m, style);
 
     TileMesh {
         fill: fill_mesh,
@@ -461,204 +354,135 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord) -> TileMesh {
     }
 }
 
-/// OpenMapTiles `place` layer classes we label, from most to least
-/// prominent, mirroring roughly how MapLibre's "liberty" style ranks them
-/// (used both for the minimum zoom a class appears at and as a tie-break
-/// alongside the feature's own `rank` property for decluttering priority).
-fn place_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
-    let class = feature.get_str("class").unwrap_or("");
-    let rank = feature.get_number("rank").unwrap_or(20.0) as i32;
-    let (min_zoom, font_size, class_priority) = match class {
-        "country" => (0.0, 15.0, 0),
-        "state" => (4.0, 12.0, 1),
-        "city" => (3.0, 14.0, 1),
-        "town" => (6.0, 12.0, 2),
-        "village" => (9.0, 11.0, 3),
-        "hamlet" | "suburb" | "neighbourhood" => (11.0, 10.0, 4),
-        _ => (12.0, 10.0, 5),
-    };
-    if zoom < min_zoom {
-        return None;
-    }
-    Some((font_size, class_priority * 1000 + rank))
-}
-
-/// OpenMapTiles `poi` layer: gated by both zoom and the feature's own
-/// `rank` (lower = more important), mirroring the "liberty" style's
-/// `poi_r1`/`poi_r7`/`poi_r20` layers (rank 1-6 from z15, 7-19 from z16,
-/// 20+ only from z17) rather than showing every POI regardless of rank
-/// once some single zoom threshold is reached -- without this tiering,
-/// far more POIs show up per zoom level than the reference style/MapLibre
-/// client renders, which is why labels looked over-dense.
-fn poi_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
-    let rank = feature.get_number("rank").unwrap_or(30.0) as i32;
-    let min_zoom = if rank >= 20 {
-        17.0
-    } else if rank >= 7 {
-        16.0
-    } else {
-        15.0
-    };
-    if zoom < min_zoom {
-        return None;
-    }
-    Some((10.0, 10_000 + rank))
-}
-
-/// A per-feature label styling function: returns `(font size, decluttering
-/// priority)`, or `None` to skip the feature.
-type LabelStyleFn = fn(&VectorFeature, f64) -> Option<(f32, i32)>;
-
-/// Constant on-screen radius (device pixels) of the small dot marker drawn
-/// under `place`/`poi` point labels, mirroring the "liberty" style's
-/// `circle_11_black` sprite / POI icon dots (see `marker_style` below).
-const MARKER_RADIUS_PX: f32 = 2.5;
-const MARKER_FILL: [f32; 4] = [0.13, 0.13, 0.13, 1.0];
-const MARKER_HALO: [f32; 4] = [1.0, 1.0, 1.0, 0.9];
-
-/// Whether a `place`/`poi` feature should get a small dot marker alongside
-/// its label, mirroring the reference style's `icon-image` rules: `place`
-/// features only show a generic dot for `village`/`town`/`city` classes and
-/// only below zoom 10 (the style swaps to `''`, i.e. no icon, at z>=10);
-/// `poi` features always show an icon (we approximate every POI class/
-/// subclass sprite with a plain dot, since this renderer has no icon-sprite
-/// atlas yet).
-fn marker_style(layer_name: &str, feature: &VectorFeature, zoom: f64) -> bool {
-    match layer_name {
-        "place" => {
-            let class = feature.get_str("class").unwrap_or("");
-            matches!(class, "village" | "town" | "city") && zoom < 10.0
-        }
-        "poi" => true,
-        _ => false,
-    }
-}
-
-/// Extracts point labels (named `place`/`poi` features) from a decoded
-/// tile, in the same tile-local-metres space `build_tile_mesh` uses for its
-/// fill/line vertices, appending a small dot marker per labeled point into
-/// `lines` (see `marker_style`).
+/// Extracts every labeled feature (`symbol` layers with a `text-field`)
+/// from a decoded tile, in the same tile-local-metres space
+/// `build_tile_mesh` uses for its fill/line vertices, evaluating
+/// `text-field`/`text-size`/`text-color`/`text-halo-color`/
+/// `symbol-placement`/`icon-image`/`icon-size` from `style` -- driven
+/// entirely by the style document instead of a hardcoded per-source-layer
+/// table. `icon-image` is resolved to a sprite name here; the caller looks
+/// it up in the fetched sprite atlas and shapes the actual textured quad
+/// (see `RgisApp::collect_label_draws`), since sprite fetching/atlas
+/// storage lives above this crate. Symbol layers with an `icon-image` but
+/// no `text-field` (road shields, one-way arrows) are still skipped, since
+/// this function only walks features that have label text.
 fn extract_labels(
     tile: &VectorTile,
     coord: TileCoord,
     tile_size_m: f64,
-    lines: &mut LineMesh,
+    style: &StyleSheet,
 ) -> Vec<TileLabel> {
     let zoom = coord.z as f64;
-    // (layer name, halo color, per-feature style fn).
-    let sources: [(&str, [f32; 4], LabelStyleFn); 2] = [
-        ("place", [1.0, 1.0, 1.0, 0.9], place_label_style),
-        ("poi", [1.0, 1.0, 1.0, 0.85], poi_label_style),
-    ];
-
     let mut labels = Vec::new();
-    for (layer_name, halo_color, style_fn) in sources {
-        let Some(layer) = tile.layers.iter().find(|l| l.name == layer_name) else {
+
+    for layer in &style.layers {
+        if layer.kind != "symbol" || !layer.matches_zoom(zoom) {
+            continue;
+        }
+        let Some(source_layer_name) = layer.source_layer.as_deref() else {
+            continue;
+        };
+        let Some(tile_layer) = tile.layers.iter().find(|l| l.name == source_layer_name) else {
             continue;
         };
         let ctx = TileContext {
-            extent: layer.extent,
+            extent: tile_layer.extent,
             tile_size_m,
         };
-        for feature in &layer.features {
-            let Geometry::Point(p) = &feature.geometry else {
+
+        for feature in &tile_layer.features {
+            if !layer.matches_feature(feature, zoom) {
                 continue;
-            };
-            let Some(text) = feature.get_str("name").filter(|s| !s.is_empty()) else {
-                continue;
-            };
-            let Some((font_size, priority)) = style_fn(feature, zoom) else {
-                continue;
-            };
-            let pos = ctx.project_point(p.x(), p.y());
-            if marker_style(layer_name, feature, zoom) {
-                append_disc(lines, pos, MARKER_RADIUS_PX + 1.0, MARKER_HALO);
-                append_disc(lines, pos, MARKER_RADIUS_PX, MARKER_FILL);
             }
-            labels.push(TileLabel {
-                position: pos,
-                text: text.to_string(),
-                font_size,
-                color: [0.15, 0.15, 0.17, 1.0],
-                halo_color,
-                priority,
-                angle: 0.0,
-                path: None,
-            });
+            let eval_ctx = EvalContext::with_feature(zoom, feature);
+            let Some(text) = layer.layout("text-field").eval_string(&eval_ctx) else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let font_size = layer.layout("text-size").eval_f64(&eval_ctx, 16.0) as f32;
+            let color = layer
+                .paint("text-color")
+                .eval_color(&eval_ctx, Color([0.15, 0.15, 0.17, 1.0]))
+                .to_array();
+            let halo_color = layer
+                .paint("text-halo-color")
+                .eval_color(&eval_ctx, Color([1.0, 1.0, 1.0, 0.9]))
+                .to_array();
+
+            // No full mapbox symbol-sort-key/collision port here -- this
+            // approximates it generically (without hardcoding per-source-
+            // layer knowledge) from the label's own evaluated size, which
+            // correlates well with a style's intended visual hierarchy
+            // (country names render larger than POI labels, etc), tie-
+            // broken by the feature's own `rank` property when present
+            // (place/poi layers set this).
+            let rank = feature
+                .get_number("rank")
+                .unwrap_or(50.0)
+                .clamp(0.0, 9_999.0) as i32;
+            let size_rank = ((200.0 - font_size).max(0.0) * 10.0) as i32;
+            let priority = size_rank * 10_000 + rank;
+
+            let placement = layer.layout("symbol-placement").eval_string(&eval_ctx);
+            if placement.as_deref() == Some("line") {
+                let points = match &feature.geometry {
+                    Geometry::LineString(line) => line_points(line, &ctx),
+                    Geometry::MultiLineString(mlines) => mlines
+                        .0
+                        .iter()
+                        .max_by(|a, b| line_length(a, &ctx).total_cmp(&line_length(b, &ctx)))
+                        .map(|line| line_points(line, &ctx))
+                        .unwrap_or_default(),
+                    _ => continue,
+                };
+                if points.len() < 2 {
+                    continue;
+                }
+                // Anchor at the arc-length midpoint of the whole road,
+                // matching where MapLibre centers a line-placed label
+                // along its geometry.
+                let mid = point_at_arc_length(&points, line_length_points(&points) * 0.5);
+                labels.push(TileLabel {
+                    position: mid,
+                    text: text.to_string(),
+                    font_size,
+                    color,
+                    halo_color,
+                    priority,
+                    angle: 0.0,
+                    path: Some(points),
+                    icon: None,
+                    icon_size: 1.0,
+                });
+            } else {
+                let Geometry::Point(p) = &feature.geometry else {
+                    continue;
+                };
+                let pos = ctx.project_point(p.x(), p.y());
+                let icon_image = layer
+                    .layout("icon-image")
+                    .eval_string(&eval_ctx)
+                    .filter(|s| !s.is_empty());
+                let icon_size = layer.layout("icon-size").eval_f64(&eval_ctx, 1.0) as f32;
+                labels.push(TileLabel {
+                    position: pos,
+                    text: text.to_string(),
+                    font_size,
+                    color,
+                    halo_color,
+                    priority,
+                    angle: 0.0,
+                    path: None,
+                    icon: icon_image,
+                    icon_size,
+                });
+            }
         }
     }
-    labels.extend(extract_road_labels(tile, coord, tile_size_m));
     labels.sort_by_key(|l| l.priority);
-    labels
-}
-
-/// OpenMapTiles `transportation_name` layer: mirrors the "liberty" style's
-/// `highway-name-major`/`highway-name-minor`/`highway-name-path` layers
-/// (major roads visible from z12.2, minor/service/track from z15, paths
-/// from z15.5) rather than showing every road name regardless of class.
-fn road_label_style(feature: &VectorFeature, zoom: f64) -> Option<(f32, i32)> {
-    let class = feature.get_str("class").unwrap_or("");
-    let (min_zoom, font_size, class_priority) = match class {
-        "motorway" | "trunk" | "primary" | "secondary" | "tertiary" => (12.2, 11.0, 0),
-        "minor" | "service" | "track" => (15.0, 10.0, 1),
-        "path" => (15.5, 9.0, 2),
-        _ => (14.0, 10.0, 3),
-    };
-    if zoom < min_zoom {
-        return None;
-    }
-    Some((font_size, class_priority))
-}
-
-/// Extracts road-name labels (`transportation_name` layer) from a decoded
-/// tile, threading each label along its full road polyline (`path`) so the
-/// glyphs curve with the actual geometry, like MapLibre's
-/// `symbol-placement: line` road labels -- unlike `place`/`poi` labels
-/// (see `extract_labels`), these aren't drawn as a single flat quad.
-fn extract_road_labels(tile: &VectorTile, coord: TileCoord, tile_size_m: f64) -> Vec<TileLabel> {
-    let zoom = coord.z as f64;
-    let Some(layer) = tile.layers.iter().find(|l| l.name == "transportation_name") else {
-        return Vec::new();
-    };
-    let ctx = TileContext {
-        extent: layer.extent,
-        tile_size_m,
-    };
-    let mut labels = Vec::new();
-    for feature in &layer.features {
-        let Some(text) = feature.get_str("name").filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let Some((font_size, class_priority)) = road_label_style(feature, zoom) else {
-            continue;
-        };
-        let points = match &feature.geometry {
-            Geometry::LineString(line) => line_points(line, &ctx),
-            Geometry::MultiLineString(lines) => lines
-                .0
-                .iter()
-                .max_by(|a, b| line_length(a, &ctx).total_cmp(&line_length(b, &ctx)))
-                .map(|line| line_points(line, &ctx))
-                .unwrap_or_default(),
-            _ => continue,
-        };
-        if points.len() < 2 {
-            continue;
-        }
-        // Anchor at the arc-length midpoint of the whole road, matching
-        // where MapLibre centers a line-placed label along its geometry.
-        let mid = point_at_arc_length(&points, line_length_points(&points) * 0.5);
-        labels.push(TileLabel {
-            position: mid,
-            text: text.to_string(),
-            font_size,
-            color: [0.15, 0.15, 0.17, 1.0],
-            halo_color: [1.0, 1.0, 1.0, 0.9],
-            priority: 20_000 + class_priority,
-            angle: 0.0,
-            path: Some(points),
-        });
-    }
     labels
 }
 
@@ -727,33 +551,45 @@ pub fn tile_screen_transform(coord: TileCoord, viewport: &Viewport) -> TileTrans
     TileTransform {
         offset,
         scale,
-        width_scale: zoom_scale(viewport.zoom),
+        width_scale: zoom_scale(viewport.zoom - coord.z as f64),
         size: bounds.size as f32 * scale,
     }
 }
 
-/// A full-viewport quad in the `liberty` style's `background` color, drawn
-/// beneath the basemap tiles.
-pub fn build_background_mesh(viewport: &Viewport) -> SceneMesh {
+/// A full-viewport quad in `style`'s `background` layer color (falling
+/// back to opaque white if the style defines none), drawn beneath the
+/// basemap tiles. `background-color`/`background-opacity` may themselves
+/// be zoom-interpolated expressions (e.g. a raster-only style fading in a
+/// solid color at low zoom), so this re-evaluates them against the
+/// viewport's current zoom every call rather than caching a fixed color.
+pub fn build_background_mesh(viewport: &Viewport, style: &StyleSheet) -> SceneMesh {
+    let ctx = EvalContext::new(viewport.zoom);
+    let mut color = Color([1.0, 1.0, 1.0, 1.0]);
+    for layer in style.layers_of_kind("background") {
+        color = layer.paint("background-color").eval_color(&ctx, color);
+        let opacity = layer.paint("background-opacity").eval_f64(&ctx, 1.0) as f32;
+        color.0[3] *= opacity;
+    }
+    let color = color.to_array();
     let w = viewport.width_px as f32;
     let h = viewport.height_px as f32;
     SceneMesh {
         vertices: vec![
             Vertex {
                 position: [0.0, 0.0],
-                color: BACKGROUND,
+                color,
             },
             Vertex {
                 position: [w, 0.0],
-                color: BACKGROUND,
+                color,
             },
             Vertex {
                 position: [w, h],
-                color: BACKGROUND,
+                color,
             },
             Vertex {
                 position: [0.0, h],
-                color: BACKGROUND,
+                color,
             },
         ],
         indices: vec![0, 1, 2, 0, 2, 3],
@@ -1141,6 +977,19 @@ fn append_disc(buffers: &mut LineMesh, center: [f32; 2], radius: f32, color: [f3
 mod tests {
     use super::*;
 
+    /// The "liberty" style JSON used both here and by `rgis-style`'s own
+    /// tests (see `crates/rgis-style/fixtures/liberty.json`) -- a single
+    /// canonical copy, loaded across the crate boundary via a relative
+    /// path rather than duplicated.
+    fn liberty_style() -> StyleSheet {
+        let path = format!(
+            "{}/../rgis-style/fixtures/liberty.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let json = std::fs::read_to_string(&path).expect("failed to read liberty.json fixture");
+        StyleSheet::parse(&json).expect("liberty style should parse")
+    }
+
     /// `build_tile_mesh` should extract point labels from a dense real-world
     /// tile's `place`/`poi` layers, with the wire round-trip (used to ship
     /// results across the wasm worker boundary; see `TileMeshWire`)
@@ -1151,7 +1000,8 @@ mod tests {
         let bytes = std::fs::read(&full_path).expect("failed to read fixture");
         let tile = rgis_tiles::decode_vector_tile(&bytes).expect("decode fixture MVT");
         let coord = TileCoord { z: 14, x: 0, y: 0 };
-        let mesh = build_tile_mesh(&tile, coord);
+        let style = liberty_style();
+        let mesh = build_tile_mesh(&tile, coord, &style);
 
         assert!(
             !mesh.labels.is_empty(),
@@ -1223,19 +1073,28 @@ mod tests {
     #[test]
     fn tile_mesh_byte_budget() {
         // (name, raw .pbf byte size, max acceptable total mesh bytes).
-        // Budgets are generous headroom above current measured output,
-        // just tight enough to catch a regression back toward the
-        // multi-ten-MB-per-tile behaviour seen before the `with_joins`
-        // fix (auto-antialiasing outlines emitting full round-join discs
-        // on every polygon corner, e.g. every building).
+        // Budgets got a one-time bump when `build_tile_mesh` switched from
+        // a hardcoded ~9-entry per-layer style table to evaluating the
+        // full "liberty" style document (over 100 layers: every road/
+        // admin-boundary subclass and bridge/tunnel variant, not just the
+        // dozen or so classes the old table covered) -- more legitimate
+        // style layers now match real tile features, so more geometry is
+        // correctly emitted (this is the point: closer parity with what
+        // MapLibre itself draws), not a regression. Still generous
+        // headroom above current measured output, tight enough to catch a
+        // regression back toward the multi-ten-MB-per-tile behaviour seen
+        // before the `with_joins` fix (auto-antialiasing outlines emitting
+        // full round-join discs on every polygon corner, e.g. every
+        // building).
         const FIXTURES: &[(&str, &str, usize)] = &[
-            ("paris_12", "fixtures/paris_12.pbf", 5_000_000),
-            ("paris_14", "fixtures/paris_14.pbf", 15_000_000),
-            ("london_14", "fixtures/london_14.pbf", 9_000_000),
-            ("nyc_14", "fixtures/nyc_14.pbf", 9_000_000),
-            ("tokyo_14", "fixtures/tokyo_14.pbf", 16_000_000),
+            ("paris_12", "fixtures/paris_12.pbf", 20_000_000),
+            ("paris_14", "fixtures/paris_14.pbf", 30_000_000),
+            ("london_14", "fixtures/london_14.pbf", 25_000_000),
+            ("nyc_14", "fixtures/nyc_14.pbf", 25_000_000),
+            ("tokyo_14", "fixtures/tokyo_14.pbf", 30_000_000),
         ];
 
+        let style = liberty_style();
         let mut total_bytes = 0usize;
         for (name, path, budget) in FIXTURES {
             let full_path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path);
@@ -1243,7 +1102,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("failed to read fixture {full_path}: {e}"));
             let tile = rgis_tiles::decode_vector_tile(&bytes).expect("decode fixture MVT");
             let coord = TileCoord { z: 14, x: 0, y: 0 };
-            let mesh = build_tile_mesh(&tile, coord);
+            let mesh = build_tile_mesh(&tile, coord, &style);
 
             let (fv, fi, lv, li) = mesh.counts();
             let mesh_bytes = fv * std::mem::size_of::<Vertex>()

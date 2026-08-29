@@ -7,7 +7,7 @@
 //! the message protocol implemented here.
 
 use js_sys::{Array, Float32Array, Uint8Array, Uint32Array};
-use rgis_render::{TileMeshWire, build_tile_mesh};
+use rgis_render::{StyleSheet, TileMeshWire, build_tile_mesh};
 use rgis_tiles::{TileCoord, decode_vector_tile};
 use wasm_bindgen::{JsCast, JsValue, prelude::Closure};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
@@ -31,6 +31,7 @@ fn main() {
         let x = data.get(1).as_f64().expect("x to be a number") as u32;
         let y = data.get(2).as_f64().expect("y to be a number") as u32;
         let bytes = Uint8Array::from(data.get(3)).to_vec();
+        let style_json = data.get(4).as_string().expect("style_json to be a string");
         let coord = TileCoord { z, x, y };
 
         let reply = Array::new();
@@ -38,9 +39,25 @@ fn main() {
         reply.push(&(x as f64).into());
         reply.push(&(y as f64).into());
 
+        // Each worker is a separate wasm instance with no memory shared
+        // with the main thread, so the style document is re-parsed here
+        // per job from the JSON string shipped alongside the tile bytes
+        // (see `tile_worker_pool`'s message protocol docs) rather than
+        // being cached across jobs -- simpler, and cheap relative to
+        // decoding+tessellating a tile.
+        let style = match StyleSheet::parse(&style_json) {
+            Ok(style) => style,
+            Err(_) => {
+                scope_clone
+                    .post_message(&reply.into())
+                    .expect("posting decode-failure result succeeds");
+                return;
+            }
+        };
+
         match decode_vector_tile(&bytes) {
             Ok(tile) => {
-                let wire = TileMeshWire::from(&build_tile_mesh(&tile, coord));
+                let wire = TileMeshWire::from(&build_tile_mesh(&tile, coord, &style));
 
                 let fill_vertices = Float32Array::from(wire.fill_vertices.as_slice());
                 let fill_indices = Uint32Array::from(wire.fill_indices.as_slice());

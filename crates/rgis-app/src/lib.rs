@@ -13,8 +13,8 @@ use rgis_core::{Layer, LayerId, Project, mercator_to_lonlat};
 use rgis_io::{IoError, LoadedLayer};
 use rgis_render::{GlyphBitmapRanges, LabelGlyphInstance, SceneMesh, TileMesh};
 use rgis_tiles::{
-    GLYPH_BUFFER, GLYPH_PIXELS_PER_EM, GlyphFetcher, OPENFREEMAP_MAX_ZOOM, TileCoord,
-    VectorTileFetcher, glyph_range_start, visible_tiles_for_zoom,
+    GLYPH_BUFFER, GLYPH_PIXELS_PER_EM, GlyphFetcher, OPENFREEMAP_MAX_ZOOM, StyleRasterSource,
+    TileCoord, TileFetcher, VectorTileFetcher, glyph_range_start, visible_tiles_for_zoom,
 };
 
 mod status_bar;
@@ -77,6 +77,12 @@ pub const SAMPLE_GEOJSON: &[u8] = include_bytes!("../assets/sample.geojson");
 /// in this codebase (`rgis_tiles::TileCache`'s 256, `VectorTileFetcher`'s
 /// 128 decoded-tile cache).
 const TILE_MESH_CACHE_SIZE: usize = 256;
+/// Per raster style source (e.g. `natural_earth`) -- see `raster_tile_cache`.
+const RASTER_TILE_CACHE_SIZE: usize = 128;
+/// Fixed `TileDraw::key` shared by every icon quad, since they all sample
+/// the one fetched sprite atlas texture (as opposed to raster tiles, which
+/// each get their own key/texture) -- see `collect_label_draws`.
+const SPRITE_ATLAS_TILE_KEY: u64 = u64::MAX;
 
 /// Max newly-arrived tiles handed off to tessellation per `drain_ready_tiles`
 /// call (once per frame) -- see the comment on its call site for why this
@@ -99,10 +105,45 @@ const MOBILE_WIDTH_THRESHOLD: f32 = 600.0;
 /// display name for error messages.
 type LoadResults = Vec<(String, Result<LoadedLayer, IoError>)>;
 
+/// The default style, bundled into the binary (rather than fetched over the
+/// network at startup) so the basemap renders immediately -- see
+/// `RgisApp::set_style` for switching to a different style document live.
+const DEFAULT_STYLE_JSON: &str = include_str!("../../rgis-style/fixtures/liberty.json");
+
 pub struct RgisApp {
     project: Project,
     vector_tile_fetcher: Arc<VectorTileFetcher>,
     glyph_fetcher: Arc<GlyphFetcher>,
+    /// The currently active MapLibre/Mapbox style document, driving every
+    /// basemap tile's fill/line/label styling (see
+    /// `rgis_render::build_tile_mesh`) -- swappable at runtime via
+    /// [`RgisApp::set_style`], which also invalidates `tile_meshes` so
+    /// already-tessellated tiles get rebuilt under the new style.
+    style: Arc<rgis_render::StyleSheet>,
+    /// Raw JSON of `style`, kept alongside it only so the wasm worker pool
+    /// (a separate wasm instance per worker, with no shared memory) can
+    /// ship the current style to a worker as a plain string -- see
+    /// `tile_worker_pool`.
+    #[cfg(target_arch = "wasm32")]
+    style_json: Rc<str>,
+    /// One [`TileFetcher`] per `"type": "raster"` style source (e.g.
+    /// `natural_earth`), created from `style.sources` -- see
+    /// `raster_fetchers_for_style`. Rebuilt whenever the style changes
+    /// (`set_style`), since a different style may use different raster
+    /// sources entirely.
+    raster_fetchers: std::collections::HashMap<String, Arc<TileFetcher>>,
+    /// Decoded raster tile bitmaps, per source id, drained each frame from
+    /// each fetcher's `receiver` in `drain_ready_tiles` -- see
+    /// `raster_fetchers`.
+    raster_tile_cache:
+        std::collections::HashMap<String, LruCache<TileCoord, Arc<image::RgbaImage>>>,
+    /// Fetcher for the current style's sprite atlas (`style.sprite`), if
+    /// any; recreated by `set_style`. `None` once the style has no
+    /// `sprite` field, or before that fetch has resolved.
+    sprite_fetcher: Option<Arc<rgis_tiles::SpriteFetcher>>,
+    /// The decoded sprite atlas, once `sprite_fetcher`'s single fetch
+    /// resolves -- see `drain_ready_tiles`/`collect_label_draws`.
+    sprite_atlas: Option<Arc<rgis_tiles::SpriteAtlas>>,
     /// Tessellated mesh per tile, in tile-local metres (viewport-independent
     /// — see `rgis_render::build_tile_mesh`) — built once per tile and
     /// reused across every pan/zoom, unlike the final screen-space mesh
@@ -152,11 +193,22 @@ impl RgisApp {
             rgis_render::MapRenderResources::new(&render_state.device, render_state.target_format),
         );
         let gpu_backend_label = format!("{:?}", render_state.adapter.get_info().backend);
+        let style = rgis_render::StyleSheet::parse(DEFAULT_STYLE_JSON)
+            .expect("bundled default style JSON should parse");
+        let raster_fetchers = raster_fetchers_for_style(&style);
+        let sprite_fetcher = style.sprite.as_deref().map(rgis_tiles::SpriteFetcher::new);
 
         Self {
             project: Project::default(),
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
             glyph_fetcher: GlyphFetcher::new(),
+            style: Arc::new(style),
+            #[cfg(target_arch = "wasm32")]
+            style_json: Rc::from(DEFAULT_STYLE_JSON),
+            raster_fetchers,
+            raster_tile_cache: std::collections::HashMap::new(),
+            sprite_fetcher,
+            sprite_atlas: None,
             tile_meshes: LruCache::new(NonZeroUsize::new(TILE_MESH_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
@@ -170,6 +222,30 @@ impl RgisApp {
             mobile_layers_open: false,
             gpu_backend_label,
         }
+    }
+
+    /// Parses `style_json` as a MapLibre/Mapbox style document and switches
+    /// the basemap to it live: every currently cached tile mesh is dropped
+    /// (see `tile_meshes`) so visible tiles retessellate under the new
+    /// style on the next frame (re-decoding is *not* needed --
+    /// `vector_tile_fetcher`'s own decoded-tile cache is untouched), without
+    /// restarting the app. Returns an error (leaving the current style
+    /// active) if `style_json` doesn't parse.
+    pub fn set_style(&mut self, style_json: &str) -> Result<(), String> {
+        let parsed = rgis_render::StyleSheet::parse(style_json).map_err(|e| e.to_string())?;
+        self.raster_fetchers = raster_fetchers_for_style(&parsed);
+        self.raster_tile_cache.clear();
+        self.sprite_fetcher = parsed.sprite.as_deref().map(rgis_tiles::SpriteFetcher::new);
+        self.sprite_atlas = None;
+        self.style = Arc::new(parsed);
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.style_json = Rc::from(style_json);
+        }
+        self.tile_meshes.clear();
+        self.pending_tiles.clear();
+        self.pending_tile_meshes.clear();
+        Ok(())
     }
 
     /// Queue loading files already on disk (native only — used for files
@@ -290,6 +366,23 @@ impl RgisApp {
     }
 
     fn drain_ready_tiles(&mut self) {
+        for (source_id, fetcher) in &self.raster_fetchers {
+            let cache = self
+                .raster_tile_cache
+                .entry(source_id.clone())
+                .or_insert_with(|| {
+                    LruCache::new(NonZeroUsize::new(RASTER_TILE_CACHE_SIZE).unwrap())
+                });
+            while let Ok(ready) = fetcher.receiver.try_recv() {
+                cache.put(ready.coord, ready.image);
+            }
+        }
+        if let Some(fetcher) = &self.sprite_fetcher
+            && let Ok(ready) = fetcher.receiver.try_recv()
+        {
+            self.sprite_atlas = Some(ready.atlas);
+        }
+
         // Capped per frame: on wasm, `Promise::spawn_local` has no real
         // background thread to run on -- its future body runs synchronously
         // as a microtask, and ALL microtasks queued in one `update()` call
@@ -304,13 +397,20 @@ impl RgisApp {
             if let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() {
                 let coord = ready.coord;
                 let tile = ready.tile;
+                let style = Arc::clone(&self.style);
                 #[cfg(not(target_arch = "wasm32"))]
                 let promise = Promise::spawn_thread("tessellate-tile", move || {
-                    (coord, Some(rgis_render::build_tile_mesh(&tile, coord)))
+                    (
+                        coord,
+                        Some(rgis_render::build_tile_mesh(&tile, coord, &style)),
+                    )
                 });
                 #[cfg(target_arch = "wasm32")]
                 let promise = Promise::spawn_local(async move {
-                    (coord, Some(rgis_render::build_tile_mesh(&tile, coord)))
+                    (
+                        coord,
+                        Some(rgis_render::build_tile_mesh(&tile, coord, &style)),
+                    )
                 });
                 self.pending_tile_meshes.push(promise);
             } else if let Ok(fetched) = self.vector_tile_fetcher.raw_receiver.try_recv() {
@@ -333,9 +433,13 @@ impl RgisApp {
                 #[cfg(not(target_arch = "wasm32"))]
                 let promise = {
                     let fetcher = Arc::clone(&self.vector_tile_fetcher);
+                    let style = Arc::clone(&self.style);
                     Promise::spawn_thread("decode-tessellate-tile", move || {
                         match fetcher.decode_and_cache(coord, &bytes) {
-                            Ok(tile) => (coord, Some(rgis_render::build_tile_mesh(&tile, coord))),
+                            Ok(tile) => (
+                                coord,
+                                Some(rgis_render::build_tile_mesh(&tile, coord, &style)),
+                            ),
                             Err(_) => (coord, None),
                         }
                     })
@@ -343,8 +447,9 @@ impl RgisApp {
                 #[cfg(target_arch = "wasm32")]
                 let promise = {
                     let pool = Rc::clone(&self.tile_worker_pool);
+                    let style_json = Rc::clone(&self.style_json);
                     Promise::spawn_local(async move {
-                        let mesh = pool.tessellate(coord, bytes).await;
+                        let mesh = pool.tessellate(coord, bytes, style_json).await;
                         (coord, mesh)
                     })
                 };
@@ -397,6 +502,56 @@ impl RgisApp {
             }
         }
         None
+    }
+
+    /// For every `raster` style layer (e.g. `natural_earth`), requests
+    /// currently-visible tiles from its source's [`TileFetcher`] and builds
+    /// screen-space [`rgis_render::TileDraw`]s for whatever's already
+    /// cached/decoded -- tiles still in flight simply don't draw this frame
+    /// (no lower-zoom placeholder fallback, unlike `basemap_tiles`, since
+    /// raster imagery is a coarse background layer where a brief blank gap
+    /// while tiles arrive is much less noticeable than for line/label
+    /// detail).
+    fn collect_raster_tile_draws(&mut self) -> Vec<rgis_render::TileDraw> {
+        let mut draws = Vec::new();
+        for layer in self.style.layers_of_kind("raster") {
+            let Some(source_id) = &layer.source else {
+                continue;
+            };
+            let Some(fetcher) = self.raster_fetchers.get(source_id) else {
+                continue;
+            };
+            let coords = visible_tiles_for_zoom(&self.project.viewport, fetcher.max_zoom());
+            let ctx = rgis_render::EvalContext::new(self.project.viewport.zoom);
+            let opacity = layer.paint("raster-opacity").eval_f64(&ctx, 1.0) as f32;
+            let cache = self
+                .raster_tile_cache
+                .entry(source_id.clone())
+                .or_insert_with(|| {
+                    LruCache::new(NonZeroUsize::new(RASTER_TILE_CACHE_SIZE).unwrap())
+                });
+            for coord in coords {
+                if let Some(image) = cache.get(&coord) {
+                    let transform =
+                        rgis_render::tile_screen_transform(coord, &self.project.viewport);
+                    draws.push(rgis_render::TileDraw {
+                        key: tile_draw_key(source_id, coord),
+                        rect: [
+                            transform.offset[0],
+                            transform.offset[1],
+                            transform.size,
+                            transform.size,
+                        ],
+                        rgba: Arc::clone(image),
+                        uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        opacity,
+                    });
+                } else {
+                    fetcher.request(coord);
+                }
+            }
+        }
+        draws
     }
 
     /// The root "LAYERS" tree entry: click to expand/collapse, hover to
@@ -698,9 +853,15 @@ impl RgisApp {
                         }
                     }
                     basemap_tiles.extend(current_draws);
-                    mesh = rgis_render::build_background_mesh(&self.project.viewport);
+                    mesh = rgis_render::build_background_mesh(&self.project.viewport, &self.style);
                     background_index_count = mesh.indices.len() as u32;
                 }
+                let mut raster_tiles = if self.project.show_tiles {
+                    self.collect_raster_tile_draws()
+                } else {
+                    Vec::new()
+                };
+                let raster_tile_count = raster_tiles.len() as u32;
                 mesh.extend(rgis_render::build_scene_mesh(
                     &self.project.layers,
                     &self.project.viewport,
@@ -708,14 +869,16 @@ impl RgisApp {
 
                 // Screen-space label glyph quads must be collected before
                 // `basemap_tiles` moves into the paint callback below.
-                let (label_glyphs, glyph_bitmaps, pending_glyphs) =
+                let (label_glyphs, glyph_bitmaps, pending_glyphs, icon_draws) =
                     self.collect_label_draws(&basemap_tiles, rect);
+                raster_tiles.extend(icon_draws);
 
                 let callback = rgis_render::MapCallback {
                     mesh,
                     background_index_count,
                     basemap_tiles,
-                    tiles: Vec::new(),
+                    tiles: raster_tiles,
+                    raster_tile_count,
                     labels: label_glyphs,
                     glyph_bitmaps,
                     width: rect.width(),
@@ -756,7 +919,12 @@ impl RgisApp {
         &self,
         basemap_tiles: &[rgis_render::BasemapTileDraw],
         rect: egui::Rect,
-    ) -> (Vec<LabelGlyphInstance>, GlyphBitmapRanges, bool) {
+    ) -> (
+        Vec<LabelGlyphInstance>,
+        GlyphBitmapRanges,
+        bool,
+        Vec<rgis_render::TileDraw>,
+    ) {
         struct ProjectedLabel {
             priority: i32,
             pos: egui::Pos2,
@@ -768,6 +936,8 @@ impl RgisApp {
             /// Screen-space road polyline for line-placed labels (see
             /// `TileLabel::path`); `None` for point (place/poi) labels.
             path: Option<Vec<egui::Pos2>>,
+            icon: Option<String>,
+            icon_size: f32,
         }
 
         // Label positions feed the wgpu `MapCallback` (same as basemap
@@ -811,6 +981,8 @@ impl RgisApp {
                             })
                             .collect()
                     }),
+                    icon: label.icon.clone(),
+                    icon_size: label.icon_size,
                 });
             }
         }
@@ -820,6 +992,7 @@ impl RgisApp {
         let mut glyphs = Vec::new();
         let mut glyph_bitmaps = GlyphBitmapRanges::default();
         let mut pending_glyphs = false;
+        let mut icon_draws = Vec::new();
         let fontstack = LABEL_FONTSTACK.to_string();
 
         for label in projected {
@@ -981,6 +1154,41 @@ impl RgisApp {
                 }
             }
 
+            // Real sprite icon quad (see `TileLabel::icon`), positioned
+            // centered on the label's anchor point exactly like the text
+            // label sitting alongside it. Included in `bounds` before the
+            // overlap check below so an icon can't survive decluttering
+            // while its paired text (or vice versa) doesn't.
+            let icon_draw = label.icon.as_deref().and_then(|icon_name| {
+                let atlas = self.sprite_atlas.as_ref()?;
+                let sprite_rect = atlas.rects.get(icon_name)?;
+                let (atlas_w, atlas_h) = atlas.image.dimensions();
+                if atlas_w == 0 || atlas_h == 0 {
+                    return None;
+                }
+                let w = sprite_rect.width as f32 * label.icon_size;
+                let h = sprite_rect.height as f32 * label.icon_size;
+                let x = label.pos.x - w * 0.5;
+                let y = label.pos.y - h * 0.5;
+                let icon_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                bounds = Some(match bounds {
+                    Some(existing) => existing.union(icon_rect),
+                    None => icon_rect,
+                });
+                Some(rgis_render::TileDraw {
+                    key: SPRITE_ATLAS_TILE_KEY,
+                    rect: [x, y, w, h],
+                    rgba: Arc::clone(&atlas.image),
+                    uv_rect: [
+                        sprite_rect.x as f32 / atlas_w as f32,
+                        sprite_rect.y as f32 / atlas_h as f32,
+                        (sprite_rect.x + sprite_rect.width) as f32 / atlas_w as f32,
+                        (sprite_rect.y + sprite_rect.height) as f32 / atlas_h as f32,
+                    ],
+                    opacity: 1.0,
+                })
+            });
+
             let Some(label_rect) = bounds.map(|rect| rect.expand2(egui::vec2(2.0, 2.0))) else {
                 continue;
             };
@@ -992,10 +1200,55 @@ impl RgisApp {
             }
             placed.push(label_rect);
             glyphs.extend(label_glyphs);
+            icon_draws.extend(icon_draw);
         }
 
-        (glyphs, glyph_bitmaps, pending_glyphs)
+        (glyphs, glyph_bitmaps, pending_glyphs, icon_draws)
     }
+}
+
+/// A stable GPU texture-cache key for a raster tile, distinguishing tiles
+/// with the same `(z, x, y)` from different raster sources (unlikely to
+/// collide in practice, but cheap to guard against).
+fn tile_draw_key(source_id: &str, coord: TileCoord) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    source_id.hash(&mut hasher);
+    coord.z.hash(&mut hasher);
+    coord.x.hash(&mut hasher);
+    coord.y.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Builds a [`TileFetcher`] for every `"type": "raster"` source referenced
+/// by a `raster` layer in `style` (e.g. `natural_earth` in the liberty
+/// style), keyed by source id -- see `RgisApp::style`/`drain_ready_tiles`.
+/// Sources with no `tiles` template (only a TileJSON `url`, unsupported
+/// here) are silently skipped.
+fn raster_fetchers_for_style(
+    style: &rgis_render::StyleSheet,
+) -> std::collections::HashMap<String, Arc<TileFetcher>> {
+    let mut fetchers = std::collections::HashMap::new();
+    for layer in style.layers_of_kind("raster") {
+        let Some(source_id) = &layer.source else {
+            continue;
+        };
+        if fetchers.contains_key(source_id) {
+            continue;
+        }
+        let Some(source) = style.sources.get(source_id) else {
+            continue;
+        };
+        let Some(template) = source.tiles.as_ref().and_then(|t| t.first()) else {
+            continue;
+        };
+        let max_zoom = source.maxzoom.unwrap_or(22.0) as u8;
+        let tile_size = source.tile_size.unwrap_or(256);
+        let raster_source = StyleRasterSource::new(template.clone(), max_zoom, tile_size);
+        fetchers.insert(source_id.clone(), Arc::new(TileFetcher::new(raster_source)));
+    }
+    fetchers
 }
 
 /// Total length of a polyline, or `None` for degenerate (single-point/

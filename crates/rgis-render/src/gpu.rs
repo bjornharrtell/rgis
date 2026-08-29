@@ -27,8 +27,8 @@ const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
 const LINE_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Float32x4];
 
-const TILE_VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+const TILE_VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32];
 
 const TEXT_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4];
@@ -38,6 +38,9 @@ const TEXT_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
 struct TileVertex {
     position: [f32; 2],
     uv: [f32; 2],
+    /// `raster-opacity` (style paint property), constant across a tile's
+    /// four corners -- see `TileDraw::opacity`.
+    opacity: f32,
 }
 
 #[repr(C)]
@@ -100,13 +103,25 @@ struct TileGpuMesh {
     lines: Option<SubMeshBuffers>,
 }
 
-/// A single raster tile to draw this frame: its screen-pixel rectangle
-/// (`[x, y, width, height]`), a stable cache key (used to avoid re-uploading
-/// the same tile texture every frame), and its RGBA pixels.
+/// A single textured screen-space quad to draw this frame: a raster tile
+/// or a sprite icon, sharing one GPU pipeline since both are just "sample
+/// an RGBA texture through a UV sub-rect and blend onto a screen-pixel
+/// quad". `key` identifies the *source texture* (not the individual draw):
+/// raster tiles use one key per tile (a distinct image each), while every
+/// icon sprite from the same style shares a single key (they all sample
+/// the one fetched sprite atlas image, uploaded once and cached -- see
+/// `ensure_tile_texture`).
 pub struct TileDraw {
     pub key: u64,
     pub rect: [f32; 4],
     pub rgba: Arc<image::RgbaImage>,
+    /// Normalized `[u0, v0, u1, v1]` sub-rect of `rgba` to sample --
+    /// `[0.0, 0.0, 1.0, 1.0]` (the whole image) for a raster tile, or a
+    /// sprite's packed atlas sub-rect for an icon.
+    pub uv_rect: [f32; 4],
+    /// `raster-opacity`/`icon-opacity` evaluated for the layer this draw
+    /// belongs to (`1.0` if the style doesn't specify one).
+    pub opacity: f32,
 }
 
 struct TileGpuTexture {
@@ -793,7 +808,14 @@ pub struct MapCallback {
     /// `MapRenderResources::ensure_basemap_tile_buffer`); only the small
     /// `offset`/`scale` transform is refreshed every frame.
     pub basemap_tiles: Vec<BasemapTileDraw>,
+    /// Raster background tiles (drawn first, at index
+    /// `0..raster_tile_count`) followed by sprite icon quads for symbol
+    /// labels (drawn later, above every other layer, at index
+    /// `raster_tile_count..tiles.len()`) -- sharing one vertex/index
+    /// buffer/pipeline (see `TileDraw`'s docs) the same way `mesh` splits
+    /// background vs. user-layer geometry around `background_index_count`.
     pub tiles: Vec<TileDraw>,
+    pub raster_tile_count: u32,
     pub labels: Vec<LabelGlyphInstance>,
     pub glyph_bitmaps: GlyphBitmapRanges,
     pub width: f32,
@@ -867,21 +889,27 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         let mut tile_vertices = Vec::with_capacity(self.tiles.len() * 4);
         for tile in &self.tiles {
             let [x, y, w, h] = tile.rect;
+            let [u0, v0, u1, v1] = tile.uv_rect;
+            let opacity = tile.opacity;
             tile_vertices.push(TileVertex {
                 position: [x, y],
-                uv: [0.0, 0.0],
+                uv: [u0, v0],
+                opacity,
             });
             tile_vertices.push(TileVertex {
                 position: [x + w, y],
-                uv: [1.0, 0.0],
+                uv: [u1, v0],
+                opacity,
             });
             tile_vertices.push(TileVertex {
                 position: [x + w, y + h],
-                uv: [1.0, 1.0],
+                uv: [u1, v1],
+                opacity,
             });
             tile_vertices.push(TileVertex {
                 position: [x, y + h],
-                uv: [0.0, 1.0],
+                uv: [u0, v1],
+                opacity,
             });
         }
         resources
@@ -969,6 +997,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             background_index_count: self.background_index_count,
             basemap_draws,
             tile_keys: self.tiles.iter().map(|tile| tile.key).collect(),
+            raster_tile_count: self.raster_tile_count,
             text_index_count: text_indices.len() as u32,
         });
 
@@ -987,9 +1016,14 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         let Some(frame) = callback_resources.get::<FramePrepared>() else {
             return;
         };
-        // OSM tiles are the map background, so draw them first; the vector
-        // background quad, basemap tiles, and vector layers are then drawn
-        // on top so layers stay visible above the basemap.
+        // Raster style tiles (e.g. a `raster` background source like
+        // `natural_earth`) are the map background, so draw them first; the
+        // vector background quad, basemap tiles, and vector layers are then
+        // drawn on top so layers stay visible above the basemap. Sprite
+        // icon quads share this same pipeline/buffers but are drawn in a
+        // second pass further below (after basemap/vector layers), since
+        // symbol icons must render above everything else, not underneath
+        // it -- see `frame.raster_tile_count`.
         if let Some(tile_vertex_slice) = resources.tile_vertex_buffer.slice() {
             render_pass.set_pipeline(&resources.tile_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
@@ -998,7 +1032,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 resources.tile_index_buffer.slice(..),
                 wgpu::IndexFormat::Uint16,
             );
-            for (i, key) in frame.tile_keys.iter().enumerate() {
+            for (i, key) in frame.tile_keys[..frame.raster_tile_count as usize]
+                .iter()
+                .enumerate()
+            {
                 if let Some(texture) = resources.tile_textures.get(key) {
                     render_pass.set_bind_group(1, &texture.bind_group, &[]);
                     render_pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
@@ -1125,6 +1162,34 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             render_pass.draw_indexed(frame.background_index_count..frame.index_count, 0, 0..1);
         }
 
+        // Sprite icon quads (see `TileDraw`'s docs): drawn here, above the
+        // background/basemap/vector layers above, using the same
+        // vertex/index buffers and pipeline as the raster tiles drawn at
+        // the very top of this function -- just a later, disjoint slice of
+        // `frame.tile_keys`/the vertex buffer (indices
+        // `raster_tile_count..tile_keys.len()`).
+        if let Some(tile_vertex_slice) = resources.tile_vertex_buffer.slice()
+            && (frame.raster_tile_count as usize) < frame.tile_keys.len()
+        {
+            render_pass.set_pipeline(&resources.tile_pipeline);
+            render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, tile_vertex_slice);
+            render_pass.set_index_buffer(
+                resources.tile_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
+            for (i, key) in frame.tile_keys[frame.raster_tile_count as usize..]
+                .iter()
+                .enumerate()
+            {
+                if let Some(texture) = resources.tile_textures.get(key) {
+                    render_pass.set_bind_group(1, &texture.bind_group, &[]);
+                    let vertex_offset = (frame.raster_tile_count as usize + i) * 4;
+                    render_pass.draw_indexed(0..6, vertex_offset as i32, 0..1);
+                }
+            }
+        }
+
         if frame.text_index_count > 0
             && let (Some(vertex_buffer), Some(index_buffer)) = (
                 resources.text_vertex_buffer.slice(),
@@ -1152,6 +1217,7 @@ struct FramePrepared {
     background_index_count: u32,
     basemap_draws: Vec<BasemapDrawPrepared>,
     tile_keys: Vec<u64>,
+    raster_tile_count: u32,
     text_index_count: u32,
 }
 

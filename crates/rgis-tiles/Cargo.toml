@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 rgis-core   = { path = "../rgis-core" }
+rgis-style  = { path = "../rgis-style" }
 geo-types   = { workspace = true }
 async-channel = { workspace = true }
 image       = { workspace = true }
 lru         = { workspace = true }
+serde       = { workspace = true }
 thiserror   = { workspace = true }
 ehttp = { workspace = true }
 serde_json  = { workspace = true }

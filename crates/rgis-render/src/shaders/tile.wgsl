@@ -16,11 +16,13 @@ var tile_sampler: sampler;
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) opacity: f32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) opacity: f32,
 };
 
 @vertex
@@ -30,10 +32,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let ndc_y = 1.0 - (in.position.y / screen.size.y) * 2.0;
     out.clip_position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.uv = in.uv;
+    out.opacity = in.opacity;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(tile_texture, tile_sampler, in.uv);
+    var color = textureSample(tile_texture, tile_sampler, in.uv);
+    color.a *= in.opacity;
+    return color;
 }

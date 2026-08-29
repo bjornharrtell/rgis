@@ -3310,12 +3310,23 @@ dependencies = [
  "geo-types",
  "image",
  "lru",
+ "pollster 0.4.0",
  "rgis-core",
+ "rgis-style",
  "rgis-tiles",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "wgpu",
+]
+
+[[package]]
+name = "rgis-style"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3330,6 +3341,8 @@ dependencies = [
  "image",
  "lru",
  "rgis-core",
+ "rgis-style",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
 ]

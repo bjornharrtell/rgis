@@ -50,7 +50,7 @@ use std::rc::Rc;
 use js_sys::{Array, Float32Array, Uint8Array, Uint32Array};
 use rgis_render::{TileMesh, TileMeshWire};
 use rgis_tiles::TileCoord;
-use wasm_bindgen::{JsCast, prelude::Closure};
+use wasm_bindgen::{JsCast, JsValue, prelude::Closure};
 use web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker};
 
 /// Number of dedicated workers kept warm for tile decode+tessellation.
@@ -66,7 +66,7 @@ const POOL_SIZE: usize = 4;
 /// -- the tile just gets re-requested later if it's still visible.
 const MAX_QUEUE_LEN: usize = POOL_SIZE * 4;
 
-type Job = (TileCoord, Vec<u8>);
+type Job = (TileCoord, Vec<u8>, Rc<str>);
 type ReplyTx = async_channel::Sender<Option<TileMesh>>;
 
 struct PoolState {
@@ -123,16 +123,24 @@ impl TileWorkerPool {
     }
 
     /// Decodes and tessellates `bytes` (raw MVT for `coord`) on a pooled
-    /// worker, returning `None` if decoding failed (or if the pool's queue
-    /// is already saturated, see [`MAX_QUEUE_LEN`]).
-    pub async fn tessellate(&self, coord: TileCoord, bytes: Vec<u8>) -> Option<TileMesh> {
+    /// worker using `style_json` (the current style document, sent to the
+    /// worker as a plain string since each worker is a separate wasm
+    /// instance with no shared memory), returning `None` if decoding
+    /// failed (or if the pool's queue is already saturated, see
+    /// [`MAX_QUEUE_LEN`]).
+    pub async fn tessellate(
+        &self,
+        coord: TileCoord,
+        bytes: Vec<u8>,
+        style_json: Rc<str>,
+    ) -> Option<TileMesh> {
         let (tx, rx) = async_channel::bounded(1);
         {
             let mut s = self.state.borrow_mut();
             if s.queue.len() >= MAX_QUEUE_LEN {
                 return None;
             }
-            s.queue.push_back(((coord, bytes), tx));
+            s.queue.push_back(((coord, bytes, style_json), tx));
         }
         pump(&self.state);
         rx.recv().await.ok().flatten()
@@ -217,7 +225,7 @@ fn pump(state: &Rc<RefCell<PoolState>>) {
         let Some(worker_idx) = s.free.pop_front() else {
             break;
         };
-        let Some(((coord, bytes), reply_tx)) = s.queue.pop_front() else {
+        let Some(((coord, bytes, style_json), reply_tx)) = s.queue.pop_front() else {
             s.free.push_front(worker_idx);
             break;
         };
@@ -231,6 +239,11 @@ fn pump(state: &Rc<RefCell<PoolState>>) {
         let transfer = Array::new();
         transfer.push(&bytes_array.buffer());
         msg.push(&bytes_array);
+        // The style document JSON, structured-cloned (not transferred --
+        // strings aren't backed by a transferable `ArrayBuffer`) so the
+        // worker can parse its own `StyleSheet` to tessellate with, since
+        // it has no memory shared with the main thread's own `RgisApp`.
+        msg.push(&JsValue::from_str(&style_json));
 
         let _ = s.workers[worker_idx].post_message_with_transfer(&msg.into(), &transfer.into());
     }

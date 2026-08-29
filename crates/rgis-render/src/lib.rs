@@ -9,4 +9,5 @@ pub use basemap::{
 };
 pub use gpu::{BasemapTileDraw, MSAA_SAMPLES, MapCallback, MapRenderResources, TileDraw};
 pub use mesh::{SceneMesh, Vertex, build_scene_mesh, build_scene_mesh_with_offset};
+pub use rgis_style::{EvalContext, StyleSheet};
 pub use text::{GlyphBitmapRanges, LabelDraw, LabelGlyphInstance};
