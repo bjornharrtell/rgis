@@ -89,4 +89,38 @@ mod tests {
         let grass = Feat(props2);
         assert!(!layer.matches_feature(&grass, 10.0));
     }
+
+    /// Regression test for a real parsing bug: a plain JSON array whose
+    /// first element is a string (e.g. `text-font: ["Noto Sans Italic"]`)
+    /// used to be mis-parsed as a call to an unrecognized expression
+    /// operator named `"Noto Sans Italic"`, which failed to parse at all
+    /// and silently discarded the whole property -- so every symbol
+    /// layer's `text-font` (italic region/water labels, bold country
+    /// names, etc.) always evaluated as unset, regardless of what the
+    /// style actually specified.
+    #[test]
+    fn text_font_array_parses_as_a_literal_fontstack_list() {
+        let json = include_str!("../fixtures/liberty.json");
+        let style = StyleSheet::parse(json).unwrap();
+        let ctx = EvalContext::new(10.0);
+
+        let bold_layer = style
+            .layers
+            .iter()
+            .find(|l| l.id == "label_country_1")
+            .unwrap();
+        assert_eq!(
+            bold_layer.layout("text-font").eval_string(&ctx).as_deref(),
+            Some("Noto Sans Bold")
+        );
+
+        let italic_layer = style.layers.iter().find(|l| l.id == "label_state").unwrap();
+        assert_eq!(
+            italic_layer
+                .layout("text-font")
+                .eval_string(&ctx)
+                .as_deref(),
+            Some("Noto Sans Italic")
+        );
+    }
 }

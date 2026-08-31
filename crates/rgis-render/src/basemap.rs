@@ -49,6 +49,13 @@ impl TileMesh {
     }
 }
 
+/// The fontstack used for symbol layers that don't set their own
+/// `text-font` (or set one that fails to evaluate) -- matches OpenFreeMap's
+/// "liberty" style's own most common `text-font` value, so layers that
+/// really do omit it (rather than every layer, as before this was wired up)
+/// still render sensibly.
+pub const DEFAULT_FONTSTACK: &str = "Noto Sans Regular";
+
 /// A single point label (a `place` or `poi` layer feature with a `name`),
 /// positioned in tile-local metres exactly like fill/line mesh vertices --
 /// see [`tile_screen_transform`] for projecting it to screen space.
@@ -63,6 +70,12 @@ pub struct TileLabel {
     /// A lighter halo/outline color drawn behind the text for legibility
     /// over busy basemap tiles.
     pub halo_color: [f32; 4],
+    /// The layer's evaluated `text-font` (e.g. `"Noto Sans Italic"`,
+    /// `"Noto Sans Bold"`), used to fetch/key the right glyph range --
+    /// MapLibre styles lean on this to distinguish e.g. italic region/water
+    /// labels and bold country names from regular place labels, not just
+    /// `text-color`. Defaults to [`DEFAULT_FONTSTACK`].
+    pub fontstack: String,
     /// Lower draws/keeps priority over higher when decluttering
     /// overlapping labels (place names before POIs; within a class, by the
     /// source layer's own `rank` property).
@@ -77,17 +90,32 @@ pub struct TileLabel {
     /// the full road polyline in the same tile-local-metres space as
     /// `position`, so the label's glyphs can be threaded along the actual
     /// road geometry (curving with it) instead of sitting on one flat,
-    /// straight quad. `None` for point labels (place/poi), which are laid
-    /// out as a single horizontal run instead.
+    /// straight quad. `None` for point labels (place/poi) and for shield
+    /// labels (icon-image + text-field on line geometry, e.g. road refs),
+    /// which are laid out as a single horizontal run instead.
     pub path: Option<Vec<[f32; 2]>>,
-    /// Evaluated `icon-image` sprite name (e.g. `"circle_11_black"`),
-    /// looked up in the fetched sprite atlas by the caller; `None`/empty
-    /// means no icon for this feature. Point labels only -- MapLibre only
-    /// places icons for point symbols, not line-placed ones.
+    /// Evaluated `icon-image` sprite name (e.g. `"circle_11_black"`,
+    /// `"road_2"`), looked up in the fetched sprite atlas by the caller;
+    /// `None`/empty means no icon for this feature. Set for point symbols
+    /// (place/poi icons) as well as line-geometry "shield" symbols (road
+    /// refs, e.g. `highway-shield-*`), which MapLibre also draws as an
+    /// icon+text pair rather than a curving line label.
     pub icon: Option<String>,
     /// Evaluated `icon-size` multiplier applied to the sprite's native
     /// pixel dimensions (`1.0` if the style doesn't specify one).
     pub icon_size: f32,
+    /// Whether the layer's `text-anchor` resolves to the style spec's
+    /// default, `"center"` (true when the layer doesn't set `text-anchor`
+    /// at all, like every road-shield layer -- their ref-number text must
+    /// sit centered *inside* the icon badge). `false` for layers that
+    /// explicitly anchor text away from the point (e.g. place/POI layers
+    /// setting `text-anchor: "top"` with a `text-offset` to hang the name
+    /// below its marker dot) -- the caller uses this to pick vertical
+    /// layout: true-blooded glyph-metrics centering on the anchor point
+    /// for shields, vs. the existing tuned below-the-icon offset for
+    /// place/POI labels. Ignored when `path` is `Some` (line-placed road
+    /// names), which already center on the path using glyph metrics.
+    pub text_anchor_center: bool,
 }
 
 /// A line/stroke vertex: `center` is the tile-local-metres position
@@ -367,11 +395,13 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
                     Some(pattern) => {
                         // Spec units are multiples of the line's width;
                         // convert to tile-local metres using this tile's
-                        // own metres-per-(256px) scale, matching the same
-                        // zoom (`coord.z`) already used to evaluate
-                        // `width` above -- see `append_dashed_line`'s doc
-                        // comment for why this is only an approximation.
-                        let m_per_px = tile_size_m as f32 / 256.0;
+                        // own metres-per-pixel scale (matching
+                        // `Viewport::resolution`'s MapLibre-convention
+                        // 512px-per-tile scale, not 256), at the same zoom
+                        // (`coord.z`) already used to evaluate `width`
+                        // above -- see `append_dashed_line`'s doc comment
+                        // for why this is only an approximation.
+                        let m_per_px = tile_size_m as f32 / rgis_core::MAPLIBRE_TILE_SIZE as f32;
                         let pattern_m: Vec<f32> = pattern
                             .iter()
                             .map(|units| units * width * m_per_px)
@@ -415,15 +445,17 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
 /// Extracts every labeled feature (`symbol` layers with a `text-field`)
 /// from a decoded tile, in the same tile-local-metres space
 /// `build_tile_mesh` uses for its fill/line vertices, evaluating
-/// `text-field`/`text-size`/`text-color`/`text-halo-color`/
+/// `text-field`/`text-size`/`text-color`/`text-halo-color`/`text-font`/
 /// `symbol-placement`/`icon-image`/`icon-size` from `style` -- driven
 /// entirely by the style document instead of a hardcoded per-source-layer
 /// table. `icon-image` is resolved to a sprite name here; the caller looks
 /// it up in the fetched sprite atlas and shapes the actual textured quad
 /// (see `RgisApp::collect_label_draws`), since sprite fetching/atlas
-/// storage lives above this crate. Symbol layers with an `icon-image` but
-/// no `text-field` (road shields, one-way arrows) are still skipped, since
-/// this function only walks features that have label text.
+/// storage lives above this crate. This includes road "shield" layers
+/// (icon + text on line geometry, e.g. `highway-shield-*`) since they do
+/// have a `text-field` (the route ref number); symbol layers with an
+/// `icon-image` but no `text-field` at all (one-way arrows) are still
+/// skipped, since this function only walks features that have label text.
 fn extract_labels(
     tile: &VectorTile,
     coord: TileCoord,
@@ -483,6 +515,34 @@ fn extract_labels(
                 .paint("text-halo-color")
                 .eval_color(&eval_ctx, Color([1.0, 1.0, 1.0, 0.9]))
                 .to_array();
+            // `text-font` picks the glyph fontstack (regular/bold/italic)
+            // -- e.g. liberty styles country names as `Noto Sans Bold` and
+            // region/water names as `Noto Sans Italic`, distinct from the
+            // plain `Noto Sans Regular` most other labels use. A single
+            // fontstack name (`["Noto Sans Italic"]`) is all liberty-style
+            // styles ever set here; `eval_string`'s array-to-string
+            // coercion collapses that one-element array straight back into
+            // the bare name.
+            let fontstack = layer
+                .layout("text-font")
+                .eval_string(&eval_ctx)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_FONTSTACK.to_string());
+            let icon_image = layer
+                .layout("icon-image")
+                .eval_string(&eval_ctx)
+                .filter(|s| !s.is_empty());
+            let icon_size = layer.layout("icon-size").eval_f64(&eval_ctx, 1.0) as f32;
+            // `text-anchor` defaults to `"center"` per the style spec when
+            // a layer doesn't set it at all -- true for every road-shield
+            // layer (their ref number must sit centered inside the icon
+            // badge), but place/POI layers explicitly override it (e.g.
+            // `"top"` with a `text-offset` to hang the name below its
+            // marker dot) -- see `TileLabel::text_anchor_center`.
+            let text_anchor_center = layer
+                .layout("text-anchor")
+                .eval_string(&eval_ctx)
+                .is_none_or(|a| a == "center");
 
             // No full mapbox symbol-sort-key/collision port here -- this
             // approximates it generically (without hardcoding per-source-
@@ -499,7 +559,25 @@ fn extract_labels(
             let priority = size_rank * 10_000 + rank;
 
             let placement = layer.layout("symbol-placement").eval_string(&eval_ctx);
-            if placement.as_deref() == Some("line") {
+            let is_line_geometry = matches!(
+                feature.geometry,
+                Geometry::LineString(_) | Geometry::MultiLineString(_)
+            );
+            // MapLibre only actually curves glyphs along the line for
+            // plain text labels (road names, waterway names): a symbol
+            // layer that pairs an icon with text on line geometry -- a
+            // road "shield" (`highway-shield-*`/`road_shield_us`), whose
+            // ref number sits inside a fixed-size sprite badge -- always
+            // keeps that badge (and its text) upright instead, regardless
+            // of what `symbol-placement` evaluates to (these layers set
+            // `icon-rotation-alignment`/`text-rotation-alignment` to
+            // `viewport`, not `map`, in the style). This renders one
+            // shield per feature at its line's arc-length midpoint
+            // instead of MapLibre's own repeat-by-`symbol-spacing` along
+            // the whole line, a reasonable approximation given this
+            // renderer has no broader symbol-collision/placement pass to
+            // begin with (see above).
+            if is_line_geometry {
                 let points = match &feature.geometry {
                     Geometry::LineString(line) => line_points(line, &ctx),
                     Geometry::MultiLineString(mlines) => mlines
@@ -517,17 +595,20 @@ fn extract_labels(
                 // matching where MapLibre centers a line-placed label
                 // along its geometry.
                 let mid = point_at_arc_length(&points, line_length_points(&points) * 0.5);
+                let curve = placement.as_deref() == Some("line") && icon_image.is_none();
                 labels.push(TileLabel {
                     position: mid,
                     text: text.to_string(),
                     font_size,
                     color,
                     halo_color,
+                    fontstack,
                     priority,
                     angle: 0.0,
-                    path: Some(points),
-                    icon: None,
-                    icon_size: 1.0,
+                    path: if curve { Some(points) } else { None },
+                    icon: if curve { None } else { icon_image },
+                    icon_size: if curve { 1.0 } else { icon_size },
+                    text_anchor_center,
                 });
             } else {
                 let Geometry::Point(p) = &feature.geometry else {
@@ -550,22 +631,19 @@ fn extract_labels(
                     continue;
                 }
                 let pos = ctx.project_point(p.x(), p.y());
-                let icon_image = layer
-                    .layout("icon-image")
-                    .eval_string(&eval_ctx)
-                    .filter(|s| !s.is_empty());
-                let icon_size = layer.layout("icon-size").eval_f64(&eval_ctx, 1.0) as f32;
                 labels.push(TileLabel {
                     position: pos,
                     text: text.to_string(),
                     font_size,
                     color,
                     halo_color,
+                    fontstack,
                     priority,
                     angle: 0.0,
                     path: None,
                     icon: icon_image,
                     icon_size,
+                    text_anchor_center,
                 });
             }
         }
@@ -1209,6 +1287,8 @@ fn append_disc(buffers: &mut LineMesh, center: [f32; 2], radius: f32, color: [f3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rgis_tiles::VectorTileLayer;
+    use std::collections::HashMap;
 
     /// The "liberty" style JSON used both here and by `rgis-style`'s own
     /// tests (see `crates/rgis-style/fixtures/liberty.json`) -- a single
@@ -1253,6 +1333,244 @@ mod tests {
         let round_tripped = wire.into_tile_mesh();
         assert_eq!(round_tripped.labels.len(), mesh.labels.len());
         assert_eq!(round_tripped.labels[0].text, mesh.labels[0].text);
+    }
+
+    /// Road "shield" symbol layers (e.g. liberty's `highway-shield-*`,
+    /// `road_shield_us`) pair an `icon-image` sprite badge with a short
+    /// ref-number `text-field` on line geometry -- MapLibre always draws
+    /// these upright as a single icon+text badge rather than curving the
+    /// text along the road, unlike plain road-name labels
+    /// (`highway-name-*`), which have no icon and do curve. Regression
+    /// test for a real bug: `extract_labels` used to require `Point`
+    /// geometry to ever attach an icon, and skipped any line-geometry
+    /// symbol feature entirely unless `symbol-placement` evaluated to
+    /// exactly `"line"` (silently dropping every shield placed via
+    /// liberty's zoom-dependent `["step", ["zoom"], "point", ..., "line"]`
+    /// at low zoom) -- so real-world road shields never rendered at all.
+    #[test]
+    fn road_shields_get_an_icon_and_stay_upright() {
+        let full_path = format!("{}/fixtures/paris_12.pbf", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&full_path).expect("failed to read fixture");
+        let tile = rgis_tiles::decode_vector_tile(&bytes).expect("decode fixture MVT");
+        let coord = TileCoord { z: 12, x: 0, y: 0 };
+        let style = liberty_style();
+        let mesh = build_tile_mesh(&tile, coord, &style);
+
+        let shield = mesh
+            .labels
+            .iter()
+            .find(|l| l.icon.is_some())
+            .expect("expected at least one road shield label in this fixture");
+        assert!(
+            shield.icon.as_deref().unwrap().starts_with("road_"),
+            "unexpected icon sprite: {:?}",
+            shield.icon
+        );
+        assert!(
+            shield.path.is_none(),
+            "a shield's ref-number text should stay upright, not curve along the road"
+        );
+        assert!(!shield.text.is_empty());
+        // Regression test for a real bug: shields don't set `text-anchor`
+        // at all, so it must resolve to the spec default `"center"` --
+        // the caller uses this to center the ref number's glyph-metrics
+        // baseline on the icon badge instead of hanging it below, like
+        // place/POI labels do.
+        assert!(
+            shield.text_anchor_center,
+            "a road shield's text-anchor should resolve to the default \"center\""
+        );
+
+        // A plain road-name label (no icon) on the same fixture should
+        // still curve along its road, unaffected by the shield fix above.
+        let road_name = mesh
+            .labels
+            .iter()
+            .find(|l| l.icon.is_none() && l.path.is_some())
+            .expect("expected at least one curving road-name label");
+        assert!(road_name.path.as_ref().unwrap().len() >= 2);
+    }
+
+    /// `text-font` should select the glyph fontstack per-layer (matching
+    /// MapLibre, where e.g. country names render bold and region/water
+    /// names render italic) rather than one hardcoded fontstack for every
+    /// label -- regression test for a bug where `TileLabel` had no
+    /// fontstack field at all and the caller always requested the same
+    /// "Noto Sans Regular" glyphs regardless of what the style specified.
+    #[test]
+    fn text_font_selects_the_layers_own_fontstack() {
+        let style_json = serde_json::json!({
+            "version": 8,
+            "layers": [
+                {
+                    "id": "place-country",
+                    "type": "symbol",
+                    "source": "test",
+                    "source-layer": "place",
+                    "layout": {
+                        "text-field": ["get", "name"],
+                        "text-font": ["Noto Sans Bold"]
+                    }
+                },
+                {
+                    "id": "place-region",
+                    "type": "symbol",
+                    "source": "test",
+                    "source-layer": "place",
+                    "layout": {
+                        "text-field": ["get", "name"],
+                        "text-font": ["Noto Sans Italic"]
+                    },
+                    "filter": ["==", ["get", "class"], "state"]
+                },
+                {
+                    "id": "place-city",
+                    "type": "symbol",
+                    "source": "test",
+                    "source-layer": "place",
+                    "layout": {
+                        "text-field": ["get", "name"]
+                    },
+                    "filter": ["==", ["get", "class"], "city"]
+                }
+            ]
+        });
+        let style = StyleSheet::parse(&style_json.to_string()).expect("valid style");
+
+        let point_feature = |name: &str, class: &str| VectorFeature {
+            geometry: Geometry::Point(geo_types::Point::new(100, 100)),
+            properties: HashMap::from([
+                (
+                    "name".to_string(),
+                    rgis_tiles::PropertyValue::String(name.to_string()),
+                ),
+                (
+                    "class".to_string(),
+                    rgis_tiles::PropertyValue::String(class.to_string()),
+                ),
+            ]),
+        };
+        let tile = VectorTile {
+            layers: vec![VectorTileLayer {
+                name: "place".to_string(),
+                extent: 4096,
+                features: vec![
+                    point_feature("Wonderland", "state"),
+                    point_feature("Metropolis", "city"),
+                ],
+            }],
+        };
+        let coord = TileCoord { z: 6, x: 0, y: 0 };
+        let mesh = build_tile_mesh(&tile, coord, &style);
+
+        // Every symbol layer matching this feature evaluates in turn, so
+        // both "place-country" (bold, no filter) and "place-region"
+        // (italic, `class == "state"`) produce a label for "Wonderland";
+        // pick out the one carrying the region layer's own fontstack.
+        let region_label = mesh
+            .labels
+            .iter()
+            .find(|l| l.text == "Wonderland" && l.fontstack == "Noto Sans Italic")
+            .expect("expected an italic region label");
+        assert_eq!(region_label.text, "Wonderland");
+
+        // "place-country" (bold, no filter) also matches "Metropolis";
+        // pick out the "place-city" one specifically (no text-font set).
+        let city_label = mesh
+            .labels
+            .iter()
+            .find(|l| l.text == "Metropolis" && l.fontstack == DEFAULT_FONTSTACK)
+            .expect("expected a city label using the default fontstack");
+        assert_eq!(city_label.fontstack, DEFAULT_FONTSTACK);
+    }
+
+    /// `text-anchor` should resolve to the spec default `"center"` when a
+    /// layer doesn't set it (matching every road-shield layer), but a
+    /// layer that explicitly anchors text elsewhere -- e.g. a place/POI
+    /// layer using `text-anchor: "top"` with a `text-offset` to hang a
+    /// name below its marker dot -- should be reported as non-center so
+    /// the caller keeps hanging that text below the icon instead of
+    /// centering it on top of it.
+    #[test]
+    fn text_anchor_defaults_to_center_but_layers_can_override_it() {
+        let style_json = serde_json::json!({
+            "version": 8,
+            "layers": [
+                {
+                    "id": "shield-like",
+                    "type": "symbol",
+                    "source": "test",
+                    "source-layer": "transportation_name",
+                    "layout": {
+                        "text-field": ["get", "ref"],
+                        "icon-image": "road_2"
+                    }
+                },
+                {
+                    "id": "poi-like",
+                    "type": "symbol",
+                    "source": "test",
+                    "source-layer": "poi",
+                    "layout": {
+                        "text-field": ["get", "name"],
+                        "icon-image": "circle_11_black",
+                        "text-anchor": "top",
+                        "text-offset": [0, 0.6]
+                    }
+                }
+            ]
+        });
+        let style = StyleSheet::parse(&style_json.to_string()).expect("valid style");
+
+        let point_feature = |name: &str, refv: &str| VectorFeature {
+            geometry: Geometry::Point(geo_types::Point::new(100, 100)),
+            properties: HashMap::from([
+                (
+                    "name".to_string(),
+                    rgis_tiles::PropertyValue::String(name.to_string()),
+                ),
+                (
+                    "ref".to_string(),
+                    rgis_tiles::PropertyValue::String(refv.to_string()),
+                ),
+            ]),
+        };
+        let tile = VectorTile {
+            layers: vec![
+                VectorTileLayer {
+                    name: "transportation_name".to_string(),
+                    extent: 4096,
+                    features: vec![point_feature("", "A1")],
+                },
+                VectorTileLayer {
+                    name: "poi".to_string(),
+                    extent: 4096,
+                    features: vec![point_feature("Cafe", "")],
+                },
+            ],
+        };
+        let coord = TileCoord { z: 14, x: 0, y: 0 };
+        let mesh = build_tile_mesh(&tile, coord, &style);
+
+        let shield = mesh
+            .labels
+            .iter()
+            .find(|l| l.text == "A1")
+            .expect("expected the shield-like label");
+        assert!(
+            shield.text_anchor_center,
+            "a layer with no text-anchor should default to center"
+        );
+
+        let poi = mesh
+            .labels
+            .iter()
+            .find(|l| l.text == "Cafe")
+            .expect("expected the poi-like label");
+        assert!(
+            !poi.text_anchor_center,
+            "a layer with an explicit non-center text-anchor should not report center"
+        );
     }
 
     /// Vertex/index count contributed by exactly one bevel join triangle.

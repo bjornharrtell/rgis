@@ -300,7 +300,16 @@ pub fn parse(json: &Json) -> Result<Expr, ExprError> {
         "to-number" => Expr::ToNumber(Box::new(parse_at(0)?)),
         "length" => Expr::Length(Box::new(parse_at(0)?)),
         "at" => Expr::At(Box::new(parse_at(0)?), Box::new(parse_at(1)?)),
-        other => return Err(ExprError::UnsupportedOperator(other.to_string())),
+        // Not a recognized expression operator: matches how MapLibre
+        // itself treats array-typed style properties whose value isn't an
+        // expression -- e.g. `text-font: ["Noto Sans Italic"]` is a plain
+        // one-element fontstack array, not a call to a (nonexistent)
+        // `"Noto Sans Italic"` operator. Without this fallback, any plain
+        // string-leading data array (text-font being the common real-world
+        // case) failed to parse at all, silently discarding the whole
+        // property and falling back to style-eval's own hardcoded default
+        // instead of the style's actual value.
+        _ => Expr::Literal(json_to_value(json)),
     })
 }
 
@@ -310,6 +319,19 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Null, Value::Null) => true,
+        // A bool compared against a number needs numeric coercion
+        // (`true`/`false` as `1`/`0`), not the string-coercion fallback
+        // below: `to_display_string()` renders bools as `"true"`/`"false"`,
+        // which would never match a numeric literal like `1`. This matters
+        // for real vector-tile data: OpenMapTiles' `boundary` layer encodes
+        // `maritime`/`disputed` as MVT booleans, while liberty-style styles
+        // filter on them with `["!=", ["get", "maritime"], 1]` -- without
+        // this case that filter always evaluated to `true` (never excluding
+        // maritime boundaries), spuriously drawing admin-boundary lines out
+        // in open water.
+        (Value::Bool(_), Value::Number(_)) | (Value::Number(_), Value::Bool(_)) => {
+            a.as_f64() == b.as_f64()
+        }
         // The style spec compares across compatible types by string/number
         // coercion (e.g. matching a numeric tag value against a `match`
         // label written as a string in the style JSON).

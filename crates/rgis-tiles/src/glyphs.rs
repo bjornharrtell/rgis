@@ -71,7 +71,14 @@ pub struct Glyph {
     pub height: u32,
     /// Horizontal bearing: ink starts `left` px right of the pen position.
     pub left: i32,
-    /// Vertical bearing: ink's top edge is `top` px above the baseline.
+    /// Vertical bearing: the *signed* Y offset (screen/bitmap convention --
+    /// down is positive) from the baseline to the ink's top edge. Real
+    /// glyph-PBF data makes this negative for ordinary upright glyphs
+    /// (ink rises *above* the baseline), e.g. digits in "Noto Sans
+    /// Regular" are `top: -9` -- it is NOT a positive "how many px above
+    /// the baseline" magnitude, despite reading that way at a glance (a
+    /// real bug in `rgis-app`'s label baseline centering once assumed
+    /// exactly that; see `glyph_run_baseline_offset` there).
     pub top: i32,
     /// Pen advance to the next glyph.
     pub advance: u32,
@@ -363,10 +370,15 @@ mod tests {
         // 'A' (U+0041): known metrics from manual inspection of this
         // fixture, checked so a decoder regression (e.g. buffer/metrics
         // mixed up) is caught even though visual rendering can't be
-        // asserted here.
+        // asserted here. `top` is negative -- ink rises *above* the
+        // baseline in this glyph-PBF convention, not a positive
+        // "how far above" magnitude (a real bug in `rgis-app`'s label
+        // baseline centering once assumed the latter; see
+        // `glyph_run_baseline_offset` there).
         let a = glyphs.get(&65).expect("'A' glyph present");
         assert_eq!(a.width, 15);
         assert_eq!(a.height, 17);
+        assert_eq!(a.top, -9);
         assert_eq!(
             a.bitmap.len() as u32,
             (a.width + 2 * GLYPH_BUFFER) * (a.height + 2 * GLYPH_BUFFER)

@@ -25,5 +25,14 @@
     "zoom": 12,
     "width": 768,
     "height": 512
+  },
+  {
+    "name": "coast",
+    "description": "Open-water strait with a maritime admin boundary (the Oresund, between Denmark and Sweden) at a mid zoom: exercises the `boundary` layer's `maritime`/`disputed` filters (must exclude maritime-tagged lines) and coastline fills, at a zoom close enough to make stray boundary lines over open water obvious.",
+    "lon": 12.7,
+    "lat": 55.85,
+    "zoom": 9,
+    "width": 768,
+    "height": 512
   }
 ]

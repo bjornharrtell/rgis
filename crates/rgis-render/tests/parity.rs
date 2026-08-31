@@ -498,8 +498,17 @@ fn renders_match_maplibre_gl_js_within_loose_tolerance() {
         // MapLibre's coverage-based antialiasing, which has no such
         // double-blend. None of these is a style-evaluation bug, so the
         // thresholds below are calibrated with headroom for them.
-        const MAX_MEAN_ABS_DIFF: f64 = 30.0;
-        const MAX_GROSS_DIFF_FRACTION: f64 = 0.27;
+        //
+        // These thresholds were tightened after fixing a real bug in
+        // `rgis_core::Viewport::resolution` (it assumed a 256px tile, but
+        // maplibre-gl-js's own camera zoom convention uses 512px --
+        // `MAPLIBRE_TILE_SIZE`/`viewport_matches_maplibre_gl_js_bounds_convention`
+        // in `rgis-core`), which had been showing 4x the real geographic
+        // area for the same nominal zoom and dominated every viewport's
+        // diff (typical `gross_diff_fraction` dropped from ~20% to ~1-4%
+        // once fixed).
+        const MAX_MEAN_ABS_DIFF: f64 = 15.0;
+        const MAX_GROSS_DIFF_FRACTION: f64 = 0.10;
         if stats.mean_abs_diff > MAX_MEAN_ABS_DIFF
             || stats.gross_diff_fraction > MAX_GROSS_DIFF_FRACTION
         {
