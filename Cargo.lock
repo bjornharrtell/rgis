@@ -3180,6 +3180,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rearcut"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a7e9bd13551d45c68975390bcb5e8a7f13bf4794165699643808add8d435464"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3304,13 +3313,13 @@ name = "rgis-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "earcut",
  "egui-wgpu",
  "epaint",
  "geo-types",
  "image",
  "lru",
  "pollster 0.4.0",
+ "rearcut",
  "rgis-core",
  "rgis-style",
  "rgis-tiles",

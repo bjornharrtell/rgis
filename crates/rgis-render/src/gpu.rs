@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use lru::LruCache;
 use rgis_tiles::{GLYPH_BUFFER, Glyph, TileCoord, glyph_range_start};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use wgpu::util::DeviceExt;
 
 use crate::basemap::{LineVertex, TileMesh};
@@ -152,6 +152,9 @@ struct GlyphAtlas {
     cursor_y: u32,
     shelf_height: u32,
     packed: FxHashMap<(String, u32), AtlasRect>,
+    /// Whether the whole texture has had a single initializing zero-fill
+    /// write yet (see `ensure`'s doc comment for why).
+    initialized: bool,
 }
 
 impl GlyphAtlas {
@@ -199,6 +202,7 @@ impl GlyphAtlas {
             cursor_y: 0,
             shelf_height: 0,
             packed: FxHashMap::default(),
+            initialized: false,
         }
     }
 
@@ -213,6 +217,44 @@ impl GlyphAtlas {
         let key = (fontstack.to_string(), codepoint);
         if let Some(rect) = self.packed.get(&key).copied() {
             return Some(rect);
+        }
+
+        // WebGL2 (notably Firefox) tracks a texture's initialization state
+        // at the whole-texture level: the very first write to it -- even
+        // one covering the whole surface -- is otherwise a `texSubImage`
+        // into storage the browser still considers uninitialized, which it
+        // silently (and slowly) full-clears itself first, logging "Texture
+        // has not been initialized prior to a partial upload"/"is incurring
+        // lazy initialization". Since every glyph after the very first one
+        // packed here is written as a small sub-rectangle of this shared
+        // atlas, without this explicit upfront zero-fill *every single
+        // glyph* would otherwise be the "first write" from the browser's
+        // point of view for that region and could still trigger it; doing
+        // one full-surface write covering the whole atlas immediately marks
+        // the entire texture initialized so subsequent per-glyph partial
+        // uploads don't re-trigger the browser's implicit clear.
+        if !self.initialized {
+            let zeros = vec![0u8; (self.size * self.size) as usize];
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self._texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &zeros,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.size),
+                    rows_per_image: Some(self.size),
+                },
+                wgpu::Extent3d {
+                    width: self.size,
+                    height: self.size,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.initialized = true;
         }
 
         let w = glyph.width + 2 * GLYPH_BUFFER;
@@ -318,13 +360,36 @@ pub struct MapRenderResources {
     tile_pipeline: wgpu::RenderPipeline,
     tile_bind_group_layout: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
-    tile_textures: FxHashMap<u64, TileGpuTexture>,
+    /// Bounded LRU cache (see `TILE_TEXTURE_CACHE_SIZE`), *not* dropped
+    /// wholesale each frame for tiles that happen to be off-screen: raster
+    /// tile textures used to be pruned down to exactly the current frame's
+    /// visible set, so a tile scrolling briefly out of view and back (very
+    /// common while panning) forced its GPU texture to be recreated and
+    /// re-uploaded from scratch. Besides the redundant upload cost, WebGL2
+    /// (Firefox especially) treats every brand-new texture's first write as
+    /// uninitialized and forces a full-texture clear before the partial
+    /// `texSubImage`, logging "Texture has not been initialized prior to a
+    /// partial upload" -- so constant recreation during pan/zoom meant
+    /// constant forced clears, worsening exactly the perf/memory symptoms
+    /// panning was showing. Keeping recently-used-but-currently-offscreen
+    /// tiles cached (evicted only once the LRU actually fills up) avoids
+    /// that churn.
+    tile_textures: LruCache<u64, TileGpuTexture>,
     /// Raster tiles' quad vertices, rewritten (not reallocated, unless the
     /// visible tile count grows) every frame.
     tile_vertex_buffer: GrowableBuffer,
-    /// `UNIT_QUAD_INDICES` uploaded once -- every raster tile quad shares
-    /// the same index pattern, so this never changes after `new`.
-    tile_index_buffer: wgpu::Buffer,
+    /// Per-tile absolute (non-shared) quad indices, rewritten every frame
+    /// alongside `tile_vertex_buffer`. Each tile's 6 indices point at its
+    /// own 4 vertices directly (`i*4 + 0/1/2/3`) rather than reusing a
+    /// single shared unit-quad index pattern via `draw_indexed`'s
+    /// `base_vertex` parameter: WebGL2 only supports a nonzero
+    /// `base_vertex` through the `ANGLE_base_vertex_base_instance`
+    /// extension, which isn't reliably available (e.g. on Firefox), and
+    /// `wgpu`'s GL backend panics ("Draw elements instanced base vertex is
+    /// not supported") without it. Baking absolute indices in here keeps
+    /// every tile's draw call to a plain `base_vertex = 0` while still only
+    /// binding the vertex/index buffers once per pass (not once per tile).
+    tile_index_buffer: GrowableBuffer,
     /// Background quad + user vector layers' geometry, rewritten every
     /// frame.
     scene_vertex_buffer: GrowableBuffer,
@@ -501,12 +566,6 @@ impl MapRenderResources {
             GLYPH_ATLAS_SIZE,
         );
 
-        let tile_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rgis-tile-indices"),
-            contents: bytemuck::cast_slice(&UNIT_QUAD_INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
         Self {
             vector_pipeline,
             screen_uniform_buffer,
@@ -524,12 +583,14 @@ impl MapRenderResources {
             tile_pipeline,
             tile_bind_group_layout,
             tile_sampler,
-            tile_textures: FxHashMap::default(),
+            tile_textures: LruCache::new(
+                std::num::NonZeroUsize::new(TILE_TEXTURE_CACHE_SIZE).unwrap(),
+            ),
             tile_vertex_buffer: GrowableBuffer::new(
                 wgpu::BufferUsages::VERTEX,
                 "rgis-tile-vertices",
             ),
-            tile_index_buffer,
+            tile_index_buffer: GrowableBuffer::new(wgpu::BufferUsages::INDEX, "rgis-tile-indices"),
             scene_vertex_buffer: GrowableBuffer::new(
                 wgpu::BufferUsages::VERTEX,
                 "rgis-vector-vertices",
@@ -559,7 +620,9 @@ impl MapRenderResources {
     }
 
     fn ensure_tile_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tile: &TileDraw) {
-        if self.tile_textures.contains_key(&tile.key) {
+        if self.tile_textures.get(&tile.key).is_some() {
+            // Already cached; `get` (rather than `peek`) promotes it to
+            // most-recently-used so it isn't the next thing evicted.
             return;
         }
 
@@ -611,14 +674,7 @@ impl MapRenderResources {
         });
 
         self.tile_textures
-            .insert(tile.key, TileGpuTexture { bind_group });
-    }
-
-    /// Drops cached tile textures whose key wasn't requested this frame, so
-    /// the GPU-side cache tracks whatever `rgis-tiles`'s CPU-side LRU cache
-    /// currently holds instead of growing without bound.
-    fn evict_stale_tiles(&mut self, live_keys: &FxHashSet<u64>) {
-        self.tile_textures.retain(|key, _| live_keys.contains(key));
+            .put(tile.key, TileGpuTexture { bind_group });
     }
 
     /// Uploads a basemap tile's fill + line meshes to the GPU once; a no-op
@@ -696,6 +752,12 @@ const GLYPH_ATLAS_SIZE: u32 = 2048;
 /// screen (the common case during panning) don't need re-uploading if the
 /// user pans back before they'd be evicted.
 const TILE_GPU_MESH_CACHE_SIZE: usize = 512;
+
+/// Number of raster-tile (and sprite icon) GPU textures kept alive at once
+/// -- see `MapRenderResources::tile_textures`'s docs for why this needs to
+/// outlive a single frame's visible set rather than being pruned down to it
+/// every frame.
+const TILE_TEXTURE_CACHE_SIZE: usize = 256;
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment.max(1)) * alignment.max(1)
@@ -837,11 +899,9 @@ impl egui_wgpu::CallbackTrait for MapCallback {
 
         resources.update_screen_size(queue, self.width, self.height);
 
-        let live_keys: FxHashSet<u64> = self.tiles.iter().map(|tile| tile.key).collect();
         for tile in &self.tiles {
             resources.ensure_tile_texture(device, queue, tile);
         }
-        resources.evict_stale_tiles(&live_keys);
 
         for draw in &self.basemap_tiles {
             resources.ensure_basemap_tile_buffer(device, draw.coord, &draw.mesh);
@@ -887,7 +947,8 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             .write(device, queue, bytemuck::cast_slice(&self.mesh.indices));
 
         let mut tile_vertices = Vec::with_capacity(self.tiles.len() * 4);
-        for tile in &self.tiles {
+        let mut tile_indices = Vec::with_capacity(self.tiles.len() * 6);
+        for (i, tile) in self.tiles.iter().enumerate() {
             let [x, y, w, h] = tile.rect;
             let [u0, v0, u1, v1] = tile.uv_rect;
             let opacity = tile.opacity;
@@ -911,10 +972,15 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 uv: [u0, v1],
                 opacity,
             });
+            let base = (i * 4) as u32;
+            tile_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
         resources
             .tile_vertex_buffer
             .write(device, queue, bytemuck::cast_slice(&tile_vertices));
+        resources
+            .tile_index_buffer
+            .write(device, queue, bytemuck::cast_slice(&tile_indices));
 
         let mut text_vertices = Vec::with_capacity(self.labels.len() * 4);
         let mut text_indices = Vec::with_capacity(self.labels.len() * 6);
@@ -1024,21 +1090,22 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         // second pass further below (after basemap/vector layers), since
         // symbol icons must render above everything else, not underneath
         // it -- see `frame.raster_tile_count`.
-        if let Some(tile_vertex_slice) = resources.tile_vertex_buffer.slice() {
+        if let (Some(tile_vertex_slice), Some(tile_index_slice)) = (
+            resources.tile_vertex_buffer.slice(),
+            resources.tile_index_buffer.slice(),
+        ) {
             render_pass.set_pipeline(&resources.tile_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
             render_pass.set_vertex_buffer(0, tile_vertex_slice);
-            render_pass.set_index_buffer(
-                resources.tile_index_buffer.slice(..),
-                wgpu::IndexFormat::Uint16,
-            );
+            render_pass.set_index_buffer(tile_index_slice, wgpu::IndexFormat::Uint32);
             for (i, key) in frame.tile_keys[..frame.raster_tile_count as usize]
                 .iter()
                 .enumerate()
             {
-                if let Some(texture) = resources.tile_textures.get(key) {
+                if let Some(texture) = resources.tile_textures.peek(key) {
                     render_pass.set_bind_group(1, &texture.bind_group, &[]);
-                    render_pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
+                    let index_start = (i * 6) as u32;
+                    render_pass.draw_indexed(index_start..index_start + 6, 0, 0..1);
                 }
             }
         }
@@ -1168,24 +1235,23 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         // the very top of this function -- just a later, disjoint slice of
         // `frame.tile_keys`/the vertex buffer (indices
         // `raster_tile_count..tile_keys.len()`).
-        if let Some(tile_vertex_slice) = resources.tile_vertex_buffer.slice()
-            && (frame.raster_tile_count as usize) < frame.tile_keys.len()
+        if let (Some(tile_vertex_slice), Some(tile_index_slice)) = (
+            resources.tile_vertex_buffer.slice(),
+            resources.tile_index_buffer.slice(),
+        ) && (frame.raster_tile_count as usize) < frame.tile_keys.len()
         {
             render_pass.set_pipeline(&resources.tile_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
             render_pass.set_vertex_buffer(0, tile_vertex_slice);
-            render_pass.set_index_buffer(
-                resources.tile_index_buffer.slice(..),
-                wgpu::IndexFormat::Uint16,
-            );
+            render_pass.set_index_buffer(tile_index_slice, wgpu::IndexFormat::Uint32);
             for (i, key) in frame.tile_keys[frame.raster_tile_count as usize..]
                 .iter()
                 .enumerate()
             {
-                if let Some(texture) = resources.tile_textures.get(key) {
+                if let Some(texture) = resources.tile_textures.peek(key) {
                     render_pass.set_bind_group(1, &texture.bind_group, &[]);
-                    let vertex_offset = (frame.raster_tile_count as usize + i) * 4;
-                    render_pass.draw_indexed(0..6, vertex_offset as i32, 0..1);
+                    let index_start = ((frame.raster_tile_count as usize + i) * 6) as u32;
+                    render_pass.draw_indexed(index_start..index_start + 6, 0, 0..1);
                 }
             }
         }

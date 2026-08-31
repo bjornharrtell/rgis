@@ -6,11 +6,11 @@
 //! indexed draw call.
 
 use bytemuck::{Pod, Zeroable};
-use earcut::Earcut;
 use geo_types::{
     Coord, Geometry, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
     Triangle,
 };
+use rearcut::Earcut;
 use rgis_core::{Layer, Viewport};
 
 #[repr(C)]
@@ -57,8 +57,9 @@ pub fn build_scene_mesh_with_offset(
 
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    let mut earcut: Earcut<f32> = Earcut::new();
+    let mut earcut: Earcut = Earcut::new();
     let mut earcut_buf: Vec<u32> = Vec::new();
+    let mut earcut_flat: Vec<f64> = Vec::new();
 
     for layer in visible_layers {
         let mut ctx = LayerTessCtx {
@@ -68,6 +69,7 @@ pub fn build_scene_mesh_with_offset(
             indices: &mut indices,
             earcut: &mut earcut,
             earcut_buf: &mut earcut_buf,
+            earcut_flat: &mut earcut_flat,
             fill_color: color_to_array(layer.style.fill),
             stroke_color: color_to_array(layer.style.stroke),
             stroke_width: layer.style.stroke_width.max(0.1),
@@ -86,8 +88,9 @@ struct LayerTessCtx<'a> {
     offset: [f32; 2],
     vertices: &'a mut Vec<Vertex>,
     indices: &'a mut Vec<u32>,
-    earcut: &'a mut Earcut<f32>,
+    earcut: &'a mut Earcut,
     earcut_buf: &'a mut Vec<u32>,
+    earcut_flat: &'a mut Vec<f64>,
     fill_color: [f32; 4],
     stroke_color: [f32; 4],
     stroke_width: f32,
@@ -196,18 +199,21 @@ impl LayerTessCtx<'_> {
         }
 
         let mut data = exterior;
-        let mut hole_indices: Vec<u32> = Vec::new();
+        let mut hole_indices: Vec<usize> = Vec::new();
         for ring in polygon.interiors() {
             let ring = self.ring_points(ring);
             if ring.len() < 3 {
                 continue;
             }
-            hole_indices.push(data.len() as u32);
+            hole_indices.push(data.len());
             data.extend(ring);
         }
 
+        self.earcut_flat.clear();
+        self.earcut_flat
+            .extend(data.iter().flat_map(|&[x, y]| [x as f64, y as f64]));
         self.earcut
-            .earcut(data.iter().copied(), &hole_indices, self.earcut_buf);
+            .earcut_into(self.earcut_flat, &hole_indices, 2, self.earcut_buf);
         if self.earcut_buf.is_empty() {
             return;
         }

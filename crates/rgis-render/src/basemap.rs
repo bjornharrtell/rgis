@@ -10,8 +10,8 @@
 //! specific to that style beyond that default.
 
 use bytemuck::{Pod, Zeroable};
-use earcut::Earcut;
 use geo_types::{Geometry, LineString, Polygon};
+use rearcut::Earcut;
 use rgis_core::{EARTH_HALF_CIRC, Viewport};
 use rgis_style::{Color, EvalContext, Layer, StyleSheet};
 use rgis_tiles::{TileCoord, VectorFeature, VectorTile};
@@ -280,8 +280,9 @@ fn eval_line_paint(layer: &Layer, ctx: &EvalContext) -> ([f32; 4], f32) {
 /// order, exactly like MapLibre, rather than a fixed hardcoded pass order.
 pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) -> TileMesh {
     let mut fill_mesh = SceneMesh::default();
-    let mut earcut: Earcut<f32> = Earcut::new();
+    let mut earcut: Earcut = Earcut::new();
     let mut earcut_buf: Vec<u32> = Vec::new();
+    let mut earcut_flat: Vec<f64> = Vec::new();
     let mut lines = LineMesh::default();
     let zoom = coord.z as f64;
     let tile_size_m = TileMercatorBounds::for_coord(coord).size;
@@ -332,6 +333,7 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
                 &mut fill_mesh,
                 &mut earcut,
                 &mut earcut_buf,
+                &mut earcut_flat,
                 feature,
                 &ctx,
                 fill_color,
@@ -637,19 +639,34 @@ impl TileContext {
 
 fn append_fill(
     fill_mesh: &mut SceneMesh,
-    earcut: &mut Earcut<f32>,
+    earcut: &mut Earcut,
     earcut_buf: &mut Vec<u32>,
+    earcut_flat: &mut Vec<f64>,
     feature: &VectorFeature,
     ctx: &TileContext,
     color: [f32; 4],
 ) {
     match &feature.geometry {
-        Geometry::Polygon(polygon) => {
-            fill_polygon(fill_mesh, earcut, earcut_buf, polygon, ctx, color)
-        }
+        Geometry::Polygon(polygon) => fill_polygon(
+            fill_mesh,
+            earcut,
+            earcut_buf,
+            earcut_flat,
+            polygon,
+            ctx,
+            color,
+        ),
         Geometry::MultiPolygon(polygons) => {
             for polygon in &polygons.0 {
-                fill_polygon(fill_mesh, earcut, earcut_buf, polygon, ctx, color);
+                fill_polygon(
+                    fill_mesh,
+                    earcut,
+                    earcut_buf,
+                    earcut_flat,
+                    polygon,
+                    ctx,
+                    color,
+                );
             }
         }
         _ => {}
@@ -658,8 +675,9 @@ fn append_fill(
 
 fn fill_polygon(
     fill_mesh: &mut SceneMesh,
-    earcut: &mut Earcut<f32>,
+    earcut: &mut Earcut,
     earcut_buf: &mut Vec<u32>,
+    earcut_flat: &mut Vec<f64>,
     polygon: &Polygon<i32>,
     ctx: &TileContext,
     color: [f32; 4],
@@ -668,17 +686,19 @@ fn fill_polygon(
     if data.len() < 3 {
         return;
     }
-    let mut hole_indices: Vec<u32> = Vec::new();
+    let mut hole_indices: Vec<usize> = Vec::new();
     for ring in polygon.interiors() {
         let ring = ring_points_no_close(ring, ctx);
         if ring.len() < 3 {
             continue;
         }
-        hole_indices.push(data.len() as u32);
+        hole_indices.push(data.len());
         data.extend(ring);
     }
 
-    earcut.earcut(data.iter().copied(), &hole_indices, earcut_buf);
+    earcut_flat.clear();
+    earcut_flat.extend(data.iter().flat_map(|&[x, y]| [x as f64, y as f64]));
+    earcut.earcut_into(earcut_flat, &hole_indices, 2, earcut_buf);
     if earcut_buf.is_empty() {
         return;
     }
