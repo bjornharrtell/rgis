@@ -59,6 +59,19 @@ impl rgis_style::FeatureProperties for VectorFeature {
             PropertyValue::Bool(b) => Some(rgis_style::Value::Bool(*b)),
         }
     }
+
+    fn geometry_type(&self) -> Option<&str> {
+        // Style spec `["geometry-type"]` only distinguishes Point/
+        // LineString/Polygon -- multi-geometries collapse into their
+        // single-geometry counterpart's category (matching MapLibre).
+        use geo_types::Geometry;
+        Some(match &self.geometry {
+            Geometry::Point(_) | Geometry::MultiPoint(_) => "Point",
+            Geometry::LineString(_) | Geometry::MultiLineString(_) => "LineString",
+            Geometry::Polygon(_) | Geometry::MultiPolygon(_) => "Polygon",
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

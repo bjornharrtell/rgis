@@ -13,6 +13,16 @@ use crate::value::{Color, Value};
 /// `VectorFeature`) so this crate doesn't need to depend on it.
 pub trait FeatureProperties {
     fn get_property(&self, key: &str) -> Option<Value>;
+
+    /// The feature's geometry type, one of `"Point"`, `"LineString"`, or
+    /// `"Polygon"` (multi-geometries collapse to the same category), for
+    /// the style spec's `["geometry-type"]` expression. Defaults to `None`
+    /// (`geometry-type` evaluates to `Null`) so existing implementers
+    /// (test fixtures, anything with no real geometry) don't need to
+    /// implement this to keep compiling.
+    fn geometry_type(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Everything an expression needs to evaluate: the current zoom level and
@@ -54,6 +64,13 @@ pub enum Expr {
     Has(String),
     NotHas(String),
     Zoom,
+    /// `["geometry-type"]` -- the current feature's geometry type as one
+    /// of the style spec's three values (`"Point"`, `"LineString"`,
+    /// `"Polygon"`; multi-geometries collapse into the same category as
+    /// their single-geometry counterpart, matching MapLibre's own
+    /// behavior). `Null` outside a feature context (e.g. `background-*`
+    /// properties, which have no associated feature).
+    GeometryType,
     /// `["interpolate", [type], input, stop1, val1, stop2, val2, ...]`
     Interpolate {
         interpolation: Interpolation,
@@ -158,6 +175,7 @@ pub fn parse(json: &Json) -> Result<Expr, ExprError> {
                 .to_string(),
         ),
         "zoom" => Expr::Zoom,
+        "geometry-type" => Expr::GeometryType,
         "interpolate" => {
             let interp_spec = args
                 .first()
@@ -396,6 +414,11 @@ impl Expr {
                 Value::Bool(ctx.feature.and_then(|f| f.get_property(key)).is_none())
             }
             Expr::Zoom => Value::Number(ctx.zoom),
+            Expr::GeometryType => ctx
+                .feature
+                .and_then(|f| f.geometry_type())
+                .map(|s| Value::String(s.to_string()))
+                .unwrap_or(Value::Null),
             Expr::Interpolate {
                 interpolation,
                 input,
