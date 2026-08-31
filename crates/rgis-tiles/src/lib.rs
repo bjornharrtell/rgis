@@ -57,6 +57,18 @@ pub trait TileSource: Send + Sync + 'static {
     fn tile_size_px(&self) -> u32 {
         256
     }
+    /// Disk-cache subdirectory unique to this source. **Must** be distinct
+    /// per distinct tile *content* (i.e. per source/URL-template), not just
+    /// per `TileSource` impl: two different `StyleRasterSource`s (e.g. a
+    /// style's own raster layer vs. a differently-styled one) still cover
+    /// the exact same `(z, x, y)` coordinate space, so without this the
+    /// on-disk cache -- keyed only by coordinate -- would silently return
+    /// one source's cached bytes for a request from a completely different
+    /// source sharing that coordinate (confirmed: this exact collision
+    /// served an old, unrelated flat land/water raster tile set in place of
+    /// `liberty`'s `natural_earth` shaded-relief tiles, since both were
+    /// cached under the same `tiles/{z}/{x}/{y}.png` paths).
+    fn cache_namespace(&self) -> &str;
 }
 
 pub struct OsmTileSource;
@@ -75,6 +87,9 @@ impl TileSource for OsmTileSource {
     fn max_zoom(&self) -> u8 {
         19
     }
+    fn cache_namespace(&self) -> &str {
+        "osm"
+    }
 }
 
 /// A `TileSource` backed by a `"type": "raster"` style source's own
@@ -85,6 +100,11 @@ pub struct StyleRasterSource {
     template: String,
     max_zoom: u8,
     tile_size: u32,
+    /// Precomputed `cache_namespace()` value -- a short hash of `template`,
+    /// so distinct raster sources (distinguished by their URL template)
+    /// never collide in the shared on-disk tile cache. See
+    /// [`TileSource::cache_namespace`]'s docs for why this matters.
+    cache_namespace: String,
 }
 
 impl StyleRasterSource {
@@ -92,10 +112,15 @@ impl StyleRasterSource {
     /// aren't published beyond it; overzooming reuses the last level, same
     /// as [`visible_tiles_for_zoom`]'s clamping).
     pub fn new(template: String, max_zoom: u8, tile_size: u32) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        template.hash(&mut hasher);
+        let cache_namespace = format!("raster-{:016x}", hasher.finish());
         Self {
             template,
             max_zoom,
             tile_size,
+            cache_namespace,
         }
     }
 }
@@ -116,6 +141,9 @@ impl TileSource for StyleRasterSource {
     fn tile_size_px(&self) -> u32 {
         self.tile_size
     }
+    fn cache_namespace(&self) -> &str {
+        &self.cache_namespace
+    }
 }
 
 // ── Disk cache helpers (native only; the browser has no filesystem) ─────────
@@ -131,22 +159,23 @@ mod disk_cache {
         ProjectDirs::from("rs", "", "rgis").map(|d| d.cache_dir().join("tiles"))
     }
 
-    fn disk_path(coord: TileCoord) -> Option<PathBuf> {
+    fn disk_path(namespace: &str, coord: TileCoord) -> Option<PathBuf> {
         cache_dir().map(|d| {
-            d.join(coord.z.to_string())
+            d.join(namespace)
+                .join(coord.z.to_string())
                 .join(coord.x.to_string())
                 .join(format!("{}.png", coord.y))
         })
     }
 
-    pub fn read(coord: TileCoord) -> Option<RgbaImage> {
-        let path = disk_path(coord)?;
+    pub fn read(namespace: &str, coord: TileCoord) -> Option<RgbaImage> {
+        let path = disk_path(namespace, coord)?;
         let bytes = std::fs::read(&path).ok()?;
         image::load_from_memory(&bytes).ok().map(|i| i.to_rgba8())
     }
 
-    pub fn write(coord: TileCoord, bytes: &[u8]) {
-        if let Some(path) = disk_path(coord) {
+    pub fn write(namespace: &str, coord: TileCoord, bytes: &[u8]) {
+        if let Some(path) = disk_path(namespace, coord) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -160,11 +189,11 @@ mod disk_cache {
     use super::TileCoord;
     use image::RgbaImage;
 
-    pub fn read(_coord: TileCoord) -> Option<RgbaImage> {
+    pub fn read(_namespace: &str, _coord: TileCoord) -> Option<RgbaImage> {
         None
     }
 
-    pub fn write(_coord: TileCoord, _bytes: &[u8]) {}
+    pub fn write(_namespace: &str, _coord: TileCoord, _bytes: &[u8]) {}
 }
 
 // ── TileCache (in-memory LRU) ─────────────────────────────────────────────────
@@ -241,7 +270,7 @@ impl TileFetcher {
             return;
         }
 
-        if let Some(img) = disk_cache::read(coord) {
+        if let Some(img) = disk_cache::read(self.source.cache_namespace(), coord) {
             let arc = self.cache.lock().unwrap().insert(coord, img);
             let _ = self.sender.try_send(TileReady { coord, image: arc });
             return;
@@ -250,6 +279,7 @@ impl TileFetcher {
         let cache = Arc::clone(&self.cache);
         let sender = self.sender.clone();
         let request = ehttp::Request::get(self.source.url(coord));
+        let namespace = self.source.cache_namespace().to_string();
 
         ehttp::fetch(request, move |result: ehttp::Result<ehttp::Response>| {
             let Ok(response) = result else { return };
@@ -261,7 +291,7 @@ impl TileFetcher {
             };
             let rgba = img.to_rgba8();
 
-            disk_cache::write(coord, &response.bytes);
+            disk_cache::write(&namespace, coord, &response.bytes);
 
             let arc = cache.lock().unwrap().insert(coord, rgba);
             let _ = sender.try_send(TileReady { coord, image: arc });

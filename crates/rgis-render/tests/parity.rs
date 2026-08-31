@@ -159,6 +159,9 @@ fn build_frame(style: &StyleSheet, viewport: &Viewport) -> MapCallback {
     let mut raster_tiles: Vec<TileDraw> = Vec::new();
     let eval_ctx = EvalContext::new(viewport.zoom);
     for layer in style.layers_of_kind("raster") {
+        if !layer.matches_zoom(viewport.zoom) {
+            continue;
+        }
         let Some(source_id) = &layer.source else {
             continue;
         };
