@@ -966,6 +966,7 @@ impl RgisApp {
             path: Option<Vec<egui::Pos2>>,
             icon: Option<String>,
             icon_size: f32,
+            text_anchor_center: bool,
         }
 
         // Label positions feed the wgpu `MapCallback` (same as basemap
@@ -1012,6 +1013,7 @@ impl RgisApp {
                     }),
                     icon: label.icon.clone(),
                     icon_size: label.icon_size,
+                    text_anchor_center: label.text_anchor_center,
                 });
             }
         }
@@ -1142,7 +1144,22 @@ impl RgisApp {
                     pen_len += glyph.advance as f32 * scale;
                 }
             } else {
-                let baseline_y = label.pos.y + label.font_size * 0.35;
+                // Point label. `text-anchor: "center"` (the style spec's
+                // default, and what every road-shield layer relies on
+                // implicitly by not overriding it) centers the text block
+                // on the anchor using the same real glyph-metrics
+                // `baseline_offset` the line-placed branch above uses --
+                // otherwise a shield's ref number would hang below the
+                // icon badge instead of sitting inside it. Layers that
+                // explicitly anchor elsewhere (place/POI layers set
+                // `text-anchor: "top"` with a `text-offset` to hang the
+                // name below its marker dot) keep the existing tuned
+                // downward offset, unaffected by this.
+                let baseline_y = if label.text_anchor_center {
+                    label.pos.y + baseline_offset
+                } else {
+                    label.pos.y + label.font_size * 0.35
+                };
                 let mut pen_x = label.pos.x - total_advance * 0.5;
 
                 for codepoint in codepoints {

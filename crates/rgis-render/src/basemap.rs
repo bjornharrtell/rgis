@@ -104,6 +104,18 @@ pub struct TileLabel {
     /// Evaluated `icon-size` multiplier applied to the sprite's native
     /// pixel dimensions (`1.0` if the style doesn't specify one).
     pub icon_size: f32,
+    /// Whether the layer's `text-anchor` resolves to the style spec's
+    /// default, `"center"` (true when the layer doesn't set `text-anchor`
+    /// at all, like every road-shield layer -- their ref-number text must
+    /// sit centered *inside* the icon badge). `false` for layers that
+    /// explicitly anchor text away from the point (e.g. place/POI layers
+    /// setting `text-anchor: "top"` with a `text-offset` to hang the name
+    /// below its marker dot) -- the caller uses this to pick vertical
+    /// layout: true-blooded glyph-metrics centering on the anchor point
+    /// for shields, vs. the existing tuned below-the-icon offset for
+    /// place/POI labels. Ignored when `path` is `Some` (line-placed road
+    /// names), which already center on the path using glyph metrics.
+    pub text_anchor_center: bool,
 }
 
 /// A line/stroke vertex: `center` is the tile-local-metres position
@@ -521,6 +533,16 @@ fn extract_labels(
                 .eval_string(&eval_ctx)
                 .filter(|s| !s.is_empty());
             let icon_size = layer.layout("icon-size").eval_f64(&eval_ctx, 1.0) as f32;
+            // `text-anchor` defaults to `"center"` per the style spec when
+            // a layer doesn't set it at all -- true for every road-shield
+            // layer (their ref number must sit centered inside the icon
+            // badge), but place/POI layers explicitly override it (e.g.
+            // `"top"` with a `text-offset` to hang the name below its
+            // marker dot) -- see `TileLabel::text_anchor_center`.
+            let text_anchor_center = layer
+                .layout("text-anchor")
+                .eval_string(&eval_ctx)
+                .is_none_or(|a| a == "center");
 
             // No full mapbox symbol-sort-key/collision port here -- this
             // approximates it generically (without hardcoding per-source-
@@ -586,6 +608,7 @@ fn extract_labels(
                     path: if curve { Some(points) } else { None },
                     icon: if curve { None } else { icon_image },
                     icon_size: if curve { 1.0 } else { icon_size },
+                    text_anchor_center,
                 });
             } else {
                 let Geometry::Point(p) = &feature.geometry else {
@@ -620,6 +643,7 @@ fn extract_labels(
                     path: None,
                     icon: icon_image,
                     icon_size,
+                    text_anchor_center,
                 });
             }
         }
@@ -1347,6 +1371,15 @@ mod tests {
             "a shield's ref-number text should stay upright, not curve along the road"
         );
         assert!(!shield.text.is_empty());
+        // Regression test for a real bug: shields don't set `text-anchor`
+        // at all, so it must resolve to the spec default `"center"` --
+        // the caller uses this to center the ref number's glyph-metrics
+        // baseline on the icon badge instead of hanging it below, like
+        // place/POI labels do.
+        assert!(
+            shield.text_anchor_center,
+            "a road shield's text-anchor should resolve to the default \"center\""
+        );
 
         // A plain road-name label (no icon) on the same fixture should
         // still curve along its road, unaffected by the shield fix above.
@@ -1449,6 +1482,95 @@ mod tests {
             .find(|l| l.text == "Metropolis" && l.fontstack == DEFAULT_FONTSTACK)
             .expect("expected a city label using the default fontstack");
         assert_eq!(city_label.fontstack, DEFAULT_FONTSTACK);
+    }
+
+    /// `text-anchor` should resolve to the spec default `"center"` when a
+    /// layer doesn't set it (matching every road-shield layer), but a
+    /// layer that explicitly anchors text elsewhere -- e.g. a place/POI
+    /// layer using `text-anchor: "top"` with a `text-offset` to hang a
+    /// name below its marker dot -- should be reported as non-center so
+    /// the caller keeps hanging that text below the icon instead of
+    /// centering it on top of it.
+    #[test]
+    fn text_anchor_defaults_to_center_but_layers_can_override_it() {
+        let style_json = serde_json::json!({
+            "version": 8,
+            "layers": [
+                {
+                    "id": "shield-like",
+                    "type": "symbol",
+                    "source": "test",
+                    "source-layer": "transportation_name",
+                    "layout": {
+                        "text-field": ["get", "ref"],
+                        "icon-image": "road_2"
+                    }
+                },
+                {
+                    "id": "poi-like",
+                    "type": "symbol",
+                    "source": "test",
+                    "source-layer": "poi",
+                    "layout": {
+                        "text-field": ["get", "name"],
+                        "icon-image": "circle_11_black",
+                        "text-anchor": "top",
+                        "text-offset": [0, 0.6]
+                    }
+                }
+            ]
+        });
+        let style = StyleSheet::parse(&style_json.to_string()).expect("valid style");
+
+        let point_feature = |name: &str, refv: &str| VectorFeature {
+            geometry: Geometry::Point(geo_types::Point::new(100, 100)),
+            properties: HashMap::from([
+                (
+                    "name".to_string(),
+                    rgis_tiles::PropertyValue::String(name.to_string()),
+                ),
+                (
+                    "ref".to_string(),
+                    rgis_tiles::PropertyValue::String(refv.to_string()),
+                ),
+            ]),
+        };
+        let tile = VectorTile {
+            layers: vec![
+                VectorTileLayer {
+                    name: "transportation_name".to_string(),
+                    extent: 4096,
+                    features: vec![point_feature("", "A1")],
+                },
+                VectorTileLayer {
+                    name: "poi".to_string(),
+                    extent: 4096,
+                    features: vec![point_feature("Cafe", "")],
+                },
+            ],
+        };
+        let coord = TileCoord { z: 14, x: 0, y: 0 };
+        let mesh = build_tile_mesh(&tile, coord, &style);
+
+        let shield = mesh
+            .labels
+            .iter()
+            .find(|l| l.text == "A1")
+            .expect("expected the shield-like label");
+        assert!(
+            shield.text_anchor_center,
+            "a layer with no text-anchor should default to center"
+        );
+
+        let poi = mesh
+            .labels
+            .iter()
+            .find(|l| l.text == "Cafe")
+            .expect("expected the poi-like label");
+        assert!(
+            !poi.text_anchor_center,
+            "a layer with an explicit non-center text-anchor should not report center"
+        );
     }
 
     /// Vertex/index count contributed by exactly one bevel join triangle.
