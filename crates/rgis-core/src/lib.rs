@@ -101,7 +101,20 @@ impl Bounds {
 /// Viewport in Web Mercator (EPSG:3857) metres.
 ///
 /// `center` is in EPSG:3857 metres.
-/// `zoom`   is a slippy-map zoom level (0 = whole world fits in 256 px).
+/// `zoom`   is a MapLibre/Mapbox GL "camera" zoom level: at an integer zoom
+///          `z`, one native `z` vector/raster tile spans exactly
+///          [`MAPLIBRE_TILE_SIZE`] screen pixels (0 = whole world fits in
+///          that many px). This is the same zoom convention
+///          maplibre-gl-js/mapbox-gl-js use internally (`Transform.tileSize
+///          = 512`), which is *not* the same as the "OSM/Leaflet" slippy-map
+///          convention (256 px) despite using identical tile *indexing* --
+///          getting this wrong doesn't move or distort anything, but it
+///          does make the map appear zoomed out by exactly one level
+///          relative to the real MapLibre renderer for the same nominal
+///          zoom number, since every zoom-gated style rule (minzoom/maxzoom,
+///          `interpolate`/`step` on `["zoom"]`, line widths, label sizes...)
+///          is evaluated using this same `zoom` value -- see the regression
+///          test `viewport_matches_maplibre_gl_js_bounds_convention`.
 /// `width_px` / `height_px` are the canvas size in device pixels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Viewport {
@@ -114,10 +127,25 @@ pub struct Viewport {
 /// Earth half-circumference in Web Mercator metres (EPSG:3857 extent).
 pub const EARTH_HALF_CIRC: f64 = 20_037_508.342_789_244;
 
+/// Screen pixels spanned by one native tile at an integer zoom level, in
+/// MapLibre/Mapbox GL's own zoom convention (`Transform.tileSize` in
+/// maplibre-gl-js/mapbox-gl-js) -- NOT 256, despite most vector/raster tile
+/// *indexing* schemes (including OpenFreeMap's own `{z}/{x}/{y}` URLs)
+/// still following the traditional 256px-tile XYZ addressing for which
+/// tile to fetch. Style documents authored for MapLibre (zoom-interpolated
+/// paint/layout expressions, minzoom/maxzoom cutoffs, label sizing) are
+/// calibrated assuming this 512px scale, so [`Viewport::resolution`] must
+/// use it too for the `zoom` value fed into style evaluation to mean what
+/// the style author intended -- using 256 here previously made every zoom
+/// number act as if it were one level more zoomed out than intended (e.g.
+/// admin-boundary lines that should still be thin/faded at a given zoom
+/// rendered at their full, more-zoomed-in opacity/width instead).
+pub const MAPLIBRE_TILE_SIZE: f64 = 512.0;
+
 impl Viewport {
-    /// Metres per pixel at the current zoom level (tile size = 256 px).
+    /// Metres per pixel at the current zoom level (see [`MAPLIBRE_TILE_SIZE`]).
     pub fn resolution(&self) -> f64 {
-        (2.0 * EARTH_HALF_CIRC) / (256.0 * 2_f64.powf(self.zoom))
+        (2.0 * EARTH_HALF_CIRC) / (MAPLIBRE_TILE_SIZE * 2_f64.powf(self.zoom))
     }
 
     /// Convert a Web Mercator coordinate to screen pixel position (top-left origin).
@@ -167,7 +195,7 @@ impl Viewport {
         let res_y = h / (self.height_px as f64 * 0.8);
         let res = res_x.max(res_y);
         // zoom = log2( world_width / (tile_size_px * res) )
-        self.zoom = ((2.0 * EARTH_HALF_CIRC) / (256.0 * res))
+        self.zoom = ((2.0 * EARTH_HALF_CIRC) / (MAPLIBRE_TILE_SIZE * res))
             .log2()
             .clamp(0.0, 22.0);
     }
@@ -356,9 +384,81 @@ mod tests {
             zoom: 0.0,
             ..Default::default()
         };
-        let expected = 2.0 * EARTH_HALF_CIRC / 256.0;
+        let expected = 2.0 * EARTH_HALF_CIRC / MAPLIBRE_TILE_SIZE;
         let diff = (vp.resolution() - expected).abs();
         assert!(diff < 1e-6, "resolution at zoom 0: {diff}");
+    }
+
+    /// Regression test for a real bug: `Viewport::resolution` used to
+    /// assume a 256px tile (the traditional OSM/Leaflet slippy-map
+    /// convention), while maplibre-gl-js's own camera zoom -> world-pixel
+    /// mapping uses 512px tiles (`Transform.tileSize = 512`, verified via
+    /// `map.transform.worldSize`/`tileSize` for this exact center/zoom/size
+    /// against a live maplibre-gl-js instance). Getting this wrong made
+    /// rgis's viewport show *4x* the real MapLibre geographic area (2x
+    /// linear) for the same nominal zoom -- which, since style zoom-gated
+    /// rules (`interpolate`/`step` on `["zoom"]`, minzoom/maxzoom) are
+    /// evaluated using this same `zoom` number, also made every such rule
+    /// fire as if one zoom level more "zoomed in" than the map was actually
+    /// showing (e.g. admin-boundary lines meant to still be thin/faded at a
+    /// given zoom rendering at their fully-opaque, closer-zoom style
+    /// instead).
+    #[test]
+    fn viewport_matches_maplibre_gl_js_bounds_convention() {
+        let center = lonlat_to_mercator(12.7, 55.85);
+        let vp = Viewport {
+            center,
+            zoom: 9.0,
+            width_px: 768,
+            height_px: 512,
+        };
+        // Captured from a live maplibre-gl-js `Map` with
+        // `center: [12.7, 55.85], zoom: 9` and an empty style, via
+        // `map.getBounds().toArray()` (see `tools/parity/README.md`'s
+        // golden generator, which drives the same library).
+        let maplibre_sw = lonlat_to_mercator(12.172656250000955, 55.65214485433083);
+        let maplibre_ne = lonlat_to_mercator(13.227343750000955, 56.0468530044362);
+
+        let half_w = vp.width_px as f64 * vp.resolution() * 0.5;
+        let half_h = vp.height_px as f64 * vp.resolution() * 0.5;
+        let rgis_sw = Coord {
+            x: center.x - half_w,
+            y: center.y - half_h,
+        };
+        let rgis_ne = Coord {
+            x: center.x + half_w,
+            y: center.y + half_h,
+        };
+
+        // A generous tolerance (metres) since maplibre-gl-js's bounds
+        // aren't bit-exact with a from-scratch reimplementation, but the
+        // previous (256px) bug was off by a full 2x in each axis -- tens of
+        // kilometres, not tens of metres.
+        let tol = 1000.0;
+        assert!(
+            (rgis_sw.x - maplibre_sw.x).abs() < tol,
+            "sw.x: rgis={} maplibre={}",
+            rgis_sw.x,
+            maplibre_sw.x
+        );
+        assert!(
+            (rgis_sw.y - maplibre_sw.y).abs() < tol,
+            "sw.y: rgis={} maplibre={}",
+            rgis_sw.y,
+            maplibre_sw.y
+        );
+        assert!(
+            (rgis_ne.x - maplibre_ne.x).abs() < tol,
+            "ne.x: rgis={} maplibre={}",
+            rgis_ne.x,
+            maplibre_ne.x
+        );
+        assert!(
+            (rgis_ne.y - maplibre_ne.y).abs() < tol,
+            "ne.y: rgis={} maplibre={}",
+            rgis_ne.y,
+            maplibre_ne.y
+        );
     }
 
     #[test]

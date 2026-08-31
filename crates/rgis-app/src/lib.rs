@@ -93,8 +93,6 @@ const MAX_TESSELLATIONS_PER_FRAME: usize = 3;
 const ROW_VPAD: f32 = 5.0;
 /// Background fill painted behind a hovered sidebar tree row.
 const ROW_HOVER_FILL: egui::Color32 = egui::Color32::from_gray(40);
-/// MapLibre/OpenFreeMap fontstack name used for all map labels for now.
-const LABEL_FONTSTACK: &str = "Noto Sans Regular";
 
 /// Screen width (logical points) below which the layer list switches from a
 /// docked side panel to a floating overlay toggled by a button, so the map
@@ -961,6 +959,7 @@ impl RgisApp {
             font_size: f32,
             color: [f32; 4],
             halo_color: [f32; 4],
+            fontstack: String,
             angle: f32,
             /// Screen-space road polyline for line-placed labels (see
             /// `TileLabel::path`); `None` for point (place/poi) labels.
@@ -999,6 +998,7 @@ impl RgisApp {
                     font_size: label.font_size,
                     color: label.color,
                     halo_color: label.halo_color,
+                    fontstack: label.fontstack.clone(),
                     angle: label.angle,
                     path: label.path.as_ref().map(|path| {
                         path.iter()
@@ -1022,13 +1022,13 @@ impl RgisApp {
         let mut glyph_bitmaps = GlyphBitmapRanges::default();
         let mut pending_glyphs = false;
         let mut icon_draws = Vec::new();
-        let fontstack = LABEL_FONTSTACK.to_string();
 
         for label in projected {
             if label.text.is_empty() {
                 continue;
             }
 
+            let fontstack = label.fontstack.as_str();
             let mut codepoints = Vec::with_capacity(label.text.chars().count());
             let mut ranges = std::collections::HashMap::new();
             let mut missing = false;
@@ -1036,14 +1036,14 @@ impl RgisApp {
                 let codepoint = ch as u32;
                 codepoints.push(codepoint);
                 let range_start = glyph_range_start(codepoint);
-                let Some(range) = self.glyph_fetcher.get_cached(LABEL_FONTSTACK, codepoint) else {
-                    self.glyph_fetcher.request(LABEL_FONTSTACK, codepoint);
+                let Some(range) = self.glyph_fetcher.get_cached(fontstack, codepoint) else {
+                    self.glyph_fetcher.request(fontstack, codepoint);
                     pending_glyphs = true;
                     missing = true;
                     continue;
                 };
                 if !range.contains_key(&codepoint) {
-                    self.glyph_fetcher.request(LABEL_FONTSTACK, codepoint);
+                    self.glyph_fetcher.request(fontstack, codepoint);
                     pending_glyphs = true;
                     missing = true;
                     continue;
@@ -1131,13 +1131,13 @@ impl RgisApp {
                         rect: [x, y, w, h],
                         anchor: [anchor.x, anchor.y],
                         angle,
-                        fontstack: fontstack.clone(),
+                        fontstack: fontstack.to_string(),
                         codepoint,
                         color: label.color,
                         halo_color: label.halo_color,
                     });
                     glyph_bitmaps
-                        .entry((fontstack.clone(), range_start))
+                        .entry((fontstack.to_string(), range_start))
                         .or_insert_with(|| Arc::clone(range));
                     pen_len += glyph.advance as f32 * scale;
                 }
@@ -1171,13 +1171,13 @@ impl RgisApp {
                         rect: [x, y, w, h],
                         anchor: [label.pos.x, label.pos.y],
                         angle: label.angle,
-                        fontstack: fontstack.clone(),
+                        fontstack: fontstack.to_string(),
                         codepoint,
                         color: label.color,
                         halo_color: label.halo_color,
                     });
                     glyph_bitmaps
-                        .entry((fontstack.clone(), range_start))
+                        .entry((fontstack.to_string(), range_start))
                         .or_insert_with(|| Arc::clone(range));
                     pen_x += glyph.advance as f32 * scale;
                 }

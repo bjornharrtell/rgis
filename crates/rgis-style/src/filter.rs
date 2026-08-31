@@ -122,4 +122,31 @@ mod tests {
         let ctx = EvalContext::with_feature(0.0, &feature);
         assert!(!f.eval(&ctx).as_bool());
     }
+
+    /// Regression test for a real bug: OpenMapTiles' `boundary` layer
+    /// encodes `maritime`/`disputed` as MVT booleans, while liberty-style
+    /// styles exclude them with legacy filters like `["!=", "maritime",
+    /// 1]`. `Value::Bool` vs `Value::Number` used to fall through to a
+    /// string-coercion comparison (`"true"` vs `"1"`), which never matched
+    /// -- so the filter always kept `true`, meaning maritime/EEZ boundary
+    /// lines rendered out in open water instead of being excluded.
+    #[test]
+    fn bool_property_excluded_by_ne_numeric_literal() {
+        let f = parse_filter(&json!(["!=", "maritime", 1])).unwrap();
+        let maritime_feature = feat(&[("maritime", Value::Bool(true))]);
+        let ctx = EvalContext::with_feature(10.0, &maritime_feature);
+        assert!(!f.eval(&ctx).as_bool(), "maritime=true should be excluded");
+
+        let land_feature = feat(&[("maritime", Value::Bool(false))]);
+        let ctx2 = EvalContext::with_feature(10.0, &land_feature);
+        assert!(f.eval(&ctx2).as_bool(), "maritime=false should be kept");
+    }
+
+    #[test]
+    fn bool_property_matches_eq_numeric_literal() {
+        let f = parse_filter(&json!(["==", "disputed", 1])).unwrap();
+        let feature = feat(&[("disputed", Value::Bool(true))]);
+        let ctx = EvalContext::with_feature(10.0, &feature);
+        assert!(f.eval(&ctx).as_bool());
+    }
 }

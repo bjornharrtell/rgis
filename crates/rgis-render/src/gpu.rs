@@ -1133,6 +1133,22 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         // background and the user layers so layers stay on top. Fills are
         // drawn before lines (roads/casings/outlines on top of polygons).
         //
+        // Known parity gap: within each category (fills among themselves,
+        // lines among themselves) draw order matches the style document's
+        // own layer order (see `build_tile_mesh`'s doc comment), but the two
+        // categories are two separate passes/draw calls, so a `line` layer
+        // that comes *before* a later `fill` layer in the style (e.g.
+        // liberty's `park`/`park_outline`, index 2-3, vs. `water`, index
+        // 17) always renders on top of it here, whereas MapLibre would
+        // paint the fill over the line per the style's real order. This
+        // shows up as e.g. a park/reserve outline that dips into a lake or
+        // the sea still being visible there, when it should be hidden
+        // under the water fill painted after it. Fixing this needs
+        // per-layer-interleaved draw calls (or a depth/stencil trick)
+        // instead of one fills-then-lines pass per tile; not attempted
+        // here as it's a much larger rendering-architecture change than a
+        // style-evaluation fix.
+        //
         // Each tile is scissor-clipped to its own screen-space square: MVT
         // tiles include a small "buffer" zone of geometry duplicated a bit
         // past the tile edge (so wide strokes aren't cut off mid-width at
