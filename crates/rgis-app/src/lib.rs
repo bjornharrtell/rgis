@@ -515,6 +515,19 @@ impl RgisApp {
     fn collect_raster_tile_draws(&mut self) -> Vec<rgis_render::TileDraw> {
         let mut draws = Vec::new();
         for layer in self.style.layers_of_kind("raster") {
+            // Respect the layer's own `minzoom`/`maxzoom` visibility range
+            // (distinct from the source's `maxzoom`, which only clamps
+            // which tiles get *fetched*/overzoomed). Without this check a
+            // layer like `natural_earth` (`maxzoom: 7`) keeps drawing its
+            // stretched, overzoomed low-res tile past its intended cutoff,
+            // which is especially visible for tilesets that bake labels
+            // into the raster imagery itself (e.g. Natural Earth's
+            // shaded-relief tiles include country-name labels) -- those
+            // then show up as ghostly duplicate text behind the real
+            // vector labels.
+            if !layer.matches_zoom(self.project.viewport.zoom) {
+                continue;
+            }
             let Some(source_id) = &layer.source else {
                 continue;
             };
@@ -808,6 +821,7 @@ impl RgisApp {
                 let mut mesh = SceneMesh::default();
                 let mut background_index_count = 0;
                 let mut basemap_tiles = Vec::new();
+                let mut fallback_tile_count = 0;
                 if self.project.show_tiles {
                     let mut current_draws = Vec::new();
                     let mut fallback_coords = std::collections::HashSet::new();
@@ -852,6 +866,7 @@ impl RgisApp {
                             });
                         }
                     }
+                    fallback_tile_count = basemap_tiles.len();
                     basemap_tiles.extend(current_draws);
                     mesh = rgis_render::build_background_mesh(&self.project.viewport, &self.style);
                     background_index_count = mesh.indices.len() as u32;
@@ -868,9 +883,23 @@ impl RgisApp {
                 ));
 
                 // Screen-space label glyph quads must be collected before
-                // `basemap_tiles` moves into the paint callback below.
+                // `basemap_tiles` moves into the paint callback below. Only
+                // the true current-zoom tiles (not the lower-zoom
+                // `fallback_tile_count` placeholder tiles prepended above)
+                // contribute labels: a fallback tile covers its *entire*
+                // area even when only some of its children are still
+                // loading, so it typically overlaps already-loaded
+                // current-zoom tiles too. Extracting labels from it as well
+                // would duplicate every already-visible label, at the
+                // wrong (overzoomed) size and, since lower-zoom vector
+                // tiles can carry less complete attribute data (e.g. a
+                // missing `name:en` that falls back to the local-language
+                // name), sometimes with different text entirely -- exactly
+                // the "ghost" duplicate label symptom this avoids. Missing
+                // a label for one frame while its tile finishes loading is
+                // far less jarring than a wrong/duplicate one.
                 let (label_glyphs, glyph_bitmaps, pending_glyphs, icon_draws) =
-                    self.collect_label_draws(&basemap_tiles, rect);
+                    self.collect_label_draws(&basemap_tiles[fallback_tile_count..], rect);
                 raster_tiles.extend(icon_draws);
 
                 let callback = rgis_render::MapCallback {

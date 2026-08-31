@@ -214,8 +214,25 @@ impl TileMeshWire {
 /// (see [`TileTransform::width_scale`]) so overzoomed tiles keep growing
 /// continuously instead of snapping when a new, more-detailed tile loads.
 /// `delta` is `viewport.zoom - tile.z`.
+///
+/// Real MapLibre GL JS re-evaluates every zoom-dependent `line-width`
+/// expression continuously against the live camera zoom, so its growth
+/// rate is whatever exponential base that particular layer's own
+/// `interpolate` stops use. This can't be replicated exactly without
+/// re-tessellating per frame, but `1.2` is a close stand-in: it's the
+/// exact base OpenFreeMap's own "liberty" style uses for essentially
+/// every `line-width` ramp (roads, casings, boundaries...), so growth
+/// tracks the real per-layer values within a few percent even many zoom
+/// levels past a tile's own fetch zoom (verified against liberty's own
+/// stops, e.g. `road_trunk_primary_casing`: z14=7.14px, z20=22px, a
+/// 3.08x ratio vs. this formula's `1.2^6` = 2.99x). The previous
+/// `1.0 + delta * 0.15` linear approximation undershot badly at typical
+/// interactive zoom levels (e.g. z18-20, common once past OpenFreeMap's
+/// z14 vector-tile ceiling): only ~1.9x growth at 6 zoom levels past the
+/// tile's own, vs. the ~3x real MapLibre would show, making roads/
+/// casings/boundaries look far too thin whenever overzoomed.
 fn zoom_scale(delta: f64) -> f32 {
-    (1.0 + delta * 0.15).max(0.0) as f32
+    1.2f64.powf(delta) as f32
 }
 
 /// Evaluates `layer`'s fill paint properties for `feature` at `zoom`:
@@ -404,6 +421,20 @@ fn extract_labels(
             if text.is_empty() {
                 continue;
             }
+            // `text-transform`: liberty's country/place-label layers set
+            // this to `uppercase` (e.g. "FRANCE" instead of "France") --
+            // applied here so it lands in the resolved `TileLabel::text`
+            // before any glyph shaping happens downstream.
+            let text = match layer
+                .layout("text-transform")
+                .eval_string(&eval_ctx)
+                .as_deref()
+            {
+                Some("uppercase") => text.to_uppercase(),
+                Some("lowercase") => text.to_lowercase(),
+                _ => text.to_string(),
+            };
+            let text = text.as_str();
             let font_size = layer.layout("text-size").eval_f64(&eval_ctx, 16.0) as f32;
             let color = layer
                 .paint("text-color")
@@ -463,6 +494,22 @@ fn extract_labels(
                 let Geometry::Point(p) = &feature.geometry else {
                     continue;
                 };
+                // MVT tiles duplicate point features that fall within the
+                // buffer margin into neighbouring tiles' raw feature data
+                // (so geometry crossing a tile edge still renders cleanly
+                // there). Fill/line geometry is deduped by the per-tile
+                // scissor-clip in `tile_screen_transform`, but nothing
+                // clipped point labels, so a single real-world point (e.g.
+                // a town near a tile boundary) could get extracted -- and
+                // drawn -- once per tile whose buffer it falls in,
+                // producing overlapping duplicate labels. Only keep points
+                // that fall within this tile's own core `[0, extent)`
+                // bounds; the tile that actually owns the point will
+                // supply it.
+                let extent = tile_layer.extent as i32;
+                if p.x() < 0 || p.x() >= extent || p.y() < 0 || p.y() >= extent {
+                    continue;
+                }
                 let pos = ctx.project_point(p.x(), p.y());
                 let icon_image = layer
                     .layout("icon-image")

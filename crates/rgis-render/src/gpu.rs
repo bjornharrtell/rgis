@@ -1082,14 +1082,30 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         let Some(frame) = callback_resources.get::<FramePrepared>() else {
             return;
         };
-        // Raster style tiles (e.g. a `raster` background source like
-        // `natural_earth`) are the map background, so draw them first; the
-        // vector background quad, basemap tiles, and vector layers are then
-        // drawn on top so layers stay visible above the basemap. Sprite
-        // icon quads share this same pipeline/buffers but are drawn in a
-        // second pass further below (after basemap/vector layers), since
-        // symbol icons must render above everything else, not underneath
-        // it -- see `frame.raster_tile_count`.
+        // The vector `background` layer (an opaque full-viewport quad, e.g.
+        // liberty's `#f8f4f0`) must be the very first thing drawn: it has
+        // alpha 1, so anything drawn *before* it would be fully erased, not
+        // blended. Raster style tiles (e.g. a `raster` source like
+        // `natural_earth`, which sits directly above `background` in the
+        // style's layer order) are drawn next, then basemap tiles and
+        // vector layers on top of that. Sprite icon quads share the same
+        // pipeline/buffers as the raster tiles but are drawn in a second
+        // pass further below (after basemap/vector layers), since symbol
+        // icons must render above everything else -- see
+        // `frame.raster_tile_count`.
+        if let (Some(vertex_slice), Some(index_slice)) = (
+            resources.scene_vertex_buffer.slice(),
+            resources.scene_index_buffer.slice(),
+        ) {
+            render_pass.set_pipeline(&resources.vector_pipeline);
+            render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, vertex_slice);
+            render_pass.set_index_buffer(index_slice, wgpu::IndexFormat::Uint32);
+            if frame.background_index_count > 0 {
+                render_pass.draw_indexed(0..frame.background_index_count, 0, 0..1);
+            }
+        }
+
         if let (Some(tile_vertex_slice), Some(tile_index_slice)) = (
             resources.tile_vertex_buffer.slice(),
             resources.tile_index_buffer.slice(),
@@ -1107,19 +1123,6 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     let index_start = (i * 6) as u32;
                     render_pass.draw_indexed(index_start..index_start + 6, 0, 0..1);
                 }
-            }
-        }
-
-        if let (Some(vertex_slice), Some(index_slice)) = (
-            resources.scene_vertex_buffer.slice(),
-            resources.scene_index_buffer.slice(),
-        ) {
-            render_pass.set_pipeline(&resources.vector_pipeline);
-            render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_slice);
-            render_pass.set_index_buffer(index_slice, wgpu::IndexFormat::Uint32);
-            if frame.background_index_count > 0 {
-                render_pass.draw_indexed(0..frame.background_index_count, 0, 0..1);
             }
         }
 
