@@ -1066,24 +1066,19 @@ impl RgisApp {
                 })
                 .sum::<f32>();
             // Baseline-relative vertical center of this label's actual ink
-            // (not a guessed constant): `top` is how far each glyph's ink
-            // rises above the baseline and `height - top` is how far it
-            // dips below, so the tallest ascender/descender across the
-            // string's glyphs gives the true cap-height box to center on
-            // the road line, matching how MapLibre centers line-placed
-            // text vertically on the line itself rather than hanging it
-            // below like point labels.
-            let (mut max_ascent, mut max_descent) = (0i32, 0i32);
-            for codepoint in &codepoints {
-                if let Some(glyph) = ranges
-                    .get(&glyph_range_start(*codepoint))
-                    .and_then(|range| range.get(codepoint))
-                {
-                    max_ascent = max_ascent.max(glyph.top);
-                    max_descent = max_descent.max(glyph.height as i32 - glyph.top);
-                }
-            }
-            let baseline_offset = (max_ascent - max_descent) as f32 * 0.5 * scale;
+            // (not a guessed constant): the tallest ascender/descender
+            // across the string's glyphs gives the true cap-height box to
+            // center on the road line, matching how MapLibre centers
+            // line-placed text vertically on the line itself rather than
+            // hanging it below like point labels -- see
+            // `glyph_run_baseline_offset`'s doc comment for the real bug
+            // this used to have.
+            let baseline_offset =
+                glyph_run_baseline_offset(codepoints.iter().filter_map(|codepoint| {
+                    ranges
+                        .get(&glyph_range_start(*codepoint))
+                        .and_then(|range| range.get(codepoint))
+                })) * scale;
             let mut label_glyphs = Vec::with_capacity(codepoints.len());
             let mut bounds: Option<egui::Rect> = None;
 
@@ -1251,6 +1246,36 @@ impl RgisApp {
 
         (glyphs, glyph_bitmaps, pending_glyphs, icon_draws)
     }
+}
+
+/// The baseline's vertical offset (in font-size-em units, i.e. multiply by
+/// `font_size / GLYPH_PIXELS_PER_EM` for pixels) from the vertical center
+/// of a run of glyphs' combined ink -- the tallest ascender and deepest
+/// descender across the run give the true cap-height box, so a
+/// center-anchored label's baseline can sit exactly so that box centers on
+/// its anchor point, instead of a guessed constant.
+///
+/// Regression test for a real bug: `glyph.top` is *negative* for real
+/// glyph-PBF data (ink rises *above* the baseline, e.g. digits in "Noto
+/// Sans Regular" are `top: -9`), so a running max seeded with `0` -- as if
+/// `top` were always positive -- could only ever end up `0`, never a
+/// glyph's real (negative) value. That skewed every center-anchored
+/// label's baseline downward: a road shield's ref number rendered closer
+/// to the bottom of its icon badge than centered, instead of in its
+/// middle.
+fn glyph_run_baseline_offset<'a>(glyphs: impl Iterator<Item = &'a rgis_tiles::Glyph>) -> f32 {
+    let (mut max_ascent, mut max_descent) = (i32::MIN, i32::MIN);
+    for glyph in glyphs {
+        max_ascent = max_ascent.max(glyph.top);
+        max_descent = max_descent.max(glyph.height as i32 - glyph.top);
+    }
+    // Only reached for an empty run (shouldn't happen: callers only ever
+    // pass already-resolved glyphs), which should just center on nothing
+    // rather than produce a wild offset from an unmatched `i32::MIN`.
+    if max_ascent == i32::MIN || max_descent == i32::MIN {
+        return 0.0;
+    }
+    (max_ascent - max_descent) as f32 * 0.5
 }
 
 /// A stable GPU texture-cache key for a raster tile, distinguishing tiles
@@ -1426,4 +1451,57 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response 
         );
     }
     response.on_hover_text(tooltip)
+}
+
+#[cfg(test)]
+mod glyph_baseline_tests {
+    use super::glyph_run_baseline_offset;
+    use rgis_tiles::Glyph;
+
+    fn glyph(top: i32, height: u32) -> Glyph {
+        Glyph {
+            bitmap: Vec::new(),
+            width: 0,
+            height,
+            left: 0,
+            top,
+            advance: 0,
+        }
+    }
+
+    /// Real "Noto Sans Regular" digit metrics (fetched from OpenFreeMap's
+    /// glyph server): `top: -9, height: 17` for every digit, i.e. no
+    /// descender -- ink should sit entirely above the baseline, and its
+    /// vertical center should sit exactly half a cap-height above it.
+    #[test]
+    fn centers_a_no_descender_run_correctly() {
+        let glyphs = [glyph(-9, 17), glyph(-9, 17)];
+        let offset = glyph_run_baseline_offset(glyphs.iter());
+        // Regression check for the real bug: seeding the running max
+        // ascent with `0` instead of `i32::MIN` made this always come out
+        // as `(0 - 26) * 0.5 = -13.0` for these metrics, not the correct
+        // `(-9 - 26) * 0.5 = -17.5`.
+        assert_eq!(offset, -17.5);
+    }
+
+    /// A descender (e.g. "y", "g") should pull the centering baseline
+    /// offset further up (more negative) relative to a purely-ascending
+    /// run, since the baseline itself must shift up to make room below it
+    /// for the descender while still centering the *whole* ink block
+    /// (ascender + descender) on the anchor point.
+    #[test]
+    fn a_descender_shifts_the_baseline_up() {
+        let no_descender = glyph_run_baseline_offset([glyph(-9, 17)].iter());
+        let with_descender = glyph_run_baseline_offset([glyph(-9, 17), glyph(-13, 19)].iter());
+        assert!(
+            with_descender < no_descender,
+            "with_descender={with_descender} no_descender={no_descender}"
+        );
+    }
+
+    #[test]
+    fn empty_run_centers_on_nothing() {
+        let glyphs: [Glyph; 0] = [];
+        assert_eq!(glyph_run_baseline_offset(glyphs.iter()), 0.0);
+    }
 }
