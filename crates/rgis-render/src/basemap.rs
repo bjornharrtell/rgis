@@ -13,7 +13,7 @@ use bytemuck::{Pod, Zeroable};
 use geo_types::{Geometry, LineString, Polygon};
 use rearcut::Earcut;
 use rgis_core::{EARTH_HALF_CIRC, Viewport};
-use rgis_style::{Color, EvalContext, Layer, StyleSheet};
+use rgis_style::{Color, EvalContext, Layer, StyleSheet, Value};
 use rgis_tiles::{TileCoord, VectorFeature, VectorTile};
 
 use crate::mesh::{SceneMesh, Vertex};
@@ -272,6 +272,29 @@ fn eval_fill_outline_paint(layer: &Layer, ctx: &EvalContext, fill_color: [f32; 4
         .unwrap_or(fill_color)
 }
 
+/// Evaluates `layer`'s `line-dasharray`, if present: a repeating on/off
+/// pattern (`[on, off, on, off, ...]`) expressed, per the style spec, in
+/// multiples of the line's own width. Anything that isn't a plain JSON
+/// array of numbers (property not set, or a data/zoom expression this
+/// simplified evaluator doesn't attempt) is treated as "no dashing" --
+/// solid is always a safe fallback, matching every other unsupported-
+/// property fallback in this module.
+fn eval_line_dasharray(layer: &Layer, ctx: &EvalContext) -> Option<Vec<f32>> {
+    let value = layer.paint("line-dasharray").eval(ctx)?;
+    let Value::Array(items) = value else {
+        return None;
+    };
+    let pattern: Vec<f32> = items
+        .iter()
+        .filter_map(|v| v.as_f64())
+        .map(|n| n as f32)
+        .collect();
+    if pattern.len() < 2 || pattern.iter().sum::<f32>() <= f32::EPSILON {
+        return None;
+    }
+    Some(pattern)
+}
+
 /// Evaluates `layer`'s `line-color`/`line-opacity`/`line-width` paint
 /// properties for `feature` at `zoom`, returning `(color, width_px)`.
 fn eval_line_paint(layer: &Layer, ctx: &EvalContext) -> ([f32; 4], f32) {
@@ -340,7 +363,23 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
 
             if layer.kind == "line" {
                 let (color, width) = eval_line_paint(layer, &eval_ctx);
-                append_line(&mut lines, feature, &ctx, color, width);
+                match eval_line_dasharray(layer, &eval_ctx) {
+                    Some(pattern) => {
+                        // Spec units are multiples of the line's width;
+                        // convert to tile-local metres using this tile's
+                        // own metres-per-(256px) scale, matching the same
+                        // zoom (`coord.z`) already used to evaluate
+                        // `width` above -- see `append_dashed_line`'s doc
+                        // comment for why this is only an approximation.
+                        let m_per_px = tile_size_m as f32 / 256.0;
+                        let pattern_m: Vec<f32> = pattern
+                            .iter()
+                            .map(|units| units * width * m_per_px)
+                            .collect();
+                        append_dashed_line(&mut lines, feature, &ctx, color, width, &pattern_m);
+                    }
+                    None => append_line(&mut lines, feature, &ctx, color, width),
+                }
                 continue;
             }
 
@@ -832,6 +871,133 @@ fn append_line(
 
 fn line_points(line: &LineString<i32>, ctx: &TileContext) -> Vec<[f32; 2]> {
     line.coords().map(|c| ctx.project_point(c.x, c.y)).collect()
+}
+
+/// Like [`append_line`], but splits each line/multiline's points into only
+/// the "on" runs of a `line-dasharray` pattern before handing each run to
+/// [`append_polyline`] -- reuses all of its existing tessellation/AA/join
+/// logic, so a dash is just a shorter line, and the natural flat (`butt`)
+/// segment ends already match MapLibre's default `line-cap` at each dash
+/// boundary.
+///
+/// `dash_pattern_m` is the style's `line-dasharray` (units of the line's
+/// own width, per spec) already converted to tile-local metres by the
+/// caller: since geometry here is tessellated once and cached (see
+/// `build_tile_mesh`'s doc comment) while width is otherwise a per-frame
+/// screen-pixel quantity, this bakes the dash pattern using the width
+/// evaluated at the tile's own fetch zoom, the same approximation
+/// tier already accepted for overzoomed line widths (see `zoom_scale`).
+fn append_dashed_line(
+    buffers: &mut LineMesh,
+    feature: &VectorFeature,
+    ctx: &TileContext,
+    color: [f32; 4],
+    width_px: f32,
+    dash_pattern_m: &[f32],
+) {
+    match &feature.geometry {
+        Geometry::LineString(line) => append_dashed_polyline(
+            buffers,
+            &line_points(line, ctx),
+            color,
+            width_px,
+            dash_pattern_m,
+        ),
+        Geometry::MultiLineString(lines) => {
+            for line in &lines.0 {
+                append_dashed_polyline(
+                    buffers,
+                    &line_points(line, ctx),
+                    color,
+                    width_px,
+                    dash_pattern_m,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walks `points` splitting it into the "on" sub-runs of the repeating
+/// `dash_pattern_m` (alternating on/off lengths, starting "on"), each fed
+/// to [`append_polyline`] independently -- a solid line is just the
+/// degenerate one-run case of this, but callers skip this function
+/// entirely when there's no dasharray, since it's needless extra work.
+fn append_dashed_polyline(
+    buffers: &mut LineMesh,
+    points: &[[f32; 2]],
+    color: [f32; 4],
+    width_px: f32,
+    dash_pattern_m: &[f32],
+) {
+    // Matches `append_polyline`'s own early-out: a zero/negative width
+    // draws nothing regardless of dashing, and more importantly avoids
+    // looping over a dash pattern whose lengths (being `width_px`
+    // multiples) have collapsed to ~0, which would otherwise turn a long
+    // segment into billions of near-zero steps.
+    if points.len() < 2 || width_px <= 0.0 {
+        return;
+    }
+
+    let mut idx = 0usize; // index into dash_pattern_m of the current on/off entry
+    let mut on = true; // dash_pattern_m[0] is always "on"
+    let mut remaining_in_entry = dash_pattern_m[0].max(1e-4);
+    let mut current_run: Vec<[f32; 2]> = Vec::new();
+
+    let mut flush = |run: &mut Vec<[f32; 2]>| {
+        if run.len() >= 2 {
+            append_polyline(buffers, run, color, width_px, true);
+        }
+        run.clear();
+    };
+
+    for pair in points.windows(2) {
+        let (p0, p1) = (pair[0], pair[1]);
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let seg_len = (dx * dx + dy * dy).sqrt();
+        if seg_len <= f32::EPSILON {
+            continue;
+        }
+
+        if on && current_run.is_empty() {
+            current_run.push(p0);
+        }
+
+        let mut consumed = 0.0f32;
+        while consumed < seg_len {
+            let step = (seg_len - consumed).min(remaining_in_entry);
+            consumed += step;
+            remaining_in_entry -= step;
+
+            let t = (consumed / seg_len).clamp(0.0, 1.0);
+            let point = [p0[0] + dx * t, p0[1] + dy * t];
+            if on {
+                current_run.push(point);
+            }
+
+            // Advance the dash pattern once its current on/off entry is
+            // fully consumed; a `<=` epsilon guard (rather than `== 0.0`)
+            // avoids an infinite loop from float error leaving a
+            // vanishingly small remainder.
+            if remaining_in_entry <= 1e-6 {
+                if on {
+                    flush(&mut current_run);
+                }
+                idx = (idx + 1) % dash_pattern_m.len();
+                on = !on;
+                // Clamp to a tiny positive floor so a zero-length pattern
+                // entry (an edge case some styles use to fake a dotted
+                // look) still advances one dash-worth of geometry per
+                // outer-loop iteration instead of spinning forever.
+                remaining_in_entry = dash_pattern_m[idx].max(1e-4);
+                if on {
+                    current_run.push(point);
+                }
+            }
+        }
+    }
+    flush(&mut current_run);
 }
 
 /// Tessellates a polyline into a screen-pixel-width "ribbon": each segment

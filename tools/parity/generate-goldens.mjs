@@ -10,16 +10,18 @@
 //
 //   cd tools/parity && npm install && npm run generate
 //
-// Scope note: symbol layers (text labels + icons) are hidden on both sides
-// of the comparison (see rgis-render's parity test for the Rust-side
-// equivalent). Label placement/font rendering differs meaningfully between
-// a browser's text shaper and rgis's SDF glyph pipeline regardless of
-// whether the underlying style evaluation is correct, so comparing them
-// pixel-for-pixel would produce noisy failures unrelated to actual style
-// parity. This keeps the comparison focused on fill/line/background/
-// fill-extrusion/raster rendering, which is where real parity bugs
-// (wrong colors, opacities, filters, zoom interpolation, etc.) would show
-// up.
+// Scope note: symbol layers (text labels + icons) and fill-extrusion
+// layers (3D buildings) are hidden on both sides of the comparison (see
+// rgis-render's parity test for the Rust-side equivalent). Label
+// placement/font rendering differs meaningfully between a browser's text
+// shaper and rgis's SDF glyph pipeline regardless of whether the underlying
+// style evaluation is correct, so comparing them pixel-for-pixel would
+// produce noisy failures unrelated to actual style parity. rgis also
+// doesn't attempt to replicate MapLibre's perspective-lit 3D extrusion
+// walls (it draws extrusion footprints as flat fills instead), so those
+// are excluded too. This keeps the comparison focused on fill/line/
+// background/raster rendering, which is where real parity bugs (wrong
+// colors, opacities, filters, zoom interpolation, etc.) would show up.
 import { chromium } from 'playwright';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, extname } from 'node:path';
@@ -97,27 +99,60 @@ try {
       },
       { styleUrl: STYLE_URL, center: [vp.lon, vp.lat], zoom: vp.zoom },
     );
-    // Wait for the style to load, then hide every symbol (text/icon) layer
-    // -- see the scope note above -- before waiting for tiles to settle.
+    // Wait for the style to load, then hide every symbol (text/icon) and
+    // fill-extrusion (3D building) layer -- see the scope note above --
+    // before waiting for tiles to settle.
     await page.evaluate(() => new Promise((resolve) => {
       const map = window.__map;
       map.once('load', () => {
         for (const layer of map.getStyle().layers) {
-          if (layer.type === 'symbol') {
+          if (layer.type === 'symbol' || layer.type === 'fill-extrusion') {
             map.setLayoutProperty(layer.id, 'visibility', 'none');
           }
         }
         resolve();
       });
     }));
-    await page.evaluate(() => new Promise((resolve) => {
+    // Wait for every vector/raster tile the current view needs to actually
+    // finish loading before capturing. `idle` alone is unreliable here: it
+    // fires once maplibre's internal render queue is momentarily empty,
+    // which can race ahead of slower tile requests over a live network and
+    // produce a screenshot with some tiles still missing (rendered as bare
+    // background) -- this silently made earlier goldens for
+    // building/street-dense areas look emptier than the real style, and
+    // rgis's own render (which blocks until every requested tile arrives,
+    // see `fetch_vector_tiles_blocking` in the parity test) would then
+    // legitimately show *more* detail than that stale golden, looking like
+    // a parity bug when it wasn't one. Poll `areTilesLoaded()` instead,
+    // requiring several consecutive positive reads (a single true reading
+    // can also be a momentary gap between one tile request finishing and
+    // the next starting) before treating the view as settled.
+    await page.evaluate(() => new Promise((resolve, reject) => {
       const map = window.__map;
-      if (map.isStyleLoaded() && !map.isMoving()) {
-        // `idle` may already have fired; give layout one more tick then resolve.
-        map.once('idle', resolve);
-        setTimeout(resolve, 4000);
+      const deadline = Date.now() + 30000;
+      let consecutiveLoaded = 0;
+      const REQUIRED_CONSECUTIVE = 5;
+      const POLL_INTERVAL_MS = 200;
+      const poll = () => {
+        if (map.areTilesLoaded()) {
+          consecutiveLoaded += 1;
+          if (consecutiveLoaded >= REQUIRED_CONSECUTIVE) {
+            resolve();
+            return;
+          }
+        } else {
+          consecutiveLoaded = 0;
+        }
+        if (Date.now() > deadline) {
+          reject(new Error('timed out waiting for tiles to finish loading'));
+          return;
+        }
+        setTimeout(poll, POLL_INTERVAL_MS);
+      };
+      if (map.isStyleLoaded()) {
+        poll();
       } else {
-        map.once('idle', resolve);
+        map.once('idle', poll);
       }
     }));
     const outPath = join(GOLDENS_DIR, `${vp.name}.png`);
