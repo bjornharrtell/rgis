@@ -11,7 +11,7 @@ use rgis_tiles::{GLYPH_BUFFER, Glyph, TileCoord, glyph_range_start};
 use rustc_hash::FxHashMap;
 use wgpu::util::DeviceExt;
 
-use crate::basemap::{LineVertex, TileMesh};
+use crate::basemap::{BatchKind, LineVertex, TileMesh, TileMeshBatch};
 use crate::mesh::{SceneMesh, Vertex};
 use crate::text::{GlyphBitmapRanges, LabelGlyphInstance};
 
@@ -88,7 +88,6 @@ pub struct BasemapTileDraw {
 struct SubMeshBuffers {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    index_count: u32,
 }
 
 /// Persistent GPU buffers for one basemap tile, uploaded once when the tile
@@ -101,6 +100,13 @@ struct SubMeshBuffers {
 struct TileGpuMesh {
     fill: Option<SubMeshBuffers>,
     lines: Option<SubMeshBuffers>,
+    /// This tile's ordered fill/line draw batches (see
+    /// [`crate::basemap::TileMeshBatch`]), copied from the CPU-side
+    /// `TileMesh` when the GPU buffers above are first uploaded -- kept
+    /// here (rather than looked up from the `TileMesh` again) since only
+    /// these persistent GPU-resident structs are reachable from `paint`,
+    /// which has no access to the original `Arc<TileMesh>`.
+    batches: Vec<TileMeshBatch>,
 }
 
 /// A single textured screen-space quad to draw this frame: a raster tile
@@ -701,7 +707,6 @@ impl MapRenderResources {
                 contents: bytemuck::cast_slice(&mesh.fill.indices),
                 usage: wgpu::BufferUsages::INDEX,
             }),
-            index_count: mesh.fill.indices.len() as u32,
         });
         let lines = (!mesh.lines.indices.is_empty()).then(|| SubMeshBuffers {
             vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -714,9 +719,15 @@ impl MapRenderResources {
                 contents: bytemuck::cast_slice(&mesh.lines.indices),
                 usage: wgpu::BufferUsages::INDEX,
             }),
-            index_count: mesh.lines.indices.len() as u32,
         });
-        self.tile_gpu_meshes.put(coord, TileGpuMesh { fill, lines });
+        self.tile_gpu_meshes.put(
+            coord,
+            TileGpuMesh {
+                fill,
+                lines,
+                batches: mesh.batches.clone(),
+            },
+        );
     }
 
     /// Grows `tile_transform_pool_buffer` (and recreates the bind group
@@ -1130,24 +1141,18 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         // `MapRenderResources::ensure_basemap_tile_buffer`), positioned via a
         // tiny per-tile transform uniform recomputed every frame instead of
         // re-tessellating or re-uploading geometry -- drawn between the
-        // background and the user layers so layers stay on top. Fills are
-        // drawn before lines (roads/casings/outlines on top of polygons).
-        //
-        // Known parity gap: within each category (fills among themselves,
-        // lines among themselves) draw order matches the style document's
-        // own layer order (see `build_tile_mesh`'s doc comment), but the two
-        // categories are two separate passes/draw calls, so a `line` layer
-        // that comes *before* a later `fill` layer in the style (e.g.
-        // liberty's `park`/`park_outline`, index 2-3, vs. `water`, index
-        // 17) always renders on top of it here, whereas MapLibre would
-        // paint the fill over the line per the style's real order. This
-        // shows up as e.g. a park/reserve outline that dips into a lake or
-        // the sea still being visible there, when it should be hidden
-        // under the water fill painted after it. Fixing this needs
-        // per-layer-interleaved draw calls (or a depth/stencil trick)
-        // instead of one fills-then-lines pass per tile; not attempted
-        // here as it's a much larger rendering-architecture change than a
-        // style-evaluation fix.
+        // background and the user layers so layers stay on top. Each
+        // tile's fill/line batches are drawn in the style document's own
+        // layer order (see `TileMeshBatch`'s doc comment), switching
+        // between the fill and line pipelines/vertex buffers per batch
+        // instead of one fills-then-lines pass per tile, so a `line` layer
+        // positioned *before* a later `fill` layer (e.g. liberty's
+        // `park_outline` vs. `water`) is correctly painted over by it --
+        // matching MapLibre's single-pass-per-tile paint order. `pipeline`
+        // tracks the last bound pipeline across both batches and tiles so
+        // consecutive same-kind batches (common: most tiles' batch list
+        // starts and ends with a long run of one kind) don't rebind it
+        // needlessly.
         //
         // Each tile is scissor-clipped to its own screen-space square: MVT
         // tiles include a small "buffer" zone of geometry duplicated a bit
@@ -1185,11 +1190,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 ))
             };
 
-            render_pass.set_pipeline(&resources.basemap_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
+            let mut pipeline: Option<BatchKind> = None;
             for draw in &frame.basemap_draws {
                 if let Some(tile_mesh) = resources.tile_gpu_meshes.peek(&draw.coord)
-                    && let Some(fill) = &tile_mesh.fill
                     && let Some((x, y, w, h)) = scissor_for(draw.offset, draw.size)
                 {
                     render_pass.set_scissor_rect(x, y, w, h);
@@ -1198,29 +1202,26 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                         &resources.tile_transform_bind_group,
                         &[draw.transform_offset],
                     );
-                    render_pass.set_vertex_buffer(0, fill.vertex_buffer.slice(..));
-                    render_pass
-                        .set_index_buffer(fill.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..fill.index_count, 0, 0..1);
-                }
-            }
-
-            render_pass.set_pipeline(&resources.basemap_line_pipeline);
-            for draw in &frame.basemap_draws {
-                if let Some(tile_mesh) = resources.tile_gpu_meshes.peek(&draw.coord)
-                    && let Some(lines) = &tile_mesh.lines
-                    && let Some((x, y, w, h)) = scissor_for(draw.offset, draw.size)
-                {
-                    render_pass.set_scissor_rect(x, y, w, h);
-                    render_pass.set_bind_group(
-                        1,
-                        &resources.tile_transform_bind_group,
-                        &[draw.transform_offset],
-                    );
-                    render_pass.set_vertex_buffer(0, lines.vertex_buffer.slice(..));
-                    render_pass
-                        .set_index_buffer(lines.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..lines.index_count, 0, 0..1);
+                    for batch in &tile_mesh.batches {
+                        let sub_mesh = match batch.kind {
+                            BatchKind::Fill => tile_mesh.fill.as_ref(),
+                            BatchKind::Line => tile_mesh.lines.as_ref(),
+                        };
+                        let Some(sub_mesh) = sub_mesh else { continue };
+                        if pipeline != Some(batch.kind) {
+                            render_pass.set_pipeline(match batch.kind {
+                                BatchKind::Fill => &resources.basemap_pipeline,
+                                BatchKind::Line => &resources.basemap_line_pipeline,
+                            });
+                            pipeline = Some(batch.kind);
+                        }
+                        render_pass.set_vertex_buffer(0, sub_mesh.vertex_buffer.slice(..));
+                        render_pass.set_index_buffer(
+                            sub_mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        render_pass.draw_indexed(batch.index_range.clone(), 0, 0..1);
+                    }
                 }
             }
 
