@@ -63,12 +63,14 @@ fn main() {
                 let fill_indices = Uint32Array::from(wire.fill_indices.as_slice());
                 let line_vertices = Float32Array::from(wire.line_vertices.as_slice());
                 let line_indices = Uint32Array::from(wire.line_indices.as_slice());
+                let batches = Uint32Array::from(wire.batches.as_slice());
 
                 let transfer = Array::new();
                 transfer.push(&fill_vertices.buffer());
                 transfer.push(&fill_indices.buffer());
                 transfer.push(&line_vertices.buffer());
                 transfer.push(&line_indices.buffer());
+                transfer.push(&batches.buffer());
 
                 reply.push(&fill_vertices);
                 reply.push(&fill_indices);
@@ -78,6 +80,7 @@ fn main() {
                 // structured-cloned, not backed by a transferable
                 // ArrayBuffer) -- see `TileMeshWire::labels_json`.
                 reply.push(&JsValue::from_str(&wire.labels_json));
+                reply.push(&batches);
 
                 scope_clone
                     .post_message_with_transfer(&reply.into(), &transfer.into())

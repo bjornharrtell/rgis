@@ -33,6 +33,34 @@ pub struct TileMesh {
     /// and shapes them into screen-space SDF glyph quads each frame, so
     /// this stays plain per-feature data.
     pub labels: Vec<TileLabel>,
+    /// Ordered draw batches, one (or two, for a `fill`/`fill-extrusion`
+    /// layer that also emits an outline -- see `append_outline`'s doc
+    /// comment) per style layer that emitted any geometry into this tile,
+    /// in the same order as `style.layers` -- see [`TileMeshBatch`].
+    pub(crate) batches: Vec<TileMeshBatch>,
+}
+
+/// Which sub-mesh (and therefore which GPU pipeline/vertex format) a
+/// [`TileMeshBatch`] draws from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchKind {
+    Fill,
+    Line,
+}
+
+/// A single contiguous run of indices to draw from either `TileMesh::fill`
+/// or `TileMesh::lines`, in the style document's own layer order -- see
+/// `build_tile_mesh`'s doc comment. Rendering these in order (switching
+/// pipeline/vertex-buffer between fill and line batches as needed) instead
+/// of one "all fills, then all lines" pass per tile is what gives a line
+/// layer positioned *before* a later fill layer (e.g. `park_outline` before
+/// `water`) correct paint-order parity with MapLibre: the fill batch drawn
+/// afterward correctly paints over the earlier line batch, rather than
+/// every line batch always drawing last regardless of style order.
+#[derive(Debug, Clone)]
+pub(crate) struct TileMeshBatch {
+    pub(crate) kind: BatchKind,
+    pub(crate) index_range: std::ops::Range<u32>,
 }
 
 impl TileMesh {
@@ -165,6 +193,12 @@ pub struct TileMeshWire {
     /// most a few hundred short strings per tile -- so plain JSON avoids
     /// hand-rolling a second binary wire format just for this).
     pub labels_json: String,
+    /// `TileMesh::batches`, flattened to `u32` triples of
+    /// `(kind, index_range.start, index_range.end)`, `kind` being `0` for
+    /// `BatchKind::Fill` or `1` for `BatchKind::Line`. Empty on/from a
+    /// worker build that predates this field -- see `into_tile_mesh`'s
+    /// fallback.
+    pub batches: Vec<u32>,
 }
 
 impl From<&TileMesh> for TileMeshWire {
@@ -181,12 +215,22 @@ impl From<&TileMesh> for TileMeshWire {
             line_vertices.push(v.half_width);
             line_vertices.extend_from_slice(&v.color);
         }
+        let mut batches = Vec::with_capacity(mesh.batches.len() * 3);
+        for batch in &mesh.batches {
+            batches.push(match batch.kind {
+                BatchKind::Fill => 0,
+                BatchKind::Line => 1,
+            });
+            batches.push(batch.index_range.start);
+            batches.push(batch.index_range.end);
+        }
         Self {
             fill_vertices,
             fill_indices: mesh.fill.indices.clone(),
             line_vertices,
             line_indices: mesh.lines.indices.clone(),
             labels_json: serde_json::to_string(&mesh.labels).unwrap_or_default(),
+            batches,
         }
     }
 }
@@ -220,6 +264,42 @@ impl TileMeshWire {
             })
             .collect();
         let labels = serde_json::from_str(&self.labels_json).unwrap_or_default();
+        let batches = if self.batches.is_empty() {
+            // A worker build that predates `batches` (or a message that
+            // otherwise omitted it) -- fall back to the pre-single-pass
+            // behaviour of one "all fills, then all lines" batch per tile
+            // rather than dropping either sub-mesh, at the cost of this
+            // one tile's line-vs-fill layers not interleaving in true
+            // style order (see `TileMeshBatch`'s doc comment).
+            let mut fallback = Vec::new();
+            if !self.fill_indices.is_empty() {
+                fallback.push(TileMeshBatch {
+                    kind: BatchKind::Fill,
+                    index_range: 0..self.fill_indices.len() as u32,
+                });
+            }
+            if !self.line_indices.is_empty() {
+                fallback.push(TileMeshBatch {
+                    kind: BatchKind::Line,
+                    index_range: 0..self.line_indices.len() as u32,
+                });
+            }
+            fallback
+        } else {
+            self.batches
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|&[kind, start, end]| TileMeshBatch {
+                    kind: if kind == 0 {
+                        BatchKind::Fill
+                    } else {
+                        BatchKind::Line
+                    },
+                    index_range: start..end,
+                })
+                .collect()
+        };
         TileMesh {
             fill: SceneMesh {
                 vertices: fill_vertices,
@@ -230,6 +310,7 @@ impl TileMeshWire {
                 indices: self.line_indices,
             },
             labels,
+            batches,
         }
     }
 }
@@ -346,12 +427,19 @@ fn eval_line_paint(layer: &Layer, ctx: &EvalContext) -> ([f32; 4], f32) {
 /// -- and `symbol`, handled by [`extract_labels`]), so draw/blend order
 /// across the whole tile always matches the style document's own layer
 /// order, exactly like MapLibre, rather than a fixed hardcoded pass order.
+/// This applies to the returned mesh's `batches` (see [`TileMeshBatch`])
+/// too, not just the order fill/line geometry is appended to `fill`/
+/// `lines` within each -- the caller draws `batches` in order, switching
+/// between the fill and line pipelines per batch, so a `line` layer
+/// positioned before a later `fill` layer is correctly painted over by it,
+/// matching MapLibre's single-pass-per-tile paint order.
 pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) -> TileMesh {
     let mut fill_mesh = SceneMesh::default();
     let mut earcut: Earcut = Earcut::new();
     let mut earcut_buf: Vec<u32> = Vec::new();
     let mut earcut_flat: Vec<f64> = Vec::new();
     let mut lines = LineMesh::default();
+    let mut batches: Vec<TileMeshBatch> = Vec::new();
     let zoom = coord.z as f64;
     let tile_size_m = TileMercatorBounds::for_coord(coord).size;
 
@@ -382,6 +470,13 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
             extent: tile_layer.extent,
             tile_size_m,
         };
+
+        // Remember where this layer's fill/line geometry starts so a
+        // batch (or two, for a fill layer's polygons + its outline) can be
+        // pushed for it below, in the same order as `style.layers` --
+        // see `TileMeshBatch`'s doc comment.
+        let fill_start = fill_mesh.indices.len() as u32;
+        let line_start = lines.indices.len() as u32;
 
         for feature in &tile_layer.features {
             if !layer.matches_feature(feature, zoom) {
@@ -431,6 +526,23 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
             let outline_color = eval_fill_outline_paint(layer, &eval_ctx, fill_color);
             append_outline(&mut lines, feature, &ctx, outline_color, 1.0);
         }
+
+        // Push this layer's batch(es), in fill-then-line order (matching
+        // the relative order the code above emits them in for a fill
+        // layer's own polygons vs. its outline), merging into the
+        // previous batch when it's contiguous and the same kind (e.g. a
+        // run of consecutive `line` layers) to keep the draw-call count
+        // down without changing the effective draw order.
+        push_batch(
+            &mut batches,
+            BatchKind::Fill,
+            fill_start..fill_mesh.indices.len() as u32,
+        );
+        push_batch(
+            &mut batches,
+            BatchKind::Line,
+            line_start..lines.indices.len() as u32,
+        );
     }
 
     let labels = extract_labels(tile, coord, tile_size_m, style);
@@ -439,7 +551,31 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
         fill: fill_mesh,
         lines,
         labels,
+        batches,
     }
+}
+
+/// Appends a `(kind, range)` batch to `batches` for one style layer's
+/// emitted geometry, unless `range` is empty (the layer touched neither
+/// sub-mesh, e.g. a `line` layer contributes nothing to `Fill`), merging it
+/// into the previous batch in place when that batch is the same `kind` and
+/// `range` picks up exactly where it left off -- see `TileMeshBatch`'s doc
+/// comment.
+fn push_batch(batches: &mut Vec<TileMeshBatch>, kind: BatchKind, range: std::ops::Range<u32>) {
+    if range.is_empty() {
+        return;
+    }
+    if let Some(last) = batches.last_mut()
+        && last.kind == kind
+        && last.index_range.end == range.start
+    {
+        last.index_range.end = range.end;
+        return;
+    }
+    batches.push(TileMeshBatch {
+        kind,
+        index_range: range,
+    });
 }
 
 /// Extracts every labeled feature (`symbol` layers with a `text-field`)
@@ -1303,6 +1439,44 @@ mod tests {
         StyleSheet::parse(&json).expect("liberty style should parse")
     }
 
+    /// Regression test for the paint-order parity bug reported in
+    /// https://github.com/bjornharrtell/rgis/issues/34: real styles
+    /// interleave `fill` and `line` layers (e.g. liberty's `park` (fill,
+    /// layer index 2), `park_outline` (line, index 3), then `water` (fill,
+    /// index 17)), so `build_tile_mesh`'s `batches` must preserve that
+    /// interleaving in style order rather than collapsing into one
+    /// fills-then-lines (or lines-then-fills) pass -- see
+    /// `TileMeshBatch`'s doc comment for why the renderer depends on this
+    /// to paint a later fill layer over an earlier line layer, matching
+    /// MapLibre.
+    #[test]
+    fn batches_interleave_fill_and_line_in_style_order_not_grouped_by_pass() {
+        let full_path = format!("{}/fixtures/paris_14.pbf", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&full_path).expect("failed to read fixture");
+        let tile = rgis_tiles::decode_vector_tile(&bytes).expect("decode fixture MVT");
+        let coord = TileCoord { z: 14, x: 0, y: 0 };
+        let style = liberty_style();
+        let mesh = build_tile_mesh(&tile, coord, &style);
+
+        assert!(
+            mesh.batches.len() > 2,
+            "expected more than one fill batch + one line batch total -- a \
+             real style's fill/line layers should interleave into several \
+             batches, not collapse into a single pass-grouped batch per kind \
+             (batches: {:?})",
+            mesh.batches.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        let kinds: Vec<BatchKind> = mesh.batches.iter().map(|b| b.kind).collect();
+        assert!(
+            kinds
+                .windows(2)
+                .any(|w| w[0] == BatchKind::Line && w[1] == BatchKind::Fill),
+            "expected at least one Line batch immediately followed by a Fill \
+             batch, proving batches interleave in style order instead of \
+             being grouped by kind: {kinds:?}"
+        );
+    }
+
     /// `build_tile_mesh` should extract point labels from a dense real-world
     /// tile's `place`/`poi` layers, with the wire round-trip (used to ship
     /// results across the wasm worker boundary; see `TileMeshWire`)
@@ -1333,6 +1507,21 @@ mod tests {
         let round_tripped = wire.into_tile_mesh();
         assert_eq!(round_tripped.labels.len(), mesh.labels.len());
         assert_eq!(round_tripped.labels[0].text, mesh.labels[0].text);
+        // `batches` (see `TileMeshBatch`) must survive the wire round trip
+        // too, or the wasm worker path would silently regress back to the
+        // #34 fills-then-lines paint-order bug even though the inline
+        // (non-worker) path is fixed.
+        assert_eq!(
+            round_tripped
+                .batches
+                .iter()
+                .map(|b| (b.kind, b.index_range.clone()))
+                .collect::<Vec<_>>(),
+            mesh.batches
+                .iter()
+                .map(|b| (b.kind, b.index_range.clone()))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Road "shield" symbol layers (e.g. liberty's `highway-shield-*`,

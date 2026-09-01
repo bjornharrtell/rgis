@@ -25,9 +25,12 @@
 //!   (length 7, all four as typed arrays, transferred) or
 //!   `[z, x, y, fill_vertices, fill_indices, line_vertices, line_indices,
 //!   labels_json]` (length 8, `labels_json` a plain JSON string of
-//!   `Vec<rgis_render::TileLabel>`): the tessellated
-//!   [`TileMeshWire`]. Older/newer workers omitting the 8th element just
-//!   get no labels for that tile.
+//!   `Vec<rgis_render::TileLabel>`) or `[..., labels_json, batches]`
+//!   (length 9, `batches` a `Uint32Array` of `TileMeshWire::batches`,
+//!   transferred): the tessellated [`TileMeshWire`]. Older/newer workers
+//!   omitting the 8th/9th element just get no labels/batches for that
+//!   tile -- see `TileMeshWire::into_tile_mesh`'s fallback for the
+//!   consequence of a missing `batches`.
 //!
 //! Each worker only ever has one job in flight at a time (enforced by this
 //! pool), so a worker's own identity is enough to route its reply back to
@@ -195,12 +198,18 @@ fn handle_message(state: &Rc<RefCell<PoolState>>, worker_idx: usize, msg: Messag
             } else {
                 String::new()
             };
+            let batches = if len >= 9 {
+                Uint32Array::from(data.get(8)).to_vec()
+            } else {
+                Vec::new()
+            };
             let wire = TileMeshWire {
                 fill_vertices: Float32Array::from(data.get(3)).to_vec(),
                 fill_indices: Uint32Array::from(data.get(4)).to_vec(),
                 line_vertices: Float32Array::from(data.get(5)).to_vec(),
                 line_indices: Uint32Array::from(data.get(6)).to_vec(),
                 labels_json,
+                batches,
             };
             Some(wire.into_tile_mesh())
         } else {
