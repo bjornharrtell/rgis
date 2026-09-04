@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_channel::{Receiver, Sender};
@@ -237,6 +238,7 @@ pub struct TileReady {
 
 pub struct TileFetcher {
     cache: Arc<Mutex<TileCache>>,
+    in_flight: Arc<Mutex<HashSet<TileCoord>>>,
     source: Arc<dyn TileSource>,
     sender: Sender<TileReady>,
     pub receiver: Receiver<TileReady>,
@@ -247,6 +249,7 @@ impl TileFetcher {
         let (sender, receiver) = async_channel::bounded(256);
         Self {
             cache: Arc::new(Mutex::new(TileCache::new())),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
             source: Arc::new(source),
             sender,
             receiver,
@@ -262,31 +265,43 @@ impl TileFetcher {
     }
 
     /// Request a tile. Delivery is asynchronous: the result (if any) shows up
-    /// on `self.receiver`. Works identically on native (background thread,
-    /// via `ehttp`'s `ureq` backend) and wasm32 (browser `fetch`).
+    /// on `self.receiver`. Repeated requests while a tile is in flight are
+    /// ignored. Works identically on native (background thread, via `ehttp`'s
+    /// `ureq` backend) and wasm32 (browser `fetch`).
     pub fn request(&self, coord: TileCoord) {
         if let Some(img) = self.cache.lock().unwrap().get(coord) {
             let _ = self.sender.try_send(TileReady { coord, image: img });
             return;
         }
 
+        if !self.in_flight.lock().unwrap().insert(coord) {
+            return;
+        }
+
         if let Some(img) = disk_cache::read(self.source.cache_namespace(), coord) {
             let arc = self.cache.lock().unwrap().insert(coord, img);
+            self.in_flight.lock().unwrap().remove(&coord);
             let _ = self.sender.try_send(TileReady { coord, image: arc });
             return;
         }
 
         let cache = Arc::clone(&self.cache);
+        let in_flight = Arc::clone(&self.in_flight);
         let sender = self.sender.clone();
         let request = ehttp::Request::get(self.source.url(coord));
         let namespace = self.source.cache_namespace().to_string();
 
         ehttp::fetch(request, move |result: ehttp::Result<ehttp::Response>| {
-            let Ok(response) = result else { return };
+            let Ok(response) = result else {
+                in_flight.lock().unwrap().remove(&coord);
+                return;
+            };
             if !response.ok {
+                in_flight.lock().unwrap().remove(&coord);
                 return;
             }
             let Ok(img) = image::load_from_memory(&response.bytes) else {
+                in_flight.lock().unwrap().remove(&coord);
                 return;
             };
             let rgba = img.to_rgba8();
@@ -294,6 +309,7 @@ impl TileFetcher {
             disk_cache::write(&namespace, coord, &response.bytes);
 
             let arc = cache.lock().unwrap().insert(coord, rgba);
+            in_flight.lock().unwrap().remove(&coord);
             let _ = sender.try_send(TileReady { coord, image: arc });
         });
     }
