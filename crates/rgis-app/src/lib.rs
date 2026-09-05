@@ -875,10 +875,18 @@ impl RgisApp {
                     Vec::new()
                 };
                 let raster_tile_count = raster_tiles.len() as u32;
-                mesh.extend(rgis_render::build_scene_mesh(
-                    &self.project.layers,
-                    &self.project.viewport,
-                ));
+                let vector_image =
+                    rgis_render::render_vector_layers(&self.project.layers, &self.project.viewport);
+                let vector_tile_count = vector_image.is_some() as u32;
+                if let Some(rgba) = vector_image {
+                    raster_tiles.push(rgis_render::TileDraw {
+                        key: u64::MAX,
+                        rect: [0.0, 0.0, rect.width(), rect.height()],
+                        rgba: Arc::new(rgba),
+                        uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        opacity: 1.0,
+                    });
+                }
 
                 // Screen-space label glyph quads must be collected before
                 // `basemap_tiles` moves into the paint callback below. Only
@@ -906,6 +914,7 @@ impl RgisApp {
                     basemap_tiles,
                     tiles: raster_tiles,
                     raster_tile_count,
+                    vector_tile_count,
                     labels: label_glyphs,
                     glyph_bitmaps,
                     width: rect.width(),
