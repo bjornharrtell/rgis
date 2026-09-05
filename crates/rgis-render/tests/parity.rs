@@ -208,6 +208,7 @@ fn build_frame(style: &StyleSheet, viewport: &Viewport) -> MapCallback {
         basemap_tiles,
         tiles: raster_tiles,
         raster_tile_count,
+        vector_tile_count: 0,
         labels: Vec::new(),
         glyph_bitmaps: HashMap::new(),
         width: viewport.width_px as f32,
