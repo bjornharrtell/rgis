@@ -46,7 +46,7 @@ pub fn render_vector_layers(layers: &[Layer], viewport: &Viewport) -> Option<Rgb
     // tiny-skia stores premultiplied RGBA, while the wgpu texture pipeline
     // expects straight alpha.
     let mut data = pixmap.take();
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = pixel[3] as u32;
         if alpha != 0 && alpha != 255 {
             for channel in &mut pixel[..3] {
@@ -181,9 +181,11 @@ mod tests {
 
     #[test]
     fn rasterizes_plain_point_without_tessellating() {
-        let mut viewport = Viewport::default();
-        viewport.width_px = 32;
-        viewport.height_px = 32;
+        let viewport = Viewport {
+            width_px: 32,
+            height_px: 32,
+            ..Viewport::default()
+        };
         let layer = Layer::new(
             LayerId(1),
             "points",

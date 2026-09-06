@@ -7,3 +7,9 @@ if ! cargo fmt --all -- --check; then
     echo "cargo fmt found unformatted code. Run 'cargo fmt --all' and commit again." >&2
     exit 1
 fi
+
+if ! cargo clippy --workspace --exclude rgis-web --all-targets -- -D warnings; then
+    echo
+    echo "cargo clippy found warnings. Fix them before committing." >&2
+    exit 1
+fi
