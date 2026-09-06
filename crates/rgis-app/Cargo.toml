@@ -17,33 +17,24 @@ rgis-core   = { path = "../rgis-core" }
 rgis-io     = { path = "../rgis-io" }
 rgis-render = { path = "../rgis-render" }
 rgis-tiles  = { path = "../rgis-tiles" }
+geo-types   = { workspace = true }
 
-eframe      = { workspace = true }
-egui        = { workspace = true }
-egui-wgpu   = "0.36.1"
 wgpu        = { workspace = true }
 image       = { workspace = true }
 rfd         = { workspace = true }
 poll-promise = { workspace = true }
 lru         = { workspace = true }
 
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_os = "linux", target_os = "freebsd")))'.dependencies]
+gpui          = { workspace = true }
+gpui-platform = { workspace = true }
+
 # Native file loading uses Promise::spawn_thread (blocking IO on a background
 # std::thread, needs no extra feature). The browser can't spawn OS threads, so
 # wasm uses Promise::spawn_local backed by wasm-bindgen-futures instead.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 poll-promise = { workspace = true, features = ["web"] }
+gpui         = { workspace = true }
+gpui-web     = { workspace = true }
 wasm-bindgen  = "0.2"
 js-sys        = "0.3"
-async-channel = { workspace = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "0.3"
-features = [
-    "Blob",
-    "BlobPropertyBag",
-    "MessageEvent",
-    "Url",
-    "Window",
-    "Worker",
-    "console",
-]

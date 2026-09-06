@@ -3,30 +3,19 @@ name = "rgis-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autobins = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rgis-app    = { path = "../rgis-app" }
-rgis-render = { path = "../rgis-render" }
-rgis-tiles  = { path = "../rgis-tiles" }
-eframe      = { workspace = true }
 
 wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 js-sys = "0.3"
 talc = "5"
 
 [dependencies.web-sys]
 version = "0.3"
-features = [
-    "Document",
-    "Element",
-    "HtmlCanvasElement",
-    "Window",
-    "DedicatedWorkerGlobalScope",
-    "MessageEvent",
-    "console",
-]
+features = ["Window"]

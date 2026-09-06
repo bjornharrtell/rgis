@@ -11,8 +11,6 @@ rgis-tiles        = { path = "../rgis-tiles" }
 geo-types         = { workspace = true }
 image             = { workspace = true }
 wgpu              = { workspace = true }
-egui-wgpu         = "0.36.1"
-epaint            = "0.36.1"
 rearcut           = { workspace = true }
 tiny-skia         = { workspace = true }
 bytemuck          = { workspace = true }
