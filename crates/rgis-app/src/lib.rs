@@ -875,10 +875,18 @@ impl RgisApp {
                     Vec::new()
                 };
                 let raster_tile_count = raster_tiles.len() as u32;
-                mesh.extend(rgis_render::build_scene_mesh(
-                    &self.project.layers,
-                    &self.project.viewport,
-                ));
+                let vector_image =
+                    rgis_render::render_vector_layers(&self.project.layers, &self.project.viewport);
+                let vector_tile_count = vector_image.is_some() as u32;
+                if let Some(rgba) = vector_image {
+                    raster_tiles.push(rgis_render::TileDraw {
+                        key: vector_draw_key(&rgba),
+                        rect: [0.0, 0.0, rect.width(), rect.height()],
+                        rgba: Arc::new(rgba),
+                        uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        opacity: 1.0,
+                    });
+                }
 
                 // Screen-space label glyph quads must be collected before
                 // `basemap_tiles` moves into the paint callback below. Only
@@ -906,6 +914,7 @@ impl RgisApp {
                     basemap_tiles,
                     tiles: raster_tiles,
                     raster_tile_count,
+                    vector_tile_count,
                     labels: label_glyphs,
                     glyph_bitmaps,
                     width: rect.width(),
@@ -1292,6 +1301,19 @@ fn tile_draw_key(source_id: &str, coord: TileCoord) -> u64 {
     hasher.finish()
 }
 
+/// Content-address the screen-space plain-vector image so the GPU texture
+/// cache cannot reuse pixels rendered for a previous viewport.
+fn vector_draw_key(image: &image::RgbaImage) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    image.width().hash(&mut hasher);
+    image.height().hash(&mut hasher);
+    image.as_raw().hash(&mut hasher);
+    hasher.finish() | (1 << 63)
+}
+
 /// Builds a [`TileFetcher`] for every `"type": "raster"` source referenced
 /// by a `raster` layer in `style` (e.g. `natural_earth` in the liberty
 /// style), keyed by source id -- see `RgisApp::style`/`drain_ready_tiles`.
@@ -1456,6 +1478,8 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response 
 #[cfg(test)]
 mod glyph_baseline_tests {
     use super::glyph_run_baseline_offset;
+    use super::vector_draw_key;
+    use image::RgbaImage;
     use rgis_tiles::Glyph;
 
     fn glyph(top: i32, height: u32) -> Glyph {
@@ -1467,6 +1491,15 @@ mod glyph_baseline_tests {
             top,
             advance: 0,
         }
+    }
+
+    #[test]
+    fn vector_texture_key_changes_when_rendered_pixels_change() {
+        let first = RgbaImage::new(2, 2);
+        let mut second = first.clone();
+        second.get_pixel_mut(0, 0).0[0] = 1;
+
+        assert_ne!(vector_draw_key(&first), vector_draw_key(&second));
     }
 
     /// Real "Noto Sans Regular" digit metrics (fetched from OpenFreeMap's

@@ -889,6 +889,9 @@ pub struct MapCallback {
     /// background vs. user-layer geometry around `background_index_count`.
     pub tiles: Vec<TileDraw>,
     pub raster_tile_count: u32,
+    /// Number of Skia-rendered plain-vector textures immediately following
+    /// the raster tiles. These are drawn after the basemap and before icons.
+    pub vector_tile_count: u32,
     pub labels: Vec<LabelGlyphInstance>,
     pub glyph_bitmaps: GlyphBitmapRanges,
     pub width: f32,
@@ -1075,6 +1078,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             basemap_draws,
             tile_keys: self.tiles.iter().map(|tile| tile.key).collect(),
             raster_tile_count: self.raster_tile_count,
+            vector_tile_count: self.vector_tile_count,
             text_index_count: text_indices.len() as u32,
         });
 
@@ -1249,6 +1253,29 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             render_pass.draw_indexed(frame.background_index_count..frame.index_count, 0, 0..1);
         }
 
+        // Skia-rendered plain-vector image is drawn after the basemap, but
+        // before sprite icons and labels.
+        if let (Some(tile_vertex_slice), Some(tile_index_slice)) = (
+            resources.tile_vertex_buffer.slice(),
+            resources.tile_index_buffer.slice(),
+        ) && frame.vector_tile_count > 0
+        {
+            render_pass.set_pipeline(&resources.tile_pipeline);
+            render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, tile_vertex_slice);
+            render_pass.set_index_buffer(tile_index_slice, wgpu::IndexFormat::Uint32);
+            for i in 0..frame.vector_tile_count as usize {
+                let index = frame.raster_tile_count as usize + i;
+                if let Some(key) = frame.tile_keys.get(index)
+                    && let Some(texture) = resources.tile_textures.peek(key)
+                {
+                    render_pass.set_bind_group(1, &texture.bind_group, &[]);
+                    let index_start = (index * 6) as u32;
+                    render_pass.draw_indexed(index_start..index_start + 6, 0, 0..1);
+                }
+            }
+        }
+
         // Sprite icon quads (see `TileDraw`'s docs): drawn here, above the
         // background/basemap/vector layers above, using the same
         // vertex/index buffers and pipeline as the raster tiles drawn at
@@ -1258,19 +1285,18 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         if let (Some(tile_vertex_slice), Some(tile_index_slice)) = (
             resources.tile_vertex_buffer.slice(),
             resources.tile_index_buffer.slice(),
-        ) && (frame.raster_tile_count as usize) < frame.tile_keys.len()
+        ) && (frame.raster_tile_count as usize + frame.vector_tile_count as usize)
+            < frame.tile_keys.len()
         {
             render_pass.set_pipeline(&resources.tile_pipeline);
             render_pass.set_bind_group(0, &resources.screen_bind_group, &[]);
             render_pass.set_vertex_buffer(0, tile_vertex_slice);
             render_pass.set_index_buffer(tile_index_slice, wgpu::IndexFormat::Uint32);
-            for (i, key) in frame.tile_keys[frame.raster_tile_count as usize..]
-                .iter()
-                .enumerate()
-            {
+            let icon_start = frame.raster_tile_count as usize + frame.vector_tile_count as usize;
+            for (i, key) in frame.tile_keys[icon_start..].iter().enumerate() {
                 if let Some(texture) = resources.tile_textures.peek(key) {
                     render_pass.set_bind_group(1, &texture.bind_group, &[]);
-                    let index_start = ((frame.raster_tile_count as usize + i) * 6) as u32;
+                    let index_start = ((icon_start + i) * 6) as u32;
                     render_pass.draw_indexed(index_start..index_start + 6, 0, 0..1);
                 }
             }
@@ -1304,6 +1330,7 @@ struct FramePrepared {
     basemap_draws: Vec<BasemapDrawPrepared>,
     tile_keys: Vec<u64>,
     raster_tile_count: u32,
+    vector_tile_count: u32,
     text_index_count: u32,
 }
 
