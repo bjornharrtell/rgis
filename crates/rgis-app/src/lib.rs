@@ -1497,6 +1497,13 @@ fn apply_catppuccin_theme(ctx: &egui::Context) {
         error_fg_color: theme.maroon,
         window_fill: theme.base,
         panel_fill: theme.base,
+        #[cfg(target_arch = "wasm32")]
+        window_corner_radius: egui::CornerRadius::ZERO,
+        #[cfg(not(target_arch = "wasm32"))]
+        window_corner_radius: old.window_corner_radius,
+        #[cfg(target_arch = "wasm32")]
+        window_stroke: egui::Stroke::NONE,
+        #[cfg(not(target_arch = "wasm32"))]
         window_stroke: egui::Stroke {
             color: theme.overlay1,
             ..old.window_stroke
