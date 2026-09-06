@@ -880,7 +880,7 @@ impl RgisApp {
                 let vector_tile_count = vector_image.is_some() as u32;
                 if let Some(rgba) = vector_image {
                     raster_tiles.push(rgis_render::TileDraw {
-                        key: u64::MAX,
+                        key: vector_draw_key(&rgba),
                         rect: [0.0, 0.0, rect.width(), rect.height()],
                         rgba: Arc::new(rgba),
                         uv_rect: [0.0, 0.0, 1.0, 1.0],
@@ -1301,6 +1301,19 @@ fn tile_draw_key(source_id: &str, coord: TileCoord) -> u64 {
     hasher.finish()
 }
 
+/// Content-address the screen-space plain-vector image so the GPU texture
+/// cache cannot reuse pixels rendered for a previous viewport.
+fn vector_draw_key(image: &image::RgbaImage) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    image.width().hash(&mut hasher);
+    image.height().hash(&mut hasher);
+    image.as_raw().hash(&mut hasher);
+    hasher.finish() | (1 << 63)
+}
+
 /// Builds a [`TileFetcher`] for every `"type": "raster"` source referenced
 /// by a `raster` layer in `style` (e.g. `natural_earth` in the liberty
 /// style), keyed by source id -- see `RgisApp::style`/`drain_ready_tiles`.
@@ -1475,6 +1488,21 @@ mod glyph_baseline_tests {
             left: 0,
             top,
             advance: 0,
+        }
+
+        #[cfg(test)]
+        mod vector_texture_tests {
+            use super::vector_draw_key;
+            use image::RgbaImage;
+
+            #[test]
+            fn vector_texture_key_changes_when_rendered_pixels_change() {
+                let mut first = RgbaImage::new(2, 2);
+                let mut second = first.clone();
+                second.get_pixel_mut(0, 0).0[0] = 1;
+
+                assert_ne!(vector_draw_key(&first), vector_draw_key(&second));
+            }
         }
     }
 
