@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::labels;
 use crate::ui::{self, LayerUi, StyleColorTarget};
 use gpui::{
     App, Bounds, Context, DevicePixels, MouseButton, Render, Size, Window, WindowBounds,
@@ -15,8 +16,8 @@ use gpui::{
 use gpui_web::WebPlatform;
 use rgis_core::{Color, Layer, LayerId, Project, Viewport, lonlat_to_mercator};
 use rgis_render::{
-    GlyphBitmapRanges, MapCallback, MapRenderResources, StyleSheet, TileMesh,
-    build_background_mesh, build_tile_mesh, render_vector_layers,
+    MapCallback, MapRenderResources, StyleSheet, TileMesh, build_background_mesh, build_tile_mesh,
+    render_vector_layers,
 };
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 use wasm_bindgen::JsCast;
@@ -190,6 +191,7 @@ pub struct RgisWebApp {
     project: Project,
     style: Arc<StyleSheet>,
     vector_tile_fetcher: Arc<VectorTileFetcher>,
+    glyph_fetcher: Arc<rgis_tiles::GlyphFetcher>,
     gpu_basemap_meshes: HashMap<TileCoord, Arc<TileMesh>>,
     pending_tiles: HashSet<TileCoord>,
     resources: Option<MapRenderResources>,
@@ -221,6 +223,7 @@ impl RgisWebApp {
             project,
             style,
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
+            glyph_fetcher: rgis_tiles::GlyphFetcher::new(),
             gpu_basemap_meshes: HashMap::new(),
             pending_tiles: HashSet::new(),
             resources: None,
@@ -720,6 +723,8 @@ impl RgisWebApp {
             });
         }
         let vector_tile_count = tiles.len() as u32;
+        let (labels, glyph_bitmaps) =
+            labels::collect_label_draws(&basemap_tiles, &self.glyph_fetcher);
         let background = if self.project.show_tiles {
             build_background_mesh(&self.project.viewport, &self.style)
         } else {
@@ -732,8 +737,8 @@ impl RgisWebApp {
             tiles,
             raster_tile_count: 0,
             vector_tile_count,
-            labels: Vec::new(),
-            glyph_bitmaps: GlyphBitmapRanges::default(),
+            labels,
+            glyph_bitmaps,
             width,
             height,
         }

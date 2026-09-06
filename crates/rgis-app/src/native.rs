@@ -10,9 +10,10 @@ use gpui::{
 use gpui_platform::application;
 use lru::LruCache;
 use poll_promise::Promise;
+use rgis_app::labels;
 use rgis_app::ui::{self, LayerUi, StyleColorTarget};
 use rgis_core::{Color, Layer, LayerId, Project};
-use rgis_render::{GlyphBitmapRanges, MapCallback, MapRenderResources, SceneMesh};
+use rgis_render::{MapCallback, MapRenderResources, SceneMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
 const SIDEBAR_WIDTH: f32 = 280.0;
@@ -119,6 +120,7 @@ pub struct RgisNativeApp {
     project: Project,
     style: Arc<rgis_render::StyleSheet>,
     vector_tile_fetcher: Arc<VectorTileFetcher>,
+    glyph_fetcher: Arc<rgis_tiles::GlyphFetcher>,
     tile_meshes: LruCache<TileCoord, Arc<rgis_render::TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
     pending_tile_meshes: Vec<Promise<(TileCoord, Option<rgis_render::TileMesh>)>>,
@@ -176,6 +178,7 @@ impl RgisNativeApp {
             project,
             style: Arc::new(style),
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
+            glyph_fetcher: rgis_tiles::GlyphFetcher::new(),
             tile_meshes: LruCache::new(std::num::NonZeroUsize::new(TILE_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
@@ -323,6 +326,8 @@ impl RgisNativeApp {
             });
         }
         let vector_tile_count = tiles.len() as u32;
+        let (labels, glyph_bitmaps) =
+            labels::collect_label_draws(&basemap_tiles, &self.glyph_fetcher);
         let mesh = if self.project.show_tiles {
             rgis_render::build_background_mesh(&self.project.viewport, &self.style)
         } else {
@@ -335,8 +340,8 @@ impl RgisNativeApp {
             tiles,
             raster_tile_count: 0,
             vector_tile_count,
-            labels: Vec::new(),
-            glyph_bitmaps: GlyphBitmapRanges::default(),
+            labels,
+            glyph_bitmaps,
             width,
             height,
         }
