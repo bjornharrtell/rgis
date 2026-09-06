@@ -1,5 +1,7 @@
 #[cfg(target_arch = "wasm32")]
-fn main() {}
+fn main() {
+    rgis_app::run();
+}
 
 #[cfg(all(
     not(target_arch = "wasm32"),

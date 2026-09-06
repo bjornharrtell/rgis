@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use gpui::{
@@ -8,6 +10,7 @@ use gpui::{
 use gpui_platform::application;
 use lru::LruCache;
 use poll_promise::Promise;
+use rgis_app::ui::{self, LayerUi, StyleColorTarget};
 use rgis_core::{Color, Layer, LayerId, Project};
 use rgis_render::{GlyphBitmapRanges, MapCallback, MapRenderResources, SceneMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
@@ -25,12 +28,6 @@ const ZED_TEXT: u32 = 0xd4d4d4;
 const ZED_MUTED: u32 = 0x929292;
 const ZED_ACCENT: u32 = 0x8ab4f8;
 const DEFAULT_STYLE_JSON: &str = include_str!("../../rgis-style/fixtures/liberty.json");
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StyleColorTarget {
-    Fill,
-    Stroke,
-}
 
 type LoadResults = Vec<(String, Result<rgis_io::LoadedLayer, rgis_io::IoError>)>;
 
@@ -1045,6 +1042,44 @@ impl RgisNativeApp {
     }
 }
 
+impl LayerUi for RgisNativeApp {
+    fn project(&self) -> &Project {
+        &self.project
+    }
+
+    fn project_mut(&mut self) -> &mut Project {
+        &mut self.project
+    }
+
+    fn layers_expanded(&self) -> bool {
+        self.layers_expanded
+    }
+
+    fn set_layers_expanded(&mut self, expanded: bool) {
+        self.layers_expanded = expanded;
+    }
+
+    fn style_editor_layer(&self) -> Option<LayerId> {
+        self.style_editor_layer
+    }
+
+    fn set_style_editor_layer(&mut self, layer: Option<LayerId>) {
+        self.style_editor_layer = layer;
+    }
+
+    fn style_color_target(&self) -> StyleColorTarget {
+        self.style_color_target
+    }
+
+    fn set_style_color_target(&mut self, target: StyleColorTarget) {
+        self.style_color_target = target;
+    }
+
+    fn add_layer(&mut self, window: &mut Window) {
+        self.queue_pick_files(window);
+    }
+}
+
 impl Render for RgisNativeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_map(window);
@@ -1133,7 +1168,13 @@ impl Render for RgisNativeApp {
             root = root.child(self.client_titlebar(cx));
         }
         root = root
-            .child(div().flex_1().flex().child(self.sidebar(cx)).child(map))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .child(ui::sidebar(self, cx))
+                    .child(map),
+            )
             .child(
                 div()
                     .h(px(STATUS_HEIGHT))

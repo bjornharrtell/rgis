@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/gpui-ce"]
 members = [
     "crates/rgis-app",
     "crates/rgis-core",
@@ -20,6 +21,13 @@ default-members = [
     "crates/rgis-style",
     "crates/rgis-tiles",
 ]
+
+# The web map uses GPUI's own wgpu device and surface compositor. This local
+# fork exposes that backend lifecycle until the upstream custom-GPU API lands.
+[patch."https://github.com/gpui-ce/gpui-ce"]
+gpui-ce = { path = "vendor/gpui-ce/crates/gpui" }
+gpui_ce_web = { path = "vendor/gpui-ce/crates/gpui_web" }
+gpui_ce_platform = { path = "vendor/gpui-ce/crates/gpui_platform" }
 
 [workspace.package]
 version = "0.1.0"
@@ -53,11 +61,10 @@ lru         = "0.18"
 directories = "6"
 
 # UI / rendering
-eframe      = { version = "0.35.0", features = ["persistence"] }
-egui        = "0.35.0"
 wgpu        = "=29.0.4"
 gpui        = { git = "https://github.com/gpui-ce/gpui-ce", rev = "0b84630eec5bb37122330ad175c8e94b148eadca", package = "gpui-ce" }
 gpui-platform = { git = "https://github.com/gpui-ce/gpui-ce", rev = "0b84630eec5bb37122330ad175c8e94b148eadca", package = "gpui_ce_platform", features = ["wayland", "x11"] }
+gpui-web    = { git = "https://github.com/gpui-ce/gpui-ce", rev = "0b84630eec5bb37122330ad175c8e94b148eadca", package = "gpui_ce_web", default-features = false }
 rearcut     = "1.0.0"
 tiny-skia   = { version = "0.11", default-features = false, features = ["std"] }
 bytemuck    = { version = "1.25.2", features = ["derive"] }

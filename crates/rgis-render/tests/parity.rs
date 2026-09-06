@@ -219,11 +219,7 @@ fn build_frame(style: &StyleSheet, viewport: &Viewport) -> MapCallback {
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Renders `callback` into an offscreen `width`x`height` RGBA image, doing
-/// exactly what `egui_wgpu` would do for a `MapCallback` inside a real
-/// paint pass, but manually: a real `eframe`/`egui` window isn't needed for
-/// `MapCallback::prepare`/`paint` since both are plain `CallbackTrait`
-/// methods taking a device/queue/render-pass and a type-erased resource
-/// map, all of which are constructible directly.
+/// exactly what the native GPUI adapter does, but into an offscreen texture.
 fn render_offscreen(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -231,9 +227,6 @@ fn render_offscreen(
     width: u32,
     height: u32,
 ) -> RgbaImage {
-    let mut resources = egui_wgpu::CallbackResources::default();
-    resources.insert(MapRenderResources::new(device, TARGET_FORMAT));
-
     let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("parity-msaa-color"),
         size: wgpu::Extent3d {
@@ -265,63 +258,18 @@ fn render_offscreen(
     let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let resolve_view = resolve_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let mut prepare_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("parity-prepare-encoder"),
-    });
-    let screen_descriptor = egui_wgpu::ScreenDescriptor {
-        size_in_pixels: [width, height],
-        pixels_per_point: 1.0,
-    };
-    let extra_buffers = {
-        use egui_wgpu::CallbackTrait;
-        callback.prepare(
-            device,
-            queue,
-            &screen_descriptor,
-            &mut prepare_encoder,
-            &mut resources,
-        )
-    };
-    let mut command_buffers = vec![prepare_encoder.finish()];
-    command_buffers.extend(extra_buffers);
-
     let mut paint_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("parity-paint-encoder"),
     });
-    {
-        let render_pass = paint_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("parity-render-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &msaa_view,
-                resolve_target: Some(&resolve_view),
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                    store: wgpu::StoreOp::Discard,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        let mut render_pass = render_pass.forget_lifetime();
-        let info = epaint::PaintCallbackInfo {
-            viewport: epaint::Rect::from_min_size(
-                epaint::Pos2::ZERO,
-                epaint::vec2(width as f32, height as f32),
-            ),
-            clip_rect: epaint::Rect::from_min_size(
-                epaint::Pos2::ZERO,
-                epaint::vec2(width as f32, height as f32),
-            ),
-            pixels_per_point: 1.0,
-            screen_size_px: [width, height],
-        };
-        use egui_wgpu::CallbackTrait;
-        callback.paint(info, &mut render_pass, &resources);
-    }
-    command_buffers.push(paint_encoder.finish());
+    let _resources = MapRenderResources::new(device, TARGET_FORMAT).render_into(
+        device,
+        queue,
+        &mut paint_encoder,
+        &msaa_view,
+        Some(&resolve_view),
+        callback,
+    );
+    let mut command_buffers = vec![paint_encoder.finish()];
 
     // Read the resolved (single-sample) texture back into an `RgbaImage`,
     // padding each row up to wgpu's 256-byte copy alignment then trimming

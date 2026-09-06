@@ -1,7 +1,5 @@
 //! wgpu render resources for drawing the tessellated vector mesh, raster
-//! tile images, and SDF text labels inside an `egui_wgpu::Callback`, so the
-//! map renders on the same wgpu device/surface as the rest of the (egui) UI
-//! — on native and in the browser (WebGPU/WebGL2) alike.
+//! tile images, and SDF text labels inside the GPUI map surface.
 
 use std::sync::Arc;
 
@@ -16,9 +14,7 @@ use crate::mesh::{SceneMesh, Vertex};
 use crate::text::{GlyphBitmapRanges, LabelGlyphInstance};
 
 /// MSAA sample count for the map's wgpu pipelines. Must match whatever
-/// sample count eframe's shared renderer was created with (native: set via
-/// `NativeOptions::multisampling`; the web/WebOptions API has no equivalent
-/// knob, so it always renders at 1 sample there).
+/// Native GPUI uses multisampling while browser surfaces use a single sample.
 pub const MSAA_SAMPLES: u32 = if cfg!(target_arch = "wasm32") { 1 } else { 4 };
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
@@ -328,8 +324,7 @@ impl GlyphAtlas {
     }
 }
 
-/// Persistent GPU resources for the map. Created once and stored in eframe's
-/// `egui_wgpu::CallbackResources`, then reused every frame by [`MapCallback`].
+/// Persistent GPU resources for the map, reused every frame by [`MapCallback`].
 pub struct MapRenderResources {
     vector_pipeline: wgpu::RenderPipeline,
     screen_uniform_buffer: wgpu::Buffer,
@@ -752,9 +747,7 @@ impl MapRenderResources {
     }
 
     /// Uploads the dynamic data for one map frame and returns the draw metadata
-    /// consumed by [`Self::render_frame`]. This is the shared-device path used
-    /// by the native GPUI host; the browser adapter uses the same method from
-    /// its eframe callback.
+    /// consumed by [`Self::paint_frame`].
     pub fn prepare_frame(
         &mut self,
         device: &wgpu::Device,
@@ -926,11 +919,9 @@ impl MapRenderResources {
         }
     }
 
-    /// Runs the existing map callback against an offscreen target. GPUI owns
-    /// the window render pass, so this adapter records the map pass first and
-    /// returns the resources for reuse on the next frame.
+    /// Runs the map callback against an offscreen target.
     pub fn render_into(
-        self,
+        mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -938,38 +929,7 @@ impl MapRenderResources {
         resolve_view: Option<&wgpu::TextureView>,
         callback: &MapCallback,
     ) -> Self {
-        let mut callback_resources = egui_wgpu::CallbackResources::default();
-        callback_resources.insert(self);
-        let screen = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [
-                callback.width.max(1.0) as u32,
-                callback.height.max(1.0) as u32,
-            ],
-            pixels_per_point: 1.0,
-        };
-        let _ = <MapCallback as egui_wgpu::CallbackTrait>::prepare(
-            callback,
-            device,
-            queue,
-            &screen,
-            encoder,
-            &mut callback_resources,
-        );
-
-        let width = callback.width.max(1.0);
-        let height = callback.height.max(1.0);
-        let info = epaint::PaintCallbackInfo {
-            viewport: epaint::Rect::from_min_size(
-                epaint::pos2(0.0, 0.0),
-                epaint::vec2(width, height),
-            ),
-            clip_rect: epaint::Rect::from_min_size(
-                epaint::pos2(0.0, 0.0),
-                epaint::vec2(width, height),
-            ),
-            pixels_per_point: 1.0,
-            screen_size_px: [width as u32, height as u32],
-        };
+        let frame = self.prepare_frame(device, queue, callback);
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("rgis-map-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -986,22 +946,15 @@ impl MapRenderResources {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        // egui_wgpu's callback contract uses a static render-pass lifetime
-        // because callbacks may bind persistent buffers. The pass is strictly
-        // scoped to this call, so extending that borrow is safe here.
-        {
-            let render_pass: &mut wgpu::RenderPass<'static> =
-                unsafe { std::mem::transmute(&mut render_pass) };
-            <MapCallback as egui_wgpu::CallbackTrait>::paint(
-                callback,
-                info,
-                render_pass,
-                &callback_resources,
-            );
-        }
-        callback_resources
-            .remove::<MapRenderResources>()
-            .expect("map resources inserted before rendering")
+        callback.paint_frame(
+            &self,
+            &mut render_pass,
+            &frame,
+            callback.width.max(1.0),
+            callback.height.max(1.0),
+        );
+        drop(render_pass);
+        self
     }
 }
 
@@ -1120,7 +1073,7 @@ fn create_tile_transform_bind_group(
     })
 }
 
-/// Per-frame data handed to the egui paint callback. Built fresh every frame
+/// Per-frame data handed to the map paint pass. Built fresh every frame
 /// from the current viewport/project state.
 pub struct MapCallback {
     /// Background quad (indices `0..background_index_count`) followed by
@@ -1151,37 +1104,15 @@ pub struct MapCallback {
     pub height: f32,
 }
 
-impl egui_wgpu::CallbackTrait for MapCallback {
-    fn prepare(
+impl MapCallback {
+    pub fn paint_frame(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let Some(mut resources) = callback_resources.remove::<MapRenderResources>() else {
-            return Vec::new();
-        };
-        let frame = resources.prepare_frame(device, queue, self);
-        callback_resources.insert(resources);
-        callback_resources.insert(frame);
-
-        Vec::new()
-    }
-
-    fn paint(
-        &self,
-        info: epaint::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &egui_wgpu::CallbackResources,
+        resources: &MapRenderResources,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        frame: &MapRenderFrame,
+        viewport_width: f32,
+        viewport_height: f32,
     ) {
-        let Some(resources) = callback_resources.get::<MapRenderResources>() else {
-            return;
-        };
-        let Some(frame) = callback_resources.get::<MapRenderFrame>() else {
-            return;
-        };
         // The vector `background` layer (an opaque full-viewport quad, e.g.
         // liberty's `#f8f4f0`) must be the very first thing drawn: it has
         // alpha 1, so anything drawn *before* it would be fully erased, not
@@ -1250,25 +1181,19 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         // overlap and double-draw the same (semi-transparent) geometry,
         // visibly darkening/duplicating it right at tile boundaries.
         if !frame.basemap_draws.is_empty() {
-            let vp = info.viewport_in_pixels();
-            let ppp = info.pixels_per_point;
             let scissor_for = |offset: [f32; 2], size: f32| -> Option<(u32, u32, u32, u32)> {
-                let left = vp.left_px as f32 + offset[0] * ppp;
-                let top = vp.top_px as f32 + offset[1] * ppp;
+                let left = offset[0];
+                let top = offset[1];
                 // Floor the leading edge and ceil the trailing edge instead
                 // of rounding to nearest, so adjacent tiles' rects always
                 // overlap by up to 1px rather than occasionally leaving a
                 // 1px gap when a shared tile edge falls near a pixel's
                 // rounding threshold (visible as thin white seams that only
                 // appear at some fractional zoom levels).
-                let clip_left = left.floor().max(vp.left_px as f32);
-                let clip_top = top.floor().max(vp.top_px as f32);
-                let clip_right = (left + size * ppp)
-                    .ceil()
-                    .min((vp.left_px + vp.width_px) as f32);
-                let clip_bottom = (top + size * ppp)
-                    .ceil()
-                    .min((vp.top_px + vp.height_px) as f32);
+                let clip_left = left.floor().max(0.0);
+                let clip_top = top.floor().max(0.0);
+                let clip_right = (left + size).ceil().min(viewport_width);
+                let clip_bottom = (top + size).ceil().min(viewport_height);
                 let width = clip_right - clip_left;
                 let height = clip_bottom - clip_top;
                 (width >= 1.0 && height >= 1.0).then_some((
@@ -1316,13 +1241,8 @@ impl egui_wgpu::CallbackTrait for MapCallback {
 
             // Restore the full callback viewport as the scissor rect so the
             // user-layer draws below aren't clipped to the last tile drawn.
-            if vp.width_px > 0 && vp.height_px > 0 {
-                render_pass.set_scissor_rect(
-                    vp.left_px as u32,
-                    vp.top_px as u32,
-                    vp.width_px as u32,
-                    vp.height_px as u32,
-                );
+            if viewport_width > 0.0 && viewport_height > 0.0 {
+                render_pass.set_scissor_rect(0, 0, viewport_width as u32, viewport_height as u32);
             }
         }
 
