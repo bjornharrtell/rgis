@@ -53,9 +53,11 @@ lru         = "0.18"
 directories = "6"
 
 # UI / rendering
-eframe      = { version = "0.36.1", features = ["persistence"] }
-egui        = "0.36.1"
-wgpu        = "=30.0.1"
+eframe      = { version = "0.35.0", features = ["persistence"] }
+egui        = "0.35.0"
+wgpu        = "=29.0.4"
+gpui        = { git = "https://github.com/gpui-ce/gpui-ce", rev = "0b84630eec5bb37122330ad175c8e94b148eadca", package = "gpui-ce" }
+gpui-platform = { git = "https://github.com/gpui-ce/gpui-ce", rev = "0b84630eec5bb37122330ad175c8e94b148eadca", package = "gpui_ce_platform", features = ["wayland", "x11"] }
 rearcut     = "1.0.0"
 tiny-skia   = { version = "0.11", default-features = false, features = ["std"] }
 bytemuck    = { version = "1.25.2", features = ["derive"] }

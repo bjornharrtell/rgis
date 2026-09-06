@@ -18,9 +18,11 @@ rgis-io     = { path = "../rgis-io" }
 rgis-render = { path = "../rgis-render" }
 rgis-tiles  = { path = "../rgis-tiles" }
 
+gpui        = { workspace = true }
+gpui-platform = { workspace = true }
 eframe      = { workspace = true }
 egui        = { workspace = true }
-egui-wgpu   = "0.36.1"
+egui-wgpu   = "0.35.0"
 wgpu        = { workspace = true }
 image       = { workspace = true }
 rfd         = { workspace = true }

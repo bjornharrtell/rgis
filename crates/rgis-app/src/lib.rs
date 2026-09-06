@@ -1,6 +1,6 @@
-//! Shared `eframe::App` implementation for `rgis`, used by both the native
-//! binary ([`crate`] via `main.rs`) and the browser build (`rgis-web`, via
-//! `eframe::WebRunner`).
+#![cfg(target_arch = "wasm32")]
+
+//! Browser-only eframe implementation for `rgis`.
 
 use std::num::NonZeroUsize;
 #[cfg(target_arch = "wasm32")]

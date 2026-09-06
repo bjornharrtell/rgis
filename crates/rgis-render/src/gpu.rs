@@ -750,6 +750,259 @@ impl MapRenderResources {
         );
         self.tile_transform_capacity = capacity;
     }
+
+    /// Uploads the dynamic data for one map frame and returns the draw metadata
+    /// consumed by [`Self::render_frame`]. This is the shared-device path used
+    /// by the native GPUI host; the browser adapter uses the same method from
+    /// its eframe callback.
+    pub fn prepare_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        callback: &MapCallback,
+    ) -> MapRenderFrame {
+        self.update_screen_size(queue, callback.width, callback.height);
+
+        for tile in &callback.tiles {
+            self.ensure_tile_texture(device, queue, tile);
+        }
+
+        for draw in &callback.basemap_tiles {
+            self.ensure_basemap_tile_buffer(device, draw.coord, &draw.mesh);
+        }
+
+        self.ensure_tile_transform_capacity(device, callback.basemap_tiles.len() as u64);
+        let stride = self.tile_transform_stride;
+        let basemap_draws = callback
+            .basemap_tiles
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, draw)| {
+                if !self.tile_gpu_meshes.contains(&draw.coord) {
+                    return None;
+                }
+                let uniform = TileTransformUniform {
+                    offset: draw.offset,
+                    scale: draw.scale,
+                    width_scale: draw.width_scale,
+                };
+                let transform_offset = slot as u64 * stride;
+                queue.write_buffer(
+                    &self.tile_transform_pool_buffer,
+                    transform_offset,
+                    bytemuck::bytes_of(&uniform),
+                );
+                Some(BasemapDrawPrepared {
+                    coord: draw.coord,
+                    offset: draw.offset,
+                    size: draw.size,
+                    transform_offset: transform_offset as u32,
+                })
+            })
+            .collect();
+
+        self.scene_vertex_buffer.write(
+            device,
+            queue,
+            bytemuck::cast_slice(&callback.mesh.vertices),
+        );
+        self.scene_index_buffer
+            .write(device, queue, bytemuck::cast_slice(&callback.mesh.indices));
+
+        let mut tile_vertices = Vec::with_capacity(callback.tiles.len() * 4);
+        let mut tile_indices = Vec::with_capacity(callback.tiles.len() * 6);
+        for (i, tile) in callback.tiles.iter().enumerate() {
+            let [x, y, w, h] = tile.rect;
+            let [u0, v0, u1, v1] = tile.uv_rect;
+            let base = (i * 4) as u32;
+            tile_vertices.extend_from_slice(&[
+                TileVertex {
+                    position: [x, y],
+                    uv: [u0, v0],
+                    opacity: tile.opacity,
+                },
+                TileVertex {
+                    position: [x + w, y],
+                    uv: [u1, v0],
+                    opacity: tile.opacity,
+                },
+                TileVertex {
+                    position: [x + w, y + h],
+                    uv: [u1, v1],
+                    opacity: tile.opacity,
+                },
+                TileVertex {
+                    position: [x, y + h],
+                    uv: [u0, v1],
+                    opacity: tile.opacity,
+                },
+            ]);
+            tile_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        self.tile_vertex_buffer
+            .write(device, queue, bytemuck::cast_slice(&tile_vertices));
+        self.tile_index_buffer
+            .write(device, queue, bytemuck::cast_slice(&tile_indices));
+
+        let mut text_vertices = Vec::with_capacity(callback.labels.len() * 4);
+        let mut text_indices = Vec::with_capacity(callback.labels.len() * 6);
+        for label in &callback.labels {
+            let range_start = glyph_range_start(label.codepoint);
+            let Some(range) = callback
+                .glyph_bitmaps
+                .get(&(label.fontstack.clone(), range_start))
+            else {
+                continue;
+            };
+            let Some(glyph) = range.get(&label.codepoint) else {
+                continue;
+            };
+            let Some(atlas_rect) =
+                self.glyph_atlas
+                    .ensure(device, queue, &label.fontstack, label.codepoint, glyph)
+            else {
+                continue;
+            };
+
+            let [x, y, w, h] = label.rect;
+            let atlas_size = self.glyph_atlas.size as f32;
+            let u0 = atlas_rect.x as f32 / atlas_size;
+            let v0 = atlas_rect.y as f32 / atlas_size;
+            let u1 = (atlas_rect.x + atlas_rect.w) as f32 / atlas_size;
+            let v1 = (atlas_rect.y + atlas_rect.h) as f32 / atlas_size;
+            let (sin_a, cos_a) = label.angle.sin_cos();
+            let [ax, ay] = label.anchor;
+            let rotate = |px: f32, py: f32| -> [f32; 2] {
+                let dx = px - ax;
+                let dy = py - ay;
+                [ax + dx * cos_a - dy * sin_a, ay + dx * sin_a + dy * cos_a]
+            };
+            let base = text_vertices.len() as u32;
+            text_vertices.extend_from_slice(&[
+                TextVertex {
+                    position: rotate(x, y),
+                    uv: [u0, v0],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+                TextVertex {
+                    position: rotate(x + w, y),
+                    uv: [u1, v0],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+                TextVertex {
+                    position: rotate(x + w, y + h),
+                    uv: [u1, v1],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+                TextVertex {
+                    position: rotate(x, y + h),
+                    uv: [u0, v1],
+                    color: label.color,
+                    halo_color: label.halo_color,
+                },
+            ]);
+            text_indices.extend(
+                UNIT_QUAD_INDICES
+                    .iter()
+                    .map(|&index| base + u32::from(index)),
+            );
+        }
+        self.text_vertex_buffer
+            .write(device, queue, bytemuck::cast_slice(&text_vertices));
+        self.text_index_buffer
+            .write(device, queue, bytemuck::cast_slice(&text_indices));
+
+        MapRenderFrame {
+            index_count: callback.mesh.indices.len() as u32,
+            background_index_count: callback.background_index_count,
+            basemap_draws,
+            tile_keys: callback.tiles.iter().map(|tile| tile.key).collect(),
+            raster_tile_count: callback.raster_tile_count,
+            vector_tile_count: callback.vector_tile_count,
+            text_index_count: text_indices.len() as u32,
+        }
+    }
+
+    /// Runs the existing map callback against an offscreen target. GPUI owns
+    /// the window render pass, so this adapter records the map pass first and
+    /// returns the resources for reuse on the next frame.
+    pub fn render_into(
+        self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        resolve_view: Option<&wgpu::TextureView>,
+        callback: &MapCallback,
+    ) -> Self {
+        let mut callback_resources = egui_wgpu::CallbackResources::default();
+        callback_resources.insert(self);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [
+                callback.width.max(1.0) as u32,
+                callback.height.max(1.0) as u32,
+            ],
+            pixels_per_point: 1.0,
+        };
+        let _ = <MapCallback as egui_wgpu::CallbackTrait>::prepare(
+            callback,
+            device,
+            queue,
+            &screen,
+            encoder,
+            &mut callback_resources,
+        );
+
+        let width = callback.width.max(1.0);
+        let height = callback.height.max(1.0);
+        let info = epaint::PaintCallbackInfo {
+            viewport: epaint::Rect::from_min_size(
+                epaint::pos2(0.0, 0.0),
+                epaint::vec2(width, height),
+            ),
+            clip_rect: epaint::Rect::from_min_size(
+                epaint::pos2(0.0, 0.0),
+                epaint::vec2(width, height),
+            ),
+            pixels_per_point: 1.0,
+            screen_size_px: [width as u32, height as u32],
+        };
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("rgis-map-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                depth_slice: None,
+                resolve_target: resolve_view,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        // egui_wgpu's callback contract uses a static render-pass lifetime
+        // because callbacks may bind persistent buffers. The pass is strictly
+        // scoped to this call, so extending that borrow is safe here.
+        {
+            let render_pass: &mut wgpu::RenderPass<'static> =
+                unsafe { std::mem::transmute(&mut render_pass) };
+            <MapCallback as egui_wgpu::CallbackTrait>::paint(
+                callback,
+                info,
+                render_pass,
+                &callback_resources,
+            );
+        }
+        callback_resources
+            .remove::<MapRenderResources>()
+            .expect("map resources inserted before rendering")
+    }
 }
 
 /// Initial number of tile slots in `MapRenderResources::tile_transform_pool_buffer`.
@@ -907,180 +1160,12 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Some(resources) = callback_resources.get_mut::<MapRenderResources>() else {
+        let Some(mut resources) = callback_resources.remove::<MapRenderResources>() else {
             return Vec::new();
         };
-
-        resources.update_screen_size(queue, self.width, self.height);
-
-        for tile in &self.tiles {
-            resources.ensure_tile_texture(device, queue, tile);
-        }
-
-        for draw in &self.basemap_tiles {
-            resources.ensure_basemap_tile_buffer(device, draw.coord, &draw.mesh);
-        }
-
-        resources.ensure_tile_transform_capacity(device, self.basemap_tiles.len() as u64);
-        let stride = resources.tile_transform_stride;
-        let basemap_draws = self
-            .basemap_tiles
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, draw)| {
-                if !resources.tile_gpu_meshes.contains(&draw.coord) {
-                    return None;
-                }
-                let uniform = TileTransformUniform {
-                    offset: draw.offset,
-                    scale: draw.scale,
-                    width_scale: draw.width_scale,
-                };
-                let transform_offset = slot as u64 * stride;
-                queue.write_buffer(
-                    &resources.tile_transform_pool_buffer,
-                    transform_offset,
-                    bytemuck::bytes_of(&uniform),
-                );
-                Some(BasemapDrawPrepared {
-                    coord: draw.coord,
-                    offset: draw.offset,
-                    size: draw.size,
-                    transform_offset: transform_offset as u32,
-                })
-            })
-            .collect();
-
-        resources.scene_vertex_buffer.write(
-            device,
-            queue,
-            bytemuck::cast_slice(&self.mesh.vertices),
-        );
-        resources
-            .scene_index_buffer
-            .write(device, queue, bytemuck::cast_slice(&self.mesh.indices));
-
-        let mut tile_vertices = Vec::with_capacity(self.tiles.len() * 4);
-        let mut tile_indices = Vec::with_capacity(self.tiles.len() * 6);
-        for (i, tile) in self.tiles.iter().enumerate() {
-            let [x, y, w, h] = tile.rect;
-            let [u0, v0, u1, v1] = tile.uv_rect;
-            let opacity = tile.opacity;
-            tile_vertices.push(TileVertex {
-                position: [x, y],
-                uv: [u0, v0],
-                opacity,
-            });
-            tile_vertices.push(TileVertex {
-                position: [x + w, y],
-                uv: [u1, v0],
-                opacity,
-            });
-            tile_vertices.push(TileVertex {
-                position: [x + w, y + h],
-                uv: [u1, v1],
-                opacity,
-            });
-            tile_vertices.push(TileVertex {
-                position: [x, y + h],
-                uv: [u0, v1],
-                opacity,
-            });
-            let base = (i * 4) as u32;
-            tile_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
-        resources
-            .tile_vertex_buffer
-            .write(device, queue, bytemuck::cast_slice(&tile_vertices));
-        resources
-            .tile_index_buffer
-            .write(device, queue, bytemuck::cast_slice(&tile_indices));
-
-        let mut text_vertices = Vec::with_capacity(self.labels.len() * 4);
-        let mut text_indices = Vec::with_capacity(self.labels.len() * 6);
-        for label in &self.labels {
-            let range_start = glyph_range_start(label.codepoint);
-            let Some(range) = self
-                .glyph_bitmaps
-                .get(&(label.fontstack.clone(), range_start))
-            else {
-                continue;
-            };
-            let Some(glyph) = range.get(&label.codepoint) else {
-                continue;
-            };
-            let Some(atlas_rect) = resources.glyph_atlas.ensure(
-                device,
-                queue,
-                &label.fontstack,
-                label.codepoint,
-                glyph,
-            ) else {
-                continue;
-            };
-
-            let [x, y, w, h] = label.rect;
-            let atlas_size = resources.glyph_atlas.size as f32;
-            let u0 = atlas_rect.x as f32 / atlas_size;
-            let v0 = atlas_rect.y as f32 / atlas_size;
-            let u1 = (atlas_rect.x + atlas_rect.w) as f32 / atlas_size;
-            let v1 = (atlas_rect.y + atlas_rect.h) as f32 / atlas_size;
-            let (sin_a, cos_a) = label.angle.sin_cos();
-            let [ax, ay] = label.anchor;
-            let rotate = |px: f32, py: f32| -> [f32; 2] {
-                let dx = px - ax;
-                let dy = py - ay;
-                [ax + dx * cos_a - dy * sin_a, ay + dx * sin_a + dy * cos_a]
-            };
-            let base = text_vertices.len() as u32;
-            text_vertices.extend_from_slice(&[
-                TextVertex {
-                    position: rotate(x, y),
-                    uv: [u0, v0],
-                    color: label.color,
-                    halo_color: label.halo_color,
-                },
-                TextVertex {
-                    position: rotate(x + w, y),
-                    uv: [u1, v0],
-                    color: label.color,
-                    halo_color: label.halo_color,
-                },
-                TextVertex {
-                    position: rotate(x + w, y + h),
-                    uv: [u1, v1],
-                    color: label.color,
-                    halo_color: label.halo_color,
-                },
-                TextVertex {
-                    position: rotate(x, y + h),
-                    uv: [u0, v1],
-                    color: label.color,
-                    halo_color: label.halo_color,
-                },
-            ]);
-            text_indices.extend(
-                UNIT_QUAD_INDICES
-                    .iter()
-                    .map(|&index| base + u32::from(index)),
-            );
-        }
-        resources
-            .text_vertex_buffer
-            .write(device, queue, bytemuck::cast_slice(&text_vertices));
-        resources
-            .text_index_buffer
-            .write(device, queue, bytemuck::cast_slice(&text_indices));
-
-        callback_resources.insert(FramePrepared {
-            index_count: self.mesh.indices.len() as u32,
-            background_index_count: self.background_index_count,
-            basemap_draws,
-            tile_keys: self.tiles.iter().map(|tile| tile.key).collect(),
-            raster_tile_count: self.raster_tile_count,
-            vector_tile_count: self.vector_tile_count,
-            text_index_count: text_indices.len() as u32,
-        });
+        let frame = resources.prepare_frame(device, queue, self);
+        callback_resources.insert(resources);
+        callback_resources.insert(frame);
 
         Vec::new()
     }
@@ -1094,7 +1179,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         let Some(resources) = callback_resources.get::<MapRenderResources>() else {
             return;
         };
-        let Some(frame) = callback_resources.get::<FramePrepared>() else {
+        let Some(frame) = callback_resources.get::<MapRenderFrame>() else {
             return;
         };
         // The vector `background` layer (an opaque full-viewport quad, e.g.
@@ -1324,7 +1409,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
 /// `tile_vertex_buffer`/`tile_index_buffer`) instead of here, since they're
 /// reused (grown, never reallocated from scratch) across frames rather
 /// than rebuilt every time.
-struct FramePrepared {
+pub struct MapRenderFrame {
     index_count: u32,
     background_index_count: u32,
     basemap_draws: Vec<BasemapDrawPrepared>,
@@ -1368,11 +1453,11 @@ fn create_vector_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[Some(wgpu::VertexBufferLayout {
+            buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Vertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRS,
-            })],
+            }],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1422,11 +1507,11 @@ fn create_basemap_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[Some(wgpu::VertexBufferLayout {
+            buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Vertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRS,
-            })],
+            }],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1476,11 +1561,11 @@ fn create_basemap_line_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[Some(wgpu::VertexBufferLayout {
+            buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<LineVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &LINE_VERTEX_ATTRS,
-            })],
+            }],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1527,11 +1612,11 @@ fn create_tile_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[Some(wgpu::VertexBufferLayout {
+            buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<TileVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &TILE_VERTEX_ATTRS,
-            })],
+            }],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1581,11 +1666,11 @@ fn create_text_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[Some(wgpu::VertexBufferLayout {
+            buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<TextVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &TEXT_VERTEX_ATTRS,
-            })],
+            }],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {

@@ -1,33 +1,28 @@
 #[cfg(target_arch = "wasm32")]
 fn main() {}
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "linux", target_os = "freebsd")
+))]
+mod native;
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "linux", target_os = "freebsd")
+))]
 fn main() {
     let startup_paths: Vec<std::path::PathBuf> = std::env::args_os()
         .skip(1)
         .map(std::path::PathBuf::from)
         .collect();
+    native::run(startup_paths);
+}
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("rgis")
-            .with_inner_size([1280.0, 800.0]),
-        multisampling: rgis_render::MSAA_SAMPLES as u16,
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "rgis",
-        native_options,
-        Box::new(move |cc| {
-            let mut app = rgis_app::RgisApp::new(cc);
-            if startup_paths.is_empty() {
-                app.queue_load_sample();
-            } else {
-                app.queue_load_paths(startup_paths);
-            }
-            Ok(Box::new(app))
-        }),
-    )
-    .expect("failed to run rgis native app");
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "linux", target_os = "freebsd"))
+))]
+fn main() {
+    eprintln!("rgis native GPUI rendering is currently supported on Linux and FreeBSD");
 }
