@@ -965,12 +965,20 @@ impl Render for RgisWebApp {
                     }
                 }),
             )
-            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-                let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
-                this.project.viewport.zoom = (this.project.viewport.zoom + delta)
-                    .clamp(0.0, rgis_tiles::OPENFREEMAP_MAX_ZOOM as f64);
-                cx.notify();
-            }))
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, window, cx| {
+                    let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
+                    let scale = window.scale_factor();
+                    let cursor = [
+                        ((f32::from(event.position.x) - SIDEBAR_WIDTH) * scale)
+                            .clamp(0.0, this.project.viewport.width_px as f32),
+                        (f32::from(event.position.y) * scale)
+                            .clamp(0.0, this.project.viewport.height_px as f32),
+                    ];
+                    this.project.viewport.zoom_toward(cursor, delta);
+                    cx.notify();
+                }),
+            )
             .child(map_content);
         div()
             .size_full()
