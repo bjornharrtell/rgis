@@ -18,8 +18,6 @@ rgis-io     = { path = "../rgis-io" }
 rgis-render = { path = "../rgis-render" }
 rgis-tiles  = { path = "../rgis-tiles" }
 
-gpui        = { workspace = true }
-gpui-platform = { workspace = true }
 eframe      = { workspace = true }
 egui        = { workspace = true }
 egui-wgpu   = "0.35.0"
@@ -28,6 +26,10 @@ image       = { workspace = true }
 rfd         = { workspace = true }
 poll-promise = { workspace = true }
 lru         = { workspace = true }
+
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_os = "linux", target_os = "freebsd")))'.dependencies]
+gpui          = { workspace = true }
+gpui-platform = { workspace = true }
 
 # Native file loading uses Promise::spawn_thread (blocking IO on a background
 # std::thread, needs no extra feature). The browser can't spawn OS threads, so
