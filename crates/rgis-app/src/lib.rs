@@ -1478,6 +1478,8 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response 
 #[cfg(test)]
 mod glyph_baseline_tests {
     use super::glyph_run_baseline_offset;
+    use super::vector_draw_key;
+    use image::RgbaImage;
     use rgis_tiles::Glyph;
 
     fn glyph(top: i32, height: u32) -> Glyph {
@@ -1489,21 +1491,15 @@ mod glyph_baseline_tests {
             top,
             advance: 0,
         }
+    }
 
-        #[cfg(test)]
-        mod vector_texture_tests {
-            use super::vector_draw_key;
-            use image::RgbaImage;
+    #[test]
+    fn vector_texture_key_changes_when_rendered_pixels_change() {
+        let first = RgbaImage::new(2, 2);
+        let mut second = first.clone();
+        second.get_pixel_mut(0, 0).0[0] = 1;
 
-            #[test]
-            fn vector_texture_key_changes_when_rendered_pixels_change() {
-                let mut first = RgbaImage::new(2, 2);
-                let mut second = first.clone();
-                second.get_pixel_mut(0, 0).0[0] = 1;
-
-                assert_ne!(vector_draw_key(&first), vector_draw_key(&second));
-            }
-        }
+        assert_ne!(vector_draw_key(&first), vector_draw_key(&second));
     }
 
     /// Real "Noto Sans Regular" digit metrics (fetched from OpenFreeMap's
