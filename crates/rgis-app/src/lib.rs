@@ -1,6 +1,7 @@
 //! GPUI application entry points shared by the native and browser targets.
 
 pub mod labels;
+pub mod raster;
 pub mod ui;
 
 #[cfg(target_arch = "wasm32")]

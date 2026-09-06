@@ -11,8 +11,9 @@ use gpui_platform::application;
 use lru::LruCache;
 use poll_promise::Promise;
 use rgis_app::labels;
+use rgis_app::raster;
 use rgis_app::ui::{self, LayerUi, StyleColorTarget};
-use rgis_core::{Color, Layer, LayerId, Project};
+use rgis_core::{Bounds as GeoBounds, Color, Layer, LayerId, Project, mercator_to_lonlat};
 use rgis_render::{MapCallback, MapRenderResources, SceneMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
@@ -123,6 +124,8 @@ pub struct RgisNativeApp {
     glyph_fetcher: Arc<rgis_tiles::GlyphFetcher>,
     sprite_fetcher: Option<Arc<rgis_tiles::SpriteFetcher>>,
     sprite_atlas: Option<Arc<rgis_tiles::SpriteAtlas>>,
+    raster_fetchers: raster::RasterFetchers,
+    raster_tile_cache: raster::RasterTileCaches,
     tile_meshes: LruCache<TileCoord, Arc<rgis_render::TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
     pending_tile_meshes: Vec<Promise<(TileCoord, Option<rgis_render::TileMesh>)>>,
@@ -131,6 +134,8 @@ pub struct RgisNativeApp {
     pending_loads: Vec<Promise<LoadResults>>,
     status: String,
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
+    cursor_lonlat: Option<(f64, f64)>,
+    bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
     dragging: bool,
     layers_expanded: bool,
     style_editor_layer: Option<LayerId>,
@@ -178,6 +183,7 @@ impl RgisNativeApp {
         }
         let style = Arc::new(style);
         let sprite_fetcher = style.sprite.as_deref().map(rgis_tiles::SpriteFetcher::new);
+        let raster_fetchers = raster::fetchers_for_style(&style);
         Self {
             project,
             style,
@@ -185,6 +191,8 @@ impl RgisNativeApp {
             glyph_fetcher: rgis_tiles::GlyphFetcher::new(),
             sprite_fetcher,
             sprite_atlas: None,
+            raster_fetchers,
+            raster_tile_cache: raster::RasterTileCaches::new(),
             tile_meshes: LruCache::new(std::num::NonZeroUsize::new(TILE_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
@@ -193,6 +201,8 @@ impl RgisNativeApp {
             pending_loads: Vec::new(),
             status: "GPUI native renderer".to_string(),
             last_cursor: None,
+            cursor_lonlat: None,
+            bbox_zoom_start: None,
             dragging: false,
             layers_expanded: true,
             style_editor_layer: None,
@@ -254,6 +264,7 @@ impl RgisNativeApp {
     }
 
     fn drain_tiles(&mut self) {
+        raster::drain_fetchers(&self.raster_fetchers, &mut self.raster_tile_cache);
         while let Ok(ready) = self.vector_tile_fetcher.receiver.try_recv() {
             let coord = ready.coord;
             let style = Arc::clone(&self.style);
@@ -307,7 +318,26 @@ impl RgisNativeApp {
         self.project.viewport.height_px = height.max(1.0) as u32;
         let mut basemap_tiles = Vec::new();
         if self.project.show_tiles {
+            let mut exact_tiles = Vec::new();
+            let mut fallback_coords = std::collections::HashSet::new();
             for coord in visible_tiles_for_zoom(&self.project.viewport, OPENFREEMAP_MAX_ZOOM) {
+                if let Some(mesh) = self.tile_meshes.get(&coord) {
+                    exact_tiles.push((coord, Arc::clone(mesh)));
+                } else if self.pending_tiles.insert(coord) {
+                    self.vector_tile_fetcher.request(coord);
+                } else {
+                    for ancestor in raster::ancestor_coords(coord) {
+                        if self.tile_meshes.contains(&ancestor) {
+                            fallback_coords.insert(ancestor);
+                            break;
+                        }
+                        if self.pending_tiles.insert(ancestor) {
+                            self.vector_tile_fetcher.request(ancestor);
+                        }
+                    }
+                }
+            }
+            for coord in fallback_coords {
                 if let Some(mesh) = self.tile_meshes.get(&coord) {
                     let transform =
                         rgis_render::tile_screen_transform(coord, &self.project.viewport);
@@ -319,14 +349,29 @@ impl RgisNativeApp {
                         width_scale: transform.width_scale,
                         size: transform.size,
                     });
-                } else if self.pending_tiles.insert(coord) {
-                    self.vector_tile_fetcher.request(coord);
                 }
+            }
+            for (coord, mesh) in exact_tiles {
+                let transform = rgis_render::tile_screen_transform(coord, &self.project.viewport);
+                basemap_tiles.push(rgis_render::BasemapTileDraw {
+                    coord,
+                    mesh,
+                    offset: transform.offset,
+                    scale: transform.scale,
+                    width_scale: transform.width_scale,
+                    size: transform.size,
+                });
             }
         }
         let vector_tile =
             rgis_render::render_vector_layers(&self.project.layers, &self.project.viewport);
-        let mut tiles = Vec::new();
+        let mut tiles = raster::collect_draws(
+            &self.style,
+            &self.project.viewport,
+            &self.raster_fetchers,
+            &mut self.raster_tile_cache,
+        );
+        let raster_tile_count = tiles.len() as u32;
         if let Some(rgba) = vector_tile {
             tiles.push(rgis_render::TileDraw {
                 key: vector_draw_key(&rgba),
@@ -336,7 +381,7 @@ impl RgisNativeApp {
                 opacity: 1.0,
             });
         }
-        let vector_tile_count = tiles.len() as u32;
+        let vector_tile_count = tiles.len() as u32 - raster_tile_count;
         let (labels, glyph_bitmaps, icons) = labels::collect_label_draws(
             &basemap_tiles,
             &self.glyph_fetcher,
@@ -353,7 +398,7 @@ impl RgisNativeApp {
             mesh,
             basemap_tiles,
             tiles,
-            raster_tile_count: 0,
+            raster_tile_count,
             vector_tile_count,
             labels,
             glyph_bitmaps,
@@ -1121,24 +1166,72 @@ impl Render for RgisNativeApp {
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
                     this.dragging = true;
                     this.last_cursor = Some(event.position);
+                    this.bbox_zoom_start = event.modifiers.shift.then_some(event.position);
                     cx.notify();
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
                     this.dragging = false;
                     this.last_cursor = None;
+                    if let Some(start) = this.bbox_zoom_start.take() {
+                        let end = event.position;
+                        if (end.x - start.x).abs() > px(4.0) && (end.y - start.y).abs() > px(4.0) {
+                            let scale = window.scale_factor();
+                            let titlebar = if matches!(
+                                window.window_decorations(),
+                                gpui::Decorations::Client { .. }
+                            ) {
+                                TITLEBAR_HEIGHT
+                            } else {
+                                0.0
+                            };
+                            let to_map = |point: gpui::Point<gpui::Pixels>| {
+                                [
+                                    ((f32::from(point.x) - SIDEBAR_WIDTH) * scale)
+                                        .clamp(0.0, this.project.viewport.width_px as f32),
+                                    ((f32::from(point.y) - titlebar) * scale)
+                                        .clamp(0.0, this.project.viewport.height_px as f32),
+                                ]
+                            };
+                            let world_a = this.project.viewport.screen_to_world(to_map(start));
+                            let world_b = this.project.viewport.screen_to_world(to_map(end));
+                            this.project.viewport.fit_bounds(&GeoBounds {
+                                min_x: world_a.x.min(world_b.x),
+                                min_y: world_a.y.min(world_b.y),
+                                max_x: world_a.x.max(world_b.x),
+                                max_y: world_a.y.max(world_b.y),
+                            });
+                        }
+                    }
                     cx.notify();
                 }),
             )
             .on_mouse_move(
                 cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    let scale = window.scale_factor();
+                    let titlebar = if matches!(
+                        window.window_decorations(),
+                        gpui::Decorations::Client { .. }
+                    ) {
+                        TITLEBAR_HEIGHT
+                    } else {
+                        0.0
+                    };
+                    let cursor = [
+                        ((f32::from(event.position.x) - SIDEBAR_WIDTH) * scale)
+                            .clamp(0.0, this.project.viewport.width_px as f32),
+                        ((f32::from(event.position.y) - titlebar) * scale)
+                            .clamp(0.0, this.project.viewport.height_px as f32),
+                    ];
+                    let world = this.project.viewport.screen_to_world(cursor);
+                    this.cursor_lonlat = Some(mercator_to_lonlat(world.x, world.y));
                     if this.dragging
+                        && this.bbox_zoom_start.is_none()
                         && let Some(previous) = this.last_cursor.replace(event.position)
                     {
                         let delta = event.position - previous;
-                        let scale = window.scale_factor();
                         this.project
                             .viewport
                             .pan(f32::from(delta.x) * scale, f32::from(delta.y) * scale);
@@ -1206,8 +1299,12 @@ impl Render for RgisNativeApp {
                     .text_xs()
                     .text_color(rgb(ZED_MUTED))
                     .child(format!(
-                        "{}  ·  zoom {:.2}",
-                        self.status, self.project.viewport.zoom
+                        "{}  ·  zoom {:.2}{}",
+                        self.status,
+                        self.project.viewport.zoom,
+                        self.cursor_lonlat
+                            .map(|(lon, lat)| format!("  ·  {lon:.5}, {lat:.5}"))
+                            .unwrap_or_default()
                     )),
             );
         root
