@@ -175,6 +175,7 @@ pub struct RgisApp {
     /// viewports (see `MOBILE_WIDTH_THRESHOLD`) — irrelevant on desktop,
     /// where the layer list is always visible as a docked side panel.
     mobile_layers_open: bool,
+    style_dialog_layer: Option<LayerId>,
     /// e.g. "Vulkan"/"Metal" (native) or "BrowserWebGpu"/"Gl" (web) — shown
     /// in the status bar since the web build silently falls back to WebGL2
     /// (much higher per-draw-call overhead) when WebGPU isn't available.
@@ -218,6 +219,7 @@ impl RgisApp {
             layers_expanded: true,
             bbox_zoom_start: None,
             mobile_layers_open: false,
+            style_dialog_layer: None,
             gpu_backend_label,
         }
     }
@@ -616,6 +618,7 @@ impl RgisApp {
     /// panel and the mobile floating overlay (see `render_sidebar`).
     fn render_layers_content(&mut self, ui: &mut egui::Ui) {
         let mut to_toggle: Option<LayerId> = None;
+        let mut to_style: Option<LayerId> = None;
         let mut to_remove: Option<LayerId> = None;
         let mut show_tiles = self.project.show_tiles;
 
@@ -628,16 +631,20 @@ impl RgisApp {
                 // always the bottom of the stack.
                 for layer in self.project.layers.iter().rev() {
                     let mut visible = layer.visible;
-                    let (toggled, removed) = tree_row(ui, &mut visible, &layer.name, true);
+                    let (toggled, style_clicked, removed) =
+                        tree_row(ui, &mut visible, &layer.name, true);
                     if toggled {
                         to_toggle = Some(layer.id);
+                    }
+                    if style_clicked {
+                        to_style = Some(layer.id);
                     }
                     if removed {
                         to_remove = Some(layer.id);
                     }
                 }
 
-                tree_row(ui, &mut show_tiles, "OpenFreeMap Background", false);
+                let _ = tree_row(ui, &mut show_tiles, "OpenFreeMap Background", false);
             }
         });
 
@@ -649,6 +656,9 @@ impl RgisApp {
         }
         if let Some(id) = to_remove {
             self.project.remove_layer(id);
+        }
+        if let Some(id) = to_style {
+            self.style_dialog_layer = Some(id);
         }
 
         if let Some(error) = &self.last_error {
@@ -715,6 +725,55 @@ impl RgisApp {
                 ui.label(coords);
             });
         });
+    }
+
+    fn render_style_dialog(&mut self, ctx: &egui::Context) {
+        let Some(layer_id) = self.style_dialog_layer else {
+            return;
+        };
+
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Layer Style")
+            .id(egui::Id::new(("layer_style_window", layer_id.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let Some(layer) = self.project.get_layer_mut(layer_id) else {
+                    close = true;
+                    return;
+                };
+
+                ui.label(egui::RichText::new(&layer.name).strong());
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("Fill");
+                    let mut fill = style_color_to_egui(layer.style.fill);
+                    if ui.color_edit_button_srgba(&mut fill).changed() {
+                        layer.style.fill = egui_to_style_color(fill);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Stroke");
+                    let mut stroke = style_color_to_egui(layer.style.stroke);
+                    if ui.color_edit_button_srgba(&mut stroke).changed() {
+                        layer.style.stroke = egui_to_style_color(stroke);
+                    }
+                });
+                ui.add(
+                    egui::Slider::new(&mut layer.style.stroke_width, 0.1..=24.0).text("Line width"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut layer.style.point_radius, 1.0..=32.0)
+                        .text("Marker size"),
+                );
+            });
+
+        if !open || close {
+            self.style_dialog_layer = None;
+        }
     }
 
     fn render_map(&mut self, ui: &mut egui::Ui) {
@@ -1397,6 +1456,7 @@ impl eframe::App for RgisApp {
         self.render_status_bar(ui);
         self.render_sidebar(ui);
         self.render_map(ui);
+        self.render_style_dialog(ui.ctx());
 
         if ready_glyphs || !self.pending_loads.is_empty() || !self.pending_tiles.is_empty() {
             ui.ctx().request_repaint();
@@ -1416,7 +1476,12 @@ fn wasm_memory_bytes() -> u32 {
     buffer.byte_length()
 }
 
-fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool) -> (bool, bool) {
+fn tree_row(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    label: &str,
+    removable: bool,
+) -> (bool, bool, bool) {
     let row_height = ui.spacing().interact_size.y + ROW_VPAD * 2.0;
     let rect = egui::Rect::from_min_size(
         ui.cursor().min,
@@ -1430,6 +1495,7 @@ fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool)
     }
 
     let mut toggled = false;
+    let mut style_clicked = false;
     let mut remove_clicked = false;
 
     ui.horizontal(|ui| {
@@ -1444,6 +1510,9 @@ fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool)
         if removable {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
+                if hovered && icon_button(ui, "🎨", "Layer style…").clicked() {
+                    style_clicked = true;
+                }
                 if hovered && icon_button(ui, "✕", "Remove layer").clicked() {
                     remove_clicked = true;
                 }
@@ -1451,7 +1520,21 @@ fn tree_row(ui: &mut egui::Ui, checked: &mut bool, label: &str, removable: bool)
         }
     });
 
-    (toggled, remove_clicked)
+    (toggled, style_clicked, remove_clicked)
+}
+
+fn style_color_to_egui(color: rgis_core::Color) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
+fn egui_to_style_color(color: egui::Color32) -> rgis_core::Color {
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    rgis_core::Color::from_u8(r, g, b, a)
 }
 
 /// A small square icon button with the glyph painted centered in its rect
@@ -1477,9 +1560,12 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response 
 
 #[cfg(test)]
 mod glyph_baseline_tests {
+    use super::egui_to_style_color;
     use super::glyph_run_baseline_offset;
+    use super::style_color_to_egui;
     use super::vector_draw_key;
     use image::RgbaImage;
+    use rgis_core::Color;
     use rgis_tiles::Glyph;
 
     fn glyph(top: i32, height: u32) -> Glyph {
@@ -1536,5 +1622,31 @@ mod glyph_baseline_tests {
     fn empty_run_centers_on_nothing() {
         let glyphs: [Glyph; 0] = [];
         assert_eq!(glyph_run_baseline_offset(glyphs.iter()), 0.0);
+    }
+
+    #[test]
+    fn style_color_to_egui_clamps_components() {
+        let color = Color::rgba(-0.2, 0.5, 1.2, 2.0);
+        let egui_color = style_color_to_egui(color);
+        assert_eq!(
+            (
+                egui_color.r(),
+                egui_color.g(),
+                egui_color.b(),
+                egui_color.a()
+            ),
+            (0, 128, 255, 255)
+        );
+    }
+
+    #[test]
+    fn egui_color_to_style_color_round_trip_u8() {
+        let converted = egui_to_style_color(egui::Color32::from_rgba_unmultiplied(12, 34, 56, 78));
+        let expected = Color::from_u8(12, 34, 56, 78);
+        let tol = 1.0 / 255.0;
+        assert!((converted.r - expected.r).abs() <= tol);
+        assert!((converted.g - expected.g).abs() <= tol);
+        assert!((converted.b - expected.b).abs() <= tol);
+        assert_eq!(converted.a, expected.a);
     }
 }
