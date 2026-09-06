@@ -103,6 +103,37 @@ const MOBILE_WIDTH_THRESHOLD: f32 = 600.0;
 /// display name for error messages.
 type LoadResults = Vec<(String, Result<LoadedLayer, IoError>)>;
 
+#[derive(Clone, Copy)]
+struct CatppuccinTheme {
+    rosewater: egui::Color32,
+    maroon: egui::Color32,
+    peach: egui::Color32,
+    blue: egui::Color32,
+    text: egui::Color32,
+    overlay1: egui::Color32,
+    surface2: egui::Color32,
+    surface1: egui::Color32,
+    surface0: egui::Color32,
+    base: egui::Color32,
+    mantle: egui::Color32,
+    crust: egui::Color32,
+}
+
+const CATPPUCCIN_MOCHA: CatppuccinTheme = CatppuccinTheme {
+    rosewater: egui::Color32::from_rgb(245, 224, 220),
+    maroon: egui::Color32::from_rgb(235, 160, 172),
+    peach: egui::Color32::from_rgb(250, 179, 135),
+    blue: egui::Color32::from_rgb(137, 180, 250),
+    text: egui::Color32::from_rgb(205, 214, 244),
+    overlay1: egui::Color32::from_rgb(127, 132, 156),
+    surface2: egui::Color32::from_rgb(88, 91, 112),
+    surface1: egui::Color32::from_rgb(69, 71, 90),
+    surface0: egui::Color32::from_rgb(49, 50, 68),
+    base: egui::Color32::from_rgb(30, 30, 46),
+    mantle: egui::Color32::from_rgb(24, 24, 37),
+    crust: egui::Color32::from_rgb(17, 17, 27),
+};
+
 /// The default style, bundled into the binary (rather than fetched over the
 /// network at startup) so the basemap renders immediately -- see
 /// `RgisApp::set_style` for switching to a different style document live.
@@ -184,6 +215,7 @@ pub struct RgisApp {
 
 impl RgisApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_catppuccin_theme(&cc.egui_ctx);
         let render_state = cc
             .wgpu_render_state
             .as_ref()
@@ -1437,6 +1469,56 @@ fn point_and_angle_at(path: &[egui::Pos2], target_len: f32) -> (egui::Pos2, f32)
     } else {
         (*path.last().unwrap(), 0.0)
     }
+}
+
+fn apply_catppuccin_theme(ctx: &egui::Context) {
+    let old = egui::Visuals::dark();
+    let theme = CATPPUCCIN_MOCHA;
+    let widget_visual =
+        |old: egui::style::WidgetVisuals, bg_fill: egui::Color32| egui::style::WidgetVisuals {
+            bg_fill,
+            weak_bg_fill: bg_fill,
+            bg_stroke: egui::Stroke {
+                color: theme.overlay1,
+                ..old.bg_stroke
+            },
+            fg_stroke: egui::Stroke {
+                color: theme.text,
+                ..old.fg_stroke
+            },
+            ..old
+        };
+    let visuals = egui::Visuals {
+        hyperlink_color: theme.rosewater,
+        faint_bg_color: theme.surface0,
+        extreme_bg_color: theme.crust,
+        code_bg_color: theme.mantle,
+        warn_fg_color: theme.peach,
+        error_fg_color: theme.maroon,
+        window_fill: theme.base,
+        panel_fill: theme.base,
+        window_stroke: egui::Stroke {
+            color: theme.overlay1,
+            ..old.window_stroke
+        },
+        widgets: egui::style::Widgets {
+            noninteractive: widget_visual(old.widgets.noninteractive, theme.base),
+            inactive: widget_visual(old.widgets.inactive, theme.surface0),
+            hovered: widget_visual(old.widgets.hovered, theme.surface2),
+            active: widget_visual(old.widgets.active, theme.surface1),
+            open: widget_visual(old.widgets.open, theme.surface0),
+        },
+        selection: egui::style::Selection {
+            bg_fill: theme.blue.linear_multiply(0.2),
+            stroke: egui::Stroke {
+                color: theme.text,
+                ..old.selection.stroke
+            },
+        },
+        dark_mode: true,
+        ..old
+    };
+    ctx.set_visuals(visuals);
 }
 
 impl eframe::App for RgisApp {
