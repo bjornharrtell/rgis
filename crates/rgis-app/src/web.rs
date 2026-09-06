@@ -192,6 +192,8 @@ pub struct RgisWebApp {
     style: Arc<StyleSheet>,
     vector_tile_fetcher: Arc<VectorTileFetcher>,
     glyph_fetcher: Arc<rgis_tiles::GlyphFetcher>,
+    sprite_fetcher: Option<Arc<rgis_tiles::SpriteFetcher>>,
+    sprite_atlas: Option<Arc<rgis_tiles::SpriteAtlas>>,
     gpu_basemap_meshes: HashMap<TileCoord, Arc<TileMesh>>,
     pending_tiles: HashSet<TileCoord>,
     resources: Option<MapRenderResources>,
@@ -219,11 +221,14 @@ impl RgisWebApp {
             StyleSheet::parse(include_str!("../../rgis-style/fixtures/liberty.json"))
                 .expect("failed to parse embedded OpenFreeMap style"),
         );
+        let sprite_fetcher = style.sprite.as_deref().map(rgis_tiles::SpriteFetcher::new);
         Self {
             project,
             style,
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
             glyph_fetcher: rgis_tiles::GlyphFetcher::new(),
+            sprite_fetcher,
+            sprite_atlas: None,
             gpu_basemap_meshes: HashMap::new(),
             pending_tiles: HashSet::new(),
             resources: None,
@@ -689,6 +694,11 @@ impl RgisWebApp {
 
     fn map_callback(&mut self, width: f32, height: f32) -> MapCallback {
         self.process_basemap_tiles();
+        if let Some(fetcher) = &self.sprite_fetcher
+            && let Ok(ready) = fetcher.receiver.try_recv()
+        {
+            self.sprite_atlas = Some(ready.atlas);
+        }
         self.project.viewport.width_px = width.max(1.0) as u32;
         self.project.viewport.height_px = height.max(1.0) as u32;
 
@@ -723,8 +733,12 @@ impl RgisWebApp {
             });
         }
         let vector_tile_count = tiles.len() as u32;
-        let (labels, glyph_bitmaps) =
-            labels::collect_label_draws(&basemap_tiles, &self.glyph_fetcher);
+        let (labels, glyph_bitmaps, icons) = labels::collect_label_draws(
+            &basemap_tiles,
+            &self.glyph_fetcher,
+            self.sprite_atlas.as_ref(),
+        );
+        tiles.extend(icons);
         let background = if self.project.show_tiles {
             build_background_mesh(&self.project.viewport, &self.style)
         } else {

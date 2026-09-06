@@ -121,6 +121,8 @@ pub struct RgisNativeApp {
     style: Arc<rgis_render::StyleSheet>,
     vector_tile_fetcher: Arc<VectorTileFetcher>,
     glyph_fetcher: Arc<rgis_tiles::GlyphFetcher>,
+    sprite_fetcher: Option<Arc<rgis_tiles::SpriteFetcher>>,
+    sprite_atlas: Option<Arc<rgis_tiles::SpriteAtlas>>,
     tile_meshes: LruCache<TileCoord, Arc<rgis_render::TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
     pending_tile_meshes: Vec<Promise<(TileCoord, Option<rgis_render::TileMesh>)>>,
@@ -174,11 +176,15 @@ impl RgisNativeApp {
                 }
             }
         }
+        let style = Arc::new(style);
+        let sprite_fetcher = style.sprite.as_deref().map(rgis_tiles::SpriteFetcher::new);
         Self {
             project,
-            style: Arc::new(style),
+            style,
             vector_tile_fetcher: VectorTileFetcher::new_openfreemap(),
             glyph_fetcher: rgis_tiles::GlyphFetcher::new(),
+            sprite_fetcher,
+            sprite_atlas: None,
             tile_meshes: LruCache::new(std::num::NonZeroUsize::new(TILE_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
@@ -292,6 +298,11 @@ impl RgisNativeApp {
 
     fn map_callback(&mut self, width: f32, height: f32) -> MapCallback {
         self.drain_tiles();
+        if let Some(fetcher) = &self.sprite_fetcher
+            && let Ok(ready) = fetcher.receiver.try_recv()
+        {
+            self.sprite_atlas = Some(ready.atlas);
+        }
         self.project.viewport.width_px = width.max(1.0) as u32;
         self.project.viewport.height_px = height.max(1.0) as u32;
         let mut basemap_tiles = Vec::new();
@@ -326,8 +337,12 @@ impl RgisNativeApp {
             });
         }
         let vector_tile_count = tiles.len() as u32;
-        let (labels, glyph_bitmaps) =
-            labels::collect_label_draws(&basemap_tiles, &self.glyph_fetcher);
+        let (labels, glyph_bitmaps, icons) = labels::collect_label_draws(
+            &basemap_tiles,
+            &self.glyph_fetcher,
+            self.sprite_atlas.as_ref(),
+        );
+        tiles.extend(icons);
         let mesh = if self.project.show_tiles {
             rgis_render::build_background_mesh(&self.project.viewport, &self.style)
         } else {
