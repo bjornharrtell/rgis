@@ -977,9 +977,6 @@ impl Render for RgisWebApp {
             .flex()
             .flex_col()
             .bg(rgb(ZED_CANVAS))
-            .border_1()
-            .rounded_lg()
-            .border_color(rgb(0x484848))
             .overflow_hidden()
             .child(
                 div()
