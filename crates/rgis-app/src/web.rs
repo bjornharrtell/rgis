@@ -9,7 +9,7 @@ use std::{
 
 use crate::labels;
 use crate::raster;
-use crate::ui::{self, LayerUi, StyleColorTarget};
+use crate::ui::{self, LayerUi, LayerUiState, StyleColorTarget};
 use gpui::{
     App, Bounds, Context, DevicePixels, MouseButton, Render, Window, WindowBounds, WindowOptions,
     div, prelude::*, px, rgb, size,
@@ -54,28 +54,28 @@ impl LayerUi for RgisWebApp {
         &mut self.project
     }
 
-    fn layers_expanded(&self) -> bool {
-        self.layers_expanded
+    fn layer_ui_state(&self) -> &LayerUiState {
+        &self.layer_ui_state
     }
 
-    fn set_layers_expanded(&mut self, expanded: bool) {
-        self.layers_expanded = expanded;
+    fn layer_ui_state_mut(&mut self) -> &mut LayerUiState {
+        &mut self.layer_ui_state
     }
 
-    fn style_editor_layer(&self) -> Option<LayerId> {
-        self.style_editor_layer
+    fn sidebar_visible(&self) -> bool {
+        self.sidebar_visible
     }
 
-    fn set_style_editor_layer(&mut self, layer: Option<LayerId>) {
-        self.style_editor_layer = layer;
+    fn set_sidebar_visible(&mut self, visible: bool) {
+        self.sidebar_visible = visible;
     }
 
-    fn style_color_target(&self) -> StyleColorTarget {
-        self.style_color_target
+    fn status_text(&self) -> &str {
+        &self.status
     }
 
-    fn set_style_color_target(&mut self, target: StyleColorTarget) {
-        self.style_color_target = target;
+    fn cursor_lonlat(&self) -> Option<(f64, f64)> {
+        self.cursor_lonlat
     }
 
     fn add_layer(&mut self, _window: &mut Window) {}
@@ -205,9 +205,8 @@ pub struct RgisWebApp {
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
     last_map_size: Option<(u32, u32)>,
     status: String,
-    layers_expanded: bool,
-    style_editor_layer: Option<LayerId>,
-    style_color_target: StyleColorTarget,
+    sidebar_visible: bool,
+    layer_ui_state: LayerUiState,
     cursor_lonlat: Option<(f64, f64)>,
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
 }
@@ -245,9 +244,8 @@ impl RgisWebApp {
             last_cursor: None,
             last_map_size: None,
             status: "GPUI browser renderer".to_string(),
-            layers_expanded: true,
-            style_editor_layer: None,
-            style_color_target: StyleColorTarget::Fill,
+            sidebar_visible: true,
+            layer_ui_state: LayerUiState::default(),
             cursor_lonlat: None,
             bbox_zoom_start: None,
         }
@@ -258,6 +256,14 @@ impl RgisWebApp {
             self.project.viewport.center = lonlat_to_mercator(lon, lat);
             self.project.viewport.zoom = zoom;
             self.status = format!("Viewport {lon:.4}, {lat:.4} · zoom {zoom:.2}");
+        }
+    }
+
+    fn sidebar_offset(&self) -> f32 {
+        if self.sidebar_visible {
+            SIDEBAR_WIDTH
+        } else {
+            0.0
         }
     }
 
@@ -329,9 +335,11 @@ impl RgisWebApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.style_editor_layer =
-                                (this.style_editor_layer != Some(layer_id)).then_some(layer_id);
-                            this.style_color_target = StyleColorTarget::Fill;
+                            let layer = this.layer_ui_state.style_editor_layer();
+                            this.layer_ui_state
+                                .set_style_editor_layer((layer != Some(layer_id)).then_some(layer_id));
+                            this.layer_ui_state
+                                .set_style_color_target(StyleColorTarget::Fill);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -403,7 +411,7 @@ impl RgisWebApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.style_color_target = target;
+                    this.layer_ui_state.set_style_color_target(target);
                     if let Some(layer) = this.project.get_layer_mut(layer_id) {
                         let alpha = match target {
                             StyleColorTarget::Fill => layer.style.fill.a,
@@ -432,7 +440,7 @@ impl RgisWebApp {
         };
         let fill = layer.style.fill;
         let stroke = layer.style.stroke;
-        let target = self.style_color_target;
+        let target = self.layer_ui_state.style_color_target();
         let target_color = if target == StyleColorTarget::Fill {
             fill
         } else {
@@ -490,7 +498,7 @@ impl RgisWebApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.style_editor_layer = None;
+                                this.layer_ui_state.set_style_editor_layer(None);
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
@@ -761,12 +769,16 @@ impl RgisWebApp {
             }
         }
 
-        let mut tiles = raster::collect_draws(
-            &self.style,
-            &self.project.viewport,
-            &self.raster_fetchers,
-            &mut self.raster_tile_cache,
-        );
+        let mut tiles = if self.project.show_tiles {
+            raster::collect_draws(
+                &self.style,
+                &self.project.viewport,
+                &self.raster_fetchers,
+                &mut self.raster_tile_cache,
+            )
+        } else {
+            Vec::new()
+        };
         let raster_tile_count = tiles.len() as u32;
         if let Some(rgba) = render_vector_layers(&self.project.layers, &self.project.viewport) {
             tiles.push(rgis_render::TileDraw {
@@ -871,7 +883,7 @@ impl RgisWebApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(if self.layers_expanded {
+                            .child(if self.layer_ui_state.layers_expanded() {
                                 icon("m6 9 6 6 6-6", ZED_MUTED)
                             } else {
                                 icon("m9 6 6 6-6 6", ZED_MUTED)
@@ -881,16 +893,17 @@ impl RgisWebApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.layers_expanded = !this.layers_expanded;
+                            let expanded = this.layer_ui_state.layers_expanded();
+                            this.layer_ui_state.set_layers_expanded(!expanded);
                             cx.notify();
                         }),
                     ),
             );
-        if self.layers_expanded {
+        if self.layer_ui_state.layers_expanded() {
             for layer in self.project.layers.iter().rev() {
                 content =
                     content.child(self.layer_row(layer.id, layer.name.clone(), layer.visible, cx));
-                if self.style_editor_layer == Some(layer.id) {
+                if self.layer_ui_state.style_editor_layer() == Some(layer.id) {
                     content = content.child(self.style_panel(layer.id, cx));
                 }
             }
@@ -942,7 +955,7 @@ impl Render for RgisWebApp {
         let window_size = window.viewport_size();
         let scale = window.scale_factor();
         let window_width = f32::from(window_size.width);
-        let sidebar_width = SIDEBAR_WIDTH;
+        let sidebar_width = self.sidebar_offset();
         self.project.viewport.width_px =
             ((window_width - sidebar_width).max(1.0) * scale).round() as u32;
         self.project.viewport.height_px =
@@ -998,7 +1011,7 @@ impl Render for RgisWebApp {
                             let scale = window.scale_factor();
                             let to_map = |point: gpui::Point<gpui::Pixels>| {
                                 [
-                                    ((f32::from(point.x) - SIDEBAR_WIDTH) * scale)
+                                    ((f32::from(point.x) - this.sidebar_offset()) * scale)
                                         .clamp(0.0, this.project.viewport.width_px as f32),
                                     (f32::from(point.y) * scale)
                                         .clamp(0.0, this.project.viewport.height_px as f32),
@@ -1021,7 +1034,7 @@ impl Render for RgisWebApp {
                 cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
                     let scale = window.scale_factor();
                     let cursor = [
-                        ((f32::from(event.position.x) - SIDEBAR_WIDTH) * scale)
+                        ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
                             .clamp(0.0, this.project.viewport.width_px as f32),
                         (f32::from(event.position.y) * scale)
                             .clamp(0.0, this.project.viewport.height_px as f32),
@@ -1045,7 +1058,7 @@ impl Render for RgisWebApp {
                     let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
                     let scale = window.scale_factor();
                     let cursor = [
-                        ((f32::from(event.position.x) - SIDEBAR_WIDTH) * scale)
+                        ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
                             .clamp(0.0, this.project.viewport.width_px as f32),
                         (f32::from(event.position.y) * scale)
                             .clamp(0.0, this.project.viewport.height_px as f32),
@@ -1065,29 +1078,12 @@ impl Render for RgisWebApp {
                 div()
                     .flex_1()
                     .flex()
-                    .child(ui::sidebar(self, cx))
+                    .when(self.sidebar_visible, |content| {
+                        content.child(ui::sidebar(self, cx))
+                    })
                     .child(map),
             )
-            .child(
-                div()
-                    .h(px(STATUS_HEIGHT))
-                    .flex_none()
-                    .px_3()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(rgb(ZED_BORDER))
-                    .bg(rgb(ZED_TITLEBAR))
-                    .text_xs()
-                    .text_color(rgb(ZED_MUTED))
-                    .child(format!(
-                        "{}  ·  zoom {:.2}{}",
-                        self.status,
-                        self.project.viewport.zoom,
-                        self.cursor_lonlat
-                            .map(|(lon, lat)| format!("  ·  {lon:.5}, {lat:.5}"))
-                            .unwrap_or_default()
-                    )),
-            )
+            .child(ui::status_bar(self, cx))
     }
 }
 
