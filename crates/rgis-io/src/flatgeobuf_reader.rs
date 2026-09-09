@@ -6,7 +6,7 @@ use geozero::ToGeo;
 use rgis_core::Feature;
 use serde_json::Value;
 
-use crate::{IoError, LoadedLayer};
+use crate::{IoError, LoadedLayer, extract_epsg_code, normalize_epsg};
 
 pub fn load_flatgeobuf(path: &Path) -> Result<LoadedLayer, IoError> {
     let name = path
@@ -39,6 +39,22 @@ fn read_flatgeobuf(
         .select_all()
         .map_err(|e| IoError::FlatGeobuf(e.to_string()))?;
 
+    let epsg = fgb.header().crs().and_then(|crs| {
+        if crs
+            .org()
+            .is_some_and(|org| org.eq_ignore_ascii_case("EPSG"))
+            && (1..=u16::MAX as i32).contains(&crs.code())
+        {
+            Some(crs.code() as u16)
+        } else {
+            crs.code_string()
+                .and_then(extract_epsg_code)
+                .or_else(|| crs.wkt().and_then(extract_epsg_code))
+                .or_else(|| crs.name().and_then(extract_epsg_code))
+        }
+    });
+    let epsg = normalize_epsg(epsg);
+
     let mut features = Vec::new();
 
     while let Some(feature) = fgb
@@ -59,6 +75,6 @@ fn read_flatgeobuf(
     Ok(LoadedLayer {
         name,
         features,
-        epsg: None,
+        epsg,
     })
 }

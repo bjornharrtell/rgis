@@ -265,6 +265,9 @@ pub struct Layer {
     pub name: String,
     pub source_path: Option<std::path::PathBuf>,
     pub features: Vec<Feature>,
+    /// Cached per-feature bounds used to skip off-screen geometry before
+    /// converting it to screen paths.
+    pub feature_bounds: Vec<Option<Bounds>>,
     pub bounds: Option<Bounds>,
     pub style: Style,
     pub visible: bool,
@@ -273,12 +276,17 @@ pub struct Layer {
 
 impl Layer {
     pub fn new(id: LayerId, name: impl Into<String>, features: Vec<Feature>) -> Self {
+        let feature_bounds = features
+            .iter()
+            .map(|feature| geometry_bounds(&feature.geometry))
+            .collect();
         let bounds = compute_bounds(&features);
         Self {
             id,
             name: name.into(),
             source_path: None,
             features,
+            feature_bounds,
             bounds,
             style: Style::default(),
             visible: true,
@@ -288,11 +296,9 @@ impl Layer {
 }
 
 fn compute_bounds(features: &[Feature]) -> Option<Bounds> {
-    use geo::BoundingRect;
     let mut result: Option<Bounds> = None;
     for f in features {
-        if let Some(rect) = f.geometry.bounding_rect() {
-            let b = Bounds::from_rect(rect);
+        if let Some(b) = geometry_bounds(&f.geometry) {
             result = Some(match result {
                 None => b,
                 Some(existing) => existing.union(&b),
@@ -300,6 +306,11 @@ fn compute_bounds(features: &[Feature]) -> Option<Bounds> {
         }
     }
     result
+}
+
+fn geometry_bounds(geometry: &geo_types::Geometry) -> Option<Bounds> {
+    use geo::BoundingRect;
+    geometry.bounding_rect().map(Bounds::from_rect)
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────

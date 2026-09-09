@@ -5,7 +5,7 @@ A Rust GIS desktop application built on [egui](https://crates.io/crates/egui)/[e
 ## Features
 
 - Read GeoJSON, Shapefile, and FlatGeobuf data, via a file-picker dialog or startup CLI arguments
-- Reproject GeoJSON layers declared in a non-WGS-84 CRS (e.g. `EPSG:25832`) using [proj4rs](https://crates.io/crates/proj4rs)
+- Detect CRS metadata in GeoJSON, Shapefile `.prj`, and FlatGeobuf layers and optionally reproject non-WGS-84 data (e.g. `EPSG:25832`) using [proj4rs](https://crates.io/crates/proj4rs)
 - Ships with a bundled demo dataset ([crates/rgis-app/assets/sample.geojson](crates/rgis-app/assets/sample.geojson)), loaded when the native app is started with no file arguments and always in the browser build
 - Render vector layers as tessellated triangle meshes uploaded to the GPU via `wgpu`
 - Show OpenStreetMap raster tiles behind vector data, with an on-disk cache on native
@@ -86,7 +86,7 @@ publishes to GitHub Pages on every push to `main`.
 | --- | --- |
 | [crates/rgis-app](crates/rgis-app) | Shared `eframe::App` (UI, layer panel, status bar, pan/zoom) and the `rgis` native binary |
 | [crates/rgis-core](crates/rgis-core) | Core GIS types, styling, projection helpers, project/viewport state |
-| [crates/rgis-io](crates/rgis-io) | GeoJSON / Shapefile / FlatGeobuf readers and CRS reprojection to Web Mercator |
+| [crates/rgis-io](crates/rgis-io) | GeoJSON / Shapefile / FlatGeobuf readers, CRS detection, and reprojection to Web Mercator |
 | [crates/rgis-render](crates/rgis-render) | Tessellates layer geometry into `wgpu` vertex/index buffers and draws them via an `egui-wgpu` paint callback |
 | [crates/rgis-tiles](crates/rgis-tiles) | Raster tile fetching and caching |
 | [crates/rgis-web](crates/rgis-web) | wasm/browser entry point that boots `rgis-app` via `eframe::WebRunner` |

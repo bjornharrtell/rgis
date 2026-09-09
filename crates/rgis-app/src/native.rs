@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use gpui::{
     App, Bounds, Context, CursorStyle, DevicePixels, MouseButton, Render, ResizeEdge, Window,
@@ -32,6 +35,34 @@ const ZED_ACCENT: u32 = 0x8ab4f8;
 const DEFAULT_STYLE_JSON: &str = include_str!("../../rgis-style/fixtures/liberty.json");
 
 type LoadResults = Vec<(String, Result<rgis_io::LoadedLayer, rgis_io::IoError>)>;
+
+struct PendingVectorRender {
+    layer_key: u64,
+    viewport: rgis_core::Viewport,
+    generation: u64,
+    promise: Promise<Option<image::RgbaImage>>,
+}
+
+fn prepare_loaded_layer(
+    loaded: rgis_io::LoadedLayer,
+    file_name: &str,
+) -> Result<Option<rgis_io::LoadedLayer>, rgis_io::IoError> {
+    if let Some(epsg) = loaded.epsg {
+        let result = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Reproject layer?")
+            .set_description(format!(
+                "\"{file_name}\" declares EPSG:{epsg}. Rgis renders layers in \
+                 Web Mercator (EPSG:3857). Transform this layer on the fly?"
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if result != rfd::MessageDialogResult::Yes {
+            return Ok(None);
+        }
+    }
+    loaded.into_web_mercator().map(Some)
+}
 
 fn icon(path: &str, color: u32) -> impl IntoElement {
     let data = format!(
@@ -72,17 +103,6 @@ fn resize_handle<T: 'static>(
             cx.stop_propagation();
         }),
     )
-}
-
-fn vector_draw_key(image: &image::RgbaImage) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    image.width().hash(&mut hasher);
-    image.height().hash(&mut hasher);
-    image.as_raw().hash(&mut hasher);
-    hasher.finish() | (1 << 63)
 }
 
 struct MapTarget {
@@ -139,6 +159,9 @@ pub struct RgisNativeApp {
     tile_meshes: LruCache<TileCoord, Arc<rgis_render::TileMesh>>,
     pending_tiles: std::collections::HashSet<TileCoord>,
     pending_tile_meshes: Vec<Promise<(TileCoord, Option<rgis_render::TileMesh>)>>,
+    vector_render_cache: rgis_render::VectorRenderCache,
+    vector_render_generation: Arc<AtomicU64>,
+    pending_vector_render: Option<PendingVectorRender>,
     resources: Option<MapRenderResources>,
     target: Option<MapTarget>,
     pending_loads: Vec<Promise<LoadResults>>,
@@ -158,7 +181,9 @@ impl RgisNativeApp {
         let mut project = Project::default();
         if startup_paths.is_empty() {
             let bytes = include_bytes!("../assets/sample.geojson");
-            if let Ok(loaded) = rgis_io::load_bytes("sample.geojson", bytes) {
+            if let Ok(loaded) = rgis_io::load_bytes_with_crs("sample.geojson", bytes)
+                .and_then(|loaded| loaded.into_web_mercator())
+            {
                 let id = project.next_layer_id();
                 let layer = Layer::new(id, loaded.name, loaded.features);
                 if let Some(bounds) = layer.bounds {
@@ -175,17 +200,21 @@ impl RgisNativeApp {
                     .and_then(|name| name.to_str())
                     .unwrap_or("layer")
                     .to_string();
-                match rgis_io::load_path(path) {
-                    Ok(loaded) => {
-                        let id = project.next_layer_id();
-                        let layer = Layer::new(id, loaded.name, loaded.features);
-                        if let Some(bounds) = layer.bounds {
-                            project.add_layer(layer);
-                            project.viewport.fit_bounds(&bounds);
-                        } else {
-                            project.add_layer(layer);
+                match rgis_io::load_path_with_crs(path) {
+                    Ok(loaded) => match prepare_loaded_layer(loaded, &name) {
+                        Ok(Some(loaded)) => {
+                            let id = project.next_layer_id();
+                            let layer = Layer::new(id, loaded.name, loaded.features);
+                            if let Some(bounds) = layer.bounds {
+                                project.add_layer(layer);
+                                project.viewport.fit_bounds(&bounds);
+                            } else {
+                                project.add_layer(layer);
+                            }
                         }
-                    }
+                        Ok(None) => eprintln!("Skipped {name}: reprojection declined"),
+                        Err(error) => eprintln!("Failed to load {name}: {error}"),
+                    },
                     Err(error) => eprintln!("Failed to load {name}: {error}"),
                 }
             }
@@ -205,6 +234,9 @@ impl RgisNativeApp {
             tile_meshes: LruCache::new(std::num::NonZeroUsize::new(TILE_CACHE_SIZE).unwrap()),
             pending_tiles: std::collections::HashSet::new(),
             pending_tile_meshes: Vec::new(),
+            vector_render_cache: rgis_render::VectorRenderCache::default(),
+            vector_render_generation: Arc::new(AtomicU64::new(0)),
+            pending_vector_render: None,
             resources: None,
             target: None,
             pending_loads: Vec::new(),
@@ -221,7 +253,12 @@ impl RgisNativeApp {
     fn queue_pick_files(&mut self, window: &Window) {
         self.pending_loads
             .push(Promise::spawn_thread("pick-and-load-layers", move || {
-                let Some(paths) = rfd::FileDialog::new().pick_files() else {
+                let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("GeoJSON", &["geojson", "json"])
+                    .add_filter("Shapefile", &["shp"])
+                    .add_filter("FlatGeobuf", &["fgb"])
+                    .pick_files()
+                else {
                     return Vec::new();
                 };
                 paths
@@ -232,11 +269,11 @@ impl RgisNativeApp {
                             .and_then(|name| name.to_str())
                             .unwrap_or("layer")
                             .to_string();
-                        (name, rgis_io::load_path(path))
+                        (name, rgis_io::load_path_with_crs(path))
                     })
                     .collect()
             }));
-        window.request_animation_frame();
+        window.on_next_frame(|_, cx| cx.refresh_windows());
     }
 
     fn sidebar_offset(&self) -> f32 {
@@ -254,17 +291,25 @@ impl RgisNativeApp {
                 Ok(results) => {
                     for (name, result) in results {
                         match result {
-                            Ok(loaded) => {
-                                let id = self.project.next_layer_id();
-                                let layer = Layer::new(id, loaded.name, loaded.features);
-                                if self.project.layers.is_empty()
-                                    && let Some(bounds) = layer.bounds
-                                {
-                                    self.project.viewport.fit_bounds(&bounds);
+                            Ok(loaded) => match prepare_loaded_layer(loaded, &name) {
+                                Ok(Some(loaded)) => {
+                                    let id = self.project.next_layer_id();
+                                    let layer = Layer::new(id, loaded.name, loaded.features);
+                                    if self.project.layers.is_empty()
+                                        && let Some(bounds) = layer.bounds
+                                    {
+                                        self.project.viewport.fit_bounds(&bounds);
+                                    }
+                                    self.project.add_layer(layer);
+                                    self.status = format!("Loaded {name}");
                                 }
-                                self.project.add_layer(layer);
-                                self.status = format!("Loaded {name}");
-                            }
+                                Ok(None) => {
+                                    self.status = format!("Skipped {name}: reprojection declined");
+                                }
+                                Err(error) => {
+                                    self.status = format!("Failed to load {name}: {error}");
+                                }
+                            },
                             Err(error) => {
                                 self.status = format!("Failed to load {name}: {error}");
                             }
@@ -275,7 +320,7 @@ impl RgisNativeApp {
             }
         }
         if !self.pending_loads.is_empty() {
-            window.request_animation_frame();
+            window.on_next_frame(|_, cx| cx.refresh_windows());
         }
     }
 
@@ -323,6 +368,73 @@ impl RgisNativeApp {
         }
     }
 
+    fn poll_vector_render(&mut self, window: &Window) {
+        let Some(pending) = self.pending_vector_render.take() else {
+            return;
+        };
+        match pending.promise.try_take() {
+            Ok(Some(image)) => {
+                if self.vector_render_generation.load(Ordering::Acquire) == pending.generation {
+                    self.vector_render_cache
+                        .install_rendered(&pending.viewport, image);
+                }
+            }
+            Ok(None) => {}
+            Err(promise) => {
+                self.pending_vector_render = Some(PendingVectorRender { promise, ..pending });
+                window.on_next_frame(|_, cx| cx.refresh_windows());
+            }
+        }
+    }
+
+    fn ensure_vector_render(&mut self) {
+        let viewport = self.project.viewport.clone();
+        let layers = self
+            .vector_render_cache
+            .snapshot_layers(&self.project.layers);
+        let Some(layer_key) = self.vector_render_cache.layer_key() else {
+            return;
+        };
+
+        if self.dragging {
+            return;
+        }
+        if !self.vector_render_cache.needs_render(&viewport) {
+            return;
+        }
+        if self
+            .pending_vector_render
+            .as_ref()
+            .is_some_and(|pending| pending.layer_key == layer_key && pending.viewport == viewport)
+        {
+            return;
+        }
+
+        let generation = self.vector_render_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let cancellation = Arc::clone(&self.vector_render_generation);
+        let render_viewport = viewport.clone();
+        let promise = Promise::spawn_thread("rgis-render-vectors", move || {
+            rgis_render::render_vector_layers_cancellable(
+                &layers,
+                &render_viewport,
+                &cancellation,
+                generation,
+            )
+        });
+        self.pending_vector_render = Some(PendingVectorRender {
+            layer_key,
+            viewport,
+            generation,
+            promise,
+        });
+    }
+
+    fn cancel_vector_render(&mut self) {
+        if self.pending_vector_render.take().is_some() {
+            self.vector_render_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     fn map_callback(&mut self, width: f32, height: f32) -> MapCallback {
         self.drain_tiles();
         if let Some(fetcher) = &self.sprite_fetcher
@@ -332,6 +444,7 @@ impl RgisNativeApp {
         }
         self.project.viewport.width_px = width.max(1.0) as u32;
         self.project.viewport.height_px = height.max(1.0) as u32;
+        self.ensure_vector_render();
         let mut basemap_tiles = Vec::new();
         if self.project.show_tiles {
             let mut exact_tiles = Vec::new();
@@ -379,8 +492,11 @@ impl RgisNativeApp {
                 });
             }
         }
-        let vector_tile =
-            rgis_render::render_vector_layers(&self.project.layers, &self.project.viewport);
+        let vector_tile = self.vector_render_cache.render_with_preview(
+            &self.project.layers,
+            &self.project.viewport,
+            true,
+        );
         let mut tiles = if self.project.show_tiles {
             raster::collect_draws(
                 &self.style,
@@ -392,11 +508,11 @@ impl RgisNativeApp {
             Vec::new()
         };
         let raster_tile_count = tiles.len() as u32;
-        if let Some(rgba) = vector_tile {
+        if let Some(vector_tile) = vector_tile {
             tiles.push(rgis_render::TileDraw {
-                key: vector_draw_key(&rgba),
-                rect: [0.0, 0.0, width, height],
-                rgba: Arc::new(rgba),
+                key: vector_tile.key,
+                rect: vector_tile.rect,
+                rgba: vector_tile.image,
                 uv_rect: [0.0, 0.0, 1.0, 1.0],
                 opacity: 1.0,
             });
@@ -429,6 +545,7 @@ impl RgisNativeApp {
 
     fn render_map(&mut self, window: &mut Window) {
         self.poll_pending_loads(window);
+        self.poll_vector_render(window);
         let Some(context) = WgpuContextHandle::from_window(window) else {
             self.status = "GPUI GPU context unavailable".to_string();
             return;
@@ -486,6 +603,9 @@ impl RgisNativeApp {
             ),
         );
         queue.submit([encoder.finish()]);
+        if self.pending_vector_render.is_some() {
+            window.on_next_frame(|_, cx| cx.refresh_windows());
+        }
     }
 
     fn layer_row(
@@ -1129,6 +1249,7 @@ impl Render for RgisNativeApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.cancel_vector_render();
                     this.dragging = true;
                     this.last_cursor = Some(event.position);
                     this.bbox_zoom_start = event.modifiers.shift.then_some(event.position);
