@@ -15,18 +15,97 @@ pub enum StyleColorTarget {
     Stroke,
 }
 
+#[derive(Clone, Copy)]
+pub struct LayerUiState {
+    layers_expanded: bool,
+    style_editor_layer: Option<LayerId>,
+    layer_menu_layer: Option<LayerId>,
+    style_color_target: StyleColorTarget,
+}
+
+impl Default for LayerUiState {
+    fn default() -> Self {
+        Self {
+            layers_expanded: true,
+            style_editor_layer: None,
+            layer_menu_layer: None,
+            style_color_target: StyleColorTarget::Fill,
+        }
+    }
+}
+
+impl LayerUiState {
+    pub fn layers_expanded(&self) -> bool {
+        self.layers_expanded
+    }
+
+    pub fn set_layers_expanded(&mut self, expanded: bool) {
+        self.layers_expanded = expanded;
+    }
+
+    pub fn style_editor_layer(&self) -> Option<LayerId> {
+        self.style_editor_layer
+    }
+
+    pub fn set_style_editor_layer(&mut self, layer: Option<LayerId>) {
+        self.style_editor_layer = layer;
+    }
+
+    pub fn layer_menu_layer(&self) -> Option<LayerId> {
+        self.layer_menu_layer
+    }
+
+    pub fn set_layer_menu_layer(&mut self, layer: Option<LayerId>) {
+        self.layer_menu_layer = layer;
+    }
+
+    pub fn style_color_target(&self) -> StyleColorTarget {
+        self.style_color_target
+    }
+
+    pub fn set_style_color_target(&mut self, target: StyleColorTarget) {
+        self.style_color_target = target;
+    }
+}
+
 pub trait LayerUi: Sized + 'static {
     fn project(&self) -> &Project;
     fn project_mut(&mut self) -> &mut Project;
-    fn layers_expanded(&self) -> bool;
-    fn set_layers_expanded(&mut self, expanded: bool);
-    fn style_editor_layer(&self) -> Option<LayerId>;
-    fn set_style_editor_layer(&mut self, layer: Option<LayerId>);
-    fn layer_menu_layer(&self) -> Option<LayerId>;
-    fn set_layer_menu_layer(&mut self, layer: Option<LayerId>);
-    fn style_color_target(&self) -> StyleColorTarget;
-    fn set_style_color_target(&mut self, target: StyleColorTarget);
+    fn layer_ui_state(&self) -> &LayerUiState;
+    fn layer_ui_state_mut(&mut self) -> &mut LayerUiState;
     fn add_layer(&mut self, window: &mut Window);
+
+    fn layers_expanded(&self) -> bool {
+        self.layer_ui_state().layers_expanded()
+    }
+
+    fn set_layers_expanded(&mut self, expanded: bool) {
+        self.layer_ui_state_mut().set_layers_expanded(expanded);
+    }
+
+    fn style_editor_layer(&self) -> Option<LayerId> {
+        self.layer_ui_state().style_editor_layer()
+    }
+
+    fn set_style_editor_layer(&mut self, layer: Option<LayerId>) {
+        self.layer_ui_state_mut().set_style_editor_layer(layer);
+    }
+
+    fn layer_menu_layer(&self) -> Option<LayerId> {
+        self.layer_ui_state().layer_menu_layer()
+    }
+
+    fn set_layer_menu_layer(&mut self, layer: Option<LayerId>) {
+        self.layer_ui_state_mut().set_layer_menu_layer(layer);
+    }
+
+    fn style_color_target(&self) -> StyleColorTarget {
+        self.layer_ui_state().style_color_target()
+    }
+
+    fn set_style_color_target(&mut self, target: StyleColorTarget) {
+        self.layer_ui_state_mut().set_style_color_target(target);
+    }
 }
 
 fn icon(path: &str, color: u32) -> impl IntoElement {

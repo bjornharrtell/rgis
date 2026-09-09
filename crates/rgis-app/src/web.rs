@@ -9,7 +9,7 @@ use std::{
 
 use crate::labels;
 use crate::raster;
-use crate::ui::{self, LayerUi, StyleColorTarget};
+use crate::ui::{self, LayerUi, LayerUiState, StyleColorTarget};
 use gpui::{
     App, Bounds, Context, DevicePixels, MouseButton, Render, Window, WindowBounds, WindowOptions,
     div, prelude::*, px, rgb, size,
@@ -54,36 +54,12 @@ impl LayerUi for RgisWebApp {
         &mut self.project
     }
 
-    fn layers_expanded(&self) -> bool {
-        self.layers_expanded
+    fn layer_ui_state(&self) -> &LayerUiState {
+        &self.layer_ui_state
     }
 
-    fn set_layers_expanded(&mut self, expanded: bool) {
-        self.layers_expanded = expanded;
-    }
-
-    fn style_editor_layer(&self) -> Option<LayerId> {
-        self.style_editor_layer
-    }
-
-    fn set_style_editor_layer(&mut self, layer: Option<LayerId>) {
-        self.style_editor_layer = layer;
-    }
-
-    fn layer_menu_layer(&self) -> Option<LayerId> {
-        self.layer_menu_layer
-    }
-
-    fn set_layer_menu_layer(&mut self, layer: Option<LayerId>) {
-        self.layer_menu_layer = layer;
-    }
-
-    fn style_color_target(&self) -> StyleColorTarget {
-        self.style_color_target
-    }
-
-    fn set_style_color_target(&mut self, target: StyleColorTarget) {
-        self.style_color_target = target;
+    fn layer_ui_state_mut(&mut self) -> &mut LayerUiState {
+        &mut self.layer_ui_state
     }
 
     fn add_layer(&mut self, _window: &mut Window) {}
@@ -213,10 +189,7 @@ pub struct RgisWebApp {
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
     last_map_size: Option<(u32, u32)>,
     status: String,
-    layers_expanded: bool,
-    style_editor_layer: Option<LayerId>,
-    layer_menu_layer: Option<LayerId>,
-    style_color_target: StyleColorTarget,
+    layer_ui_state: LayerUiState,
     cursor_lonlat: Option<(f64, f64)>,
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
 }
@@ -254,10 +227,7 @@ impl RgisWebApp {
             last_cursor: None,
             last_map_size: None,
             status: "GPUI browser renderer".to_string(),
-            layers_expanded: true,
-            style_editor_layer: None,
-            layer_menu_layer: None,
-            style_color_target: StyleColorTarget::Fill,
+            layer_ui_state: LayerUiState::default(),
             cursor_lonlat: None,
             bbox_zoom_start: None,
         }
@@ -339,9 +309,11 @@ impl RgisWebApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.style_editor_layer =
-                                (this.style_editor_layer != Some(layer_id)).then_some(layer_id);
-                            this.style_color_target = StyleColorTarget::Fill;
+                            let layer = this.layer_ui_state.style_editor_layer();
+                            this.layer_ui_state
+                                .set_style_editor_layer((layer != Some(layer_id)).then_some(layer_id));
+                            this.layer_ui_state
+                                .set_style_color_target(StyleColorTarget::Fill);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -413,7 +385,7 @@ impl RgisWebApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.style_color_target = target;
+                    this.layer_ui_state.set_style_color_target(target);
                     if let Some(layer) = this.project.get_layer_mut(layer_id) {
                         let alpha = match target {
                             StyleColorTarget::Fill => layer.style.fill.a,
@@ -442,7 +414,7 @@ impl RgisWebApp {
         };
         let fill = layer.style.fill;
         let stroke = layer.style.stroke;
-        let target = self.style_color_target;
+        let target = self.layer_ui_state.style_color_target();
         let target_color = if target == StyleColorTarget::Fill {
             fill
         } else {
@@ -500,7 +472,7 @@ impl RgisWebApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.style_editor_layer = None;
+                                this.layer_ui_state.set_style_editor_layer(None);
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
@@ -885,7 +857,7 @@ impl RgisWebApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(if self.layers_expanded {
+                            .child(if self.layer_ui_state.layers_expanded() {
                                 icon("m6 9 6 6 6-6", ZED_MUTED)
                             } else {
                                 icon("m9 6 6 6-6 6", ZED_MUTED)
@@ -895,16 +867,17 @@ impl RgisWebApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.layers_expanded = !this.layers_expanded;
+                            let expanded = this.layer_ui_state.layers_expanded();
+                            this.layer_ui_state.set_layers_expanded(!expanded);
                             cx.notify();
                         }),
                     ),
             );
-        if self.layers_expanded {
+        if self.layer_ui_state.layers_expanded() {
             for layer in self.project.layers.iter().rev() {
                 content =
                     content.child(self.layer_row(layer.id, layer.name.clone(), layer.visible, cx));
-                if self.style_editor_layer == Some(layer.id) {
+                if self.layer_ui_state.style_editor_layer() == Some(layer.id) {
                     content = content.child(self.style_panel(layer.id, cx));
                 }
             }

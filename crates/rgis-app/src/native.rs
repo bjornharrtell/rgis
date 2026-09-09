@@ -12,7 +12,7 @@ use lru::LruCache;
 use poll_promise::Promise;
 use rgis_app::labels;
 use rgis_app::raster;
-use rgis_app::ui::{self, LayerUi, StyleColorTarget};
+use rgis_app::ui::{self, LayerUi, LayerUiState, StyleColorTarget};
 use rgis_core::{Bounds as GeoBounds, Color, Layer, LayerId, Project, mercator_to_lonlat};
 use rgis_render::{MapCallback, MapRenderResources, SceneMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
@@ -148,10 +148,7 @@ pub struct RgisNativeApp {
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
     dragging: bool,
     sidebar_visible: bool,
-    layers_expanded: bool,
-    style_editor_layer: Option<LayerId>,
-    layer_menu_layer: Option<LayerId>,
-    style_color_target: StyleColorTarget,
+    layer_ui_state: LayerUiState,
 }
 
 impl RgisNativeApp {
@@ -217,10 +214,7 @@ impl RgisNativeApp {
             bbox_zoom_start: None,
             dragging: false,
             sidebar_visible: true,
-            layers_expanded: true,
-            style_editor_layer: None,
-            layer_menu_layer: None,
-            style_color_target: StyleColorTarget::Fill,
+            layer_ui_state: LayerUiState::default(),
         }
     }
 
@@ -563,9 +557,11 @@ impl RgisNativeApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.style_editor_layer = (this.style_editor_layer != Some(layer_id))
-                                .then_some(layer_id);
-                            this.style_color_target = StyleColorTarget::Fill;
+                            let layer = this.layer_ui_state.style_editor_layer();
+                            this.layer_ui_state
+                                .set_style_editor_layer((layer != Some(layer_id)).then_some(layer_id));
+                            this.layer_ui_state
+                                .set_style_color_target(StyleColorTarget::Fill);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -619,7 +615,7 @@ impl RgisNativeApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(if self.layers_expanded {
+                            .child(if self.layer_ui_state.layers_expanded() {
                                 icon("m6 9 6 6 6-6", ZED_MUTED)
                             } else {
                                 icon("m9 6 6 6-6 6", ZED_MUTED)
@@ -647,13 +643,14 @@ impl RgisNativeApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.layers_expanded = !this.layers_expanded;
+                            let expanded = this.layer_ui_state.layers_expanded();
+                            this.layer_ui_state.set_layers_expanded(!expanded);
                             cx.notify();
                         }),
                     ),
             );
 
-        if self.layers_expanded {
+        if self.layer_ui_state.layers_expanded() {
             for (id, name, visible) in self
                 .project
                 .layers
@@ -662,7 +659,7 @@ impl RgisNativeApp {
                 .map(|layer| (layer.id, layer.name.clone(), layer.visible))
             {
                 content = content.child(self.layer_row(id, name, visible, cx));
-                if self.style_editor_layer == Some(id) {
+                if self.layer_ui_state.style_editor_layer() == Some(id) {
                     content = content.child(self.style_panel(id, cx));
                 }
             }
@@ -725,7 +722,7 @@ impl RgisNativeApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.style_color_target = target;
+                    this.layer_ui_state.set_style_color_target(target);
                     if let Some(layer) = this.project.get_layer_mut(layer_id) {
                         let alpha = match target {
                             StyleColorTarget::Fill => layer.style.fill.a,
@@ -756,7 +753,7 @@ impl RgisNativeApp {
         let stroke = layer.style.stroke;
         let stroke_width = layer.style.stroke_width;
         let point_radius = layer.style.point_radius;
-        let target = self.style_color_target;
+        let target = self.layer_ui_state.style_color_target();
         let target_color = match target {
             StyleColorTarget::Fill => fill,
             StyleColorTarget::Stroke => stroke,
@@ -811,7 +808,7 @@ impl RgisNativeApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.style_editor_layer = None;
+                                this.layer_ui_state.set_style_editor_layer(None);
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
@@ -1090,36 +1087,12 @@ impl LayerUi for RgisNativeApp {
         &mut self.project
     }
 
-    fn layers_expanded(&self) -> bool {
-        self.layers_expanded
+    fn layer_ui_state(&self) -> &LayerUiState {
+        &self.layer_ui_state
     }
 
-    fn set_layers_expanded(&mut self, expanded: bool) {
-        self.layers_expanded = expanded;
-    }
-
-    fn style_editor_layer(&self) -> Option<LayerId> {
-        self.style_editor_layer
-    }
-
-    fn set_style_editor_layer(&mut self, layer: Option<LayerId>) {
-        self.style_editor_layer = layer;
-    }
-
-    fn layer_menu_layer(&self) -> Option<LayerId> {
-        self.layer_menu_layer
-    }
-
-    fn set_layer_menu_layer(&mut self, layer: Option<LayerId>) {
-        self.layer_menu_layer = layer;
-    }
-
-    fn style_color_target(&self) -> StyleColorTarget {
-        self.style_color_target
-    }
-
-    fn set_style_color_target(&mut self, target: StyleColorTarget) {
-        self.style_color_target = target;
+    fn layer_ui_state_mut(&mut self) -> &mut LayerUiState {
+        &mut self.layer_ui_state
     }
 
     fn add_layer(&mut self, window: &mut Window) {
