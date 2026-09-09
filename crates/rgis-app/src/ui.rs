@@ -2,7 +2,9 @@ use gpui::{Context, MouseButton, Window, deferred, div, prelude::*, px, rgb, rgb
 use rgis_core::{Color, LayerId, Project};
 
 const SIDEBAR_WIDTH: f32 = 280.0;
+const STATUS_HEIGHT: f32 = 28.0;
 const ZED_PANEL: u32 = 0x1b1b1b;
+const ZED_TITLEBAR: u32 = 0x202020;
 const ZED_SURFACE: u32 = 0x2a2a2a;
 const ZED_BORDER: u32 = 0x343434;
 const ZED_TEXT: u32 = 0xd4d4d4;
@@ -73,6 +75,10 @@ pub trait LayerUi: Sized + 'static {
     fn project_mut(&mut self) -> &mut Project;
     fn layer_ui_state(&self) -> &LayerUiState;
     fn layer_ui_state_mut(&mut self) -> &mut LayerUiState;
+    fn sidebar_visible(&self) -> bool;
+    fn set_sidebar_visible(&mut self, visible: bool);
+    fn status_text(&self) -> &str;
+    fn cursor_lonlat(&self) -> Option<(f64, f64)>;
     fn add_layer(&mut self, window: &mut Window);
 
     fn layers_expanded(&self) -> bool {
@@ -243,6 +249,85 @@ pub fn sidebar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElement {
         );
     }
     content
+}
+
+pub fn status_bar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElement {
+    div()
+        .h(px(STATUS_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .border_t_1()
+        .border_color(rgb(ZED_BORDER))
+        .bg(rgb(ZED_TITLEBAR))
+        .text_xs()
+        .text_color(rgb(ZED_MUTED))
+        .child(
+            div()
+                .h_full()
+                .w(px(if state.sidebar_visible() {
+                    SIDEBAR_WIDTH
+                } else {
+                    32.0
+                }))
+                .flex()
+                .items_center()
+                .justify_start()
+                .px_2()
+                .border_r_1()
+                .border_color(rgb(ZED_BORDER))
+                .hover(|style| style.bg(rgb(ZED_SURFACE)))
+                .child(icon(
+                    if state.sidebar_visible() {
+                        "M4 5h16v14H4zM9 5v14"
+                    } else {
+                        "M4 5h16v14H4zM7 5v14"
+                    },
+                    ZED_MUTED,
+                ))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_sidebar_visible(!this.sidebar_visible());
+                        cx.notify();
+                    }),
+                ),
+        )
+        .child(
+            div()
+                .h_full()
+                .flex_1()
+                .px_3()
+                .flex()
+                .items_center()
+                .child(state.status_text().to_string()),
+        )
+        .child(
+            div()
+                .h_full()
+                .px_3()
+                .flex()
+                .items_center()
+                .border_l_1()
+                .border_color(rgb(ZED_BORDER))
+                .child(format!("zoom {:.2}", state.project().viewport.zoom)),
+        )
+        .child(
+            div()
+                .h_full()
+                .min_w(px(150.0))
+                .px_3()
+                .flex()
+                .items_center()
+                .border_l_1()
+                .border_color(rgb(ZED_BORDER))
+                .child(
+                    state
+                        .cursor_lonlat()
+                        .map(|(lon, lat)| format!("{lon:.5}, {lat:.5}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+        )
 }
 
 fn layer_row<T: LayerUi>(

@@ -1095,6 +1095,22 @@ impl LayerUi for RgisNativeApp {
         &mut self.layer_ui_state
     }
 
+    fn sidebar_visible(&self) -> bool {
+        self.sidebar_visible
+    }
+
+    fn set_sidebar_visible(&mut self, visible: bool) {
+        self.sidebar_visible = visible;
+    }
+
+    fn status_text(&self) -> &str {
+        &self.status
+    }
+
+    fn cursor_lonlat(&self) -> Option<(f64, f64)> {
+        self.cursor_lonlat
+    }
+
     fn add_layer(&mut self, window: &mut Window) {
         self.queue_pick_files(window);
     }
@@ -1236,83 +1252,7 @@ impl Render for RgisNativeApp {
                 content.child(ui::sidebar(self, cx))
             })
             .child(map);
-        root = root.child(map_content).child(
-            div()
-                .h(px(STATUS_HEIGHT))
-                .flex_none()
-                .flex()
-                .items_center()
-                .border_t_1()
-                .border_color(rgb(ZED_BORDER))
-                .bg(rgb(ZED_TITLEBAR))
-                .text_xs()
-                .text_color(rgb(ZED_MUTED))
-                .child(
-                    div()
-                        .h_full()
-                        .w(px(if self.sidebar_visible {
-                            SIDEBAR_WIDTH
-                        } else {
-                            32.0
-                        }))
-                        .flex()
-                        .items_center()
-                        .justify_start()
-                        .px_2()
-                        .border_r_1()
-                        .border_color(rgb(ZED_BORDER))
-                        .hover(|style| style.bg(rgb(ZED_SURFACE)))
-                        .child(icon(
-                            if self.sidebar_visible {
-                                "M4 5h16v14H4zM9 5v14"
-                            } else {
-                                "M4 5h16v14H4zM7 5v14"
-                            },
-                            ZED_MUTED,
-                        ))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.sidebar_visible = !this.sidebar_visible;
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .h_full()
-                        .flex_1()
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .child(self.status.clone()),
-                )
-                .child(
-                    div()
-                        .h_full()
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .border_l_1()
-                        .border_color(rgb(ZED_BORDER))
-                        .child(format!("zoom {:.2}", self.project.viewport.zoom)),
-                )
-                .child(
-                    div()
-                        .h_full()
-                        .min_w(px(150.0))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .border_l_1()
-                        .border_color(rgb(ZED_BORDER))
-                        .child(
-                            self.cursor_lonlat
-                                .map(|(lon, lat)| format!("{lon:.5}, {lat:.5}"))
-                                .unwrap_or_else(|| "-".to_string()),
-                        ),
-                ),
-        );
+        root = root.child(map_content).child(ui::status_bar(self, cx));
         if !window.is_maximized() {
             const RESIZE_ZONE: f32 = 8.0;
             root = root.child(
