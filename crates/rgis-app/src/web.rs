@@ -14,6 +14,7 @@ use gpui::{
     App, Bounds, Context, DevicePixels, MouseButton, Render, Window, WindowBounds, WindowOptions,
     div, prelude::*, px, rgb, size,
 };
+use gpui_elements::editable_text::actions::{DEFAULT_INPUT_CONTEXT, default_bindings};
 use gpui_web::WebPlatform;
 use gpui_wgpu::{WgpuContextHandle, WgpuRenderTarget};
 use rgis_core::{
@@ -71,6 +72,10 @@ impl LayerUi for RgisWebApp {
 
     fn status_text(&self) -> &str {
         &self.status
+    }
+
+    fn set_status(&mut self, status: String) {
+        self.status = status;
     }
 
     fn cursor_lonlat(&self) -> Option<(f64, f64)> {
@@ -1076,7 +1081,7 @@ impl Render for RgisWebApp {
                     .flex_1()
                     .flex()
                     .when(self.sidebar_visible, |content| {
-                        content.child(ui::sidebar(self, cx))
+                        content.child(ui::sidebar(self, window, cx))
                     })
                     .child(map),
             )
@@ -1091,6 +1096,7 @@ pub fn run() {
     let application = gpui::Application::with_platform(platform)
         .with_http_client(http_client)
         .run_embedded(|cx: &mut App| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
             cx.text_system()
                 .add_fonts(vec![Cow::Borrowed(include_bytes!(
                     "../assets/fonts/IBMPlexSans-Regular.ttf"
