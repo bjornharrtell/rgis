@@ -20,6 +20,7 @@ rgis-tiles  = { path = "../rgis-tiles" }
 geo-types   = { workspace = true }
 
 wgpu        = { workspace = true }
+gpui-wgpu   = { workspace = true }
 image       = { workspace = true }
 rfd         = { workspace = true }
 poll-promise = { workspace = true }

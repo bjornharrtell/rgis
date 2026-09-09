@@ -11,10 +11,11 @@ use crate::labels;
 use crate::raster;
 use crate::ui::{self, LayerUi, StyleColorTarget};
 use gpui::{
-    App, Bounds, Context, DevicePixels, MouseButton, Render, Size, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    App, Bounds, Context, DevicePixels, MouseButton, Render, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size,
 };
 use gpui_web::WebPlatform;
+use gpui_wgpu::{WgpuContextHandle, WgpuRenderTarget};
 use rgis_core::{
     Bounds as GeoBounds, Color, Layer, LayerId, Project, Viewport, lonlat_to_mercator,
     mercator_to_lonlat,
@@ -39,9 +40,8 @@ const ZED_MUTED: u32 = 0x929292;
 const ZED_ACCENT: u32 = 0x8ab4f8;
 
 struct MapTarget {
-    texture: Arc<wgpu::Texture>,
-    view: wgpu::TextureView,
-    msaa_view: wgpu::TextureView,
+    target: WgpuRenderTarget,
+    msaa_view: Option<wgpu::TextureView>,
     size: (u32, u32),
 }
 
@@ -82,40 +82,37 @@ impl LayerUi for RgisWebApp {
 }
 
 impl MapTarget {
-    fn new(device: &wgpu::Device, size: (u32, u32)) -> Self {
-        let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rgis-map-surface"),
-            size: wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }));
-        let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rgis-map-msaa"),
-            size: wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: rgis_render::MSAA_SAMPLES,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
+    fn new(context: &WgpuContextHandle, dimensions: (u32, u32)) -> Self {
+        let target = WgpuRenderTarget::new(
+            context,
+            size(
+                DevicePixels(dimensions.0 as i32),
+                DevicePixels(dimensions.1 as i32),
+            ),
+        );
+        let msaa_view = (rgis_render::MSAA_SAMPLES > 1).then(|| {
+            context
+                .device()
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("rgis-map-msaa"),
+                    size: wgpu::Extent3d {
+                        width: dimensions.0,
+                        height: dimensions.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: rgis_render::MSAA_SAMPLES,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: target.format(),
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
         });
         Self {
-            view: texture.create_view(&Default::default()),
-            msaa_view: msaa_texture.create_view(&Default::default()),
-            texture,
-            size,
+            target,
+            msaa_view,
+            size: dimensions,
         }
     }
 }
@@ -807,28 +804,22 @@ impl RgisWebApp {
     }
 
     fn render_map(&mut self, window: &mut Window, width: f32, height: f32) {
-        if window.gpu_device_lost().unwrap_or(false) {
+        let Some(context) = WgpuContextHandle::from_window(window) else {
+            self.status = "GPUI GPU context unavailable".to_string();
+            return;
+        };
+        if context.device_lost() {
             self.resources = None;
             self.target = None;
             self.status = "Recovering GPU device".to_string();
             return;
         }
-        let Some(context) = window.gpu_context() else {
-            self.status = "GPUI GPU context unavailable".to_string();
-            return;
-        };
-        let Some((device, queue)) = context.downcast_ref::<(Arc<wgpu::Device>, Arc<wgpu::Queue>)>()
-        else {
-            self.status = "Unsupported GPUI GPU context".to_string();
-            return;
-        };
+        let device = context.device();
+        let queue = context.queue();
         let size = (width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
         if self.target.as_ref().map(|target| target.size) != Some(size) {
-            self.target = Some(MapTarget::new(device, size));
-            self.resources = Some(MapRenderResources::new(
-                device,
-                wgpu::TextureFormat::Rgba8Unorm,
-            ));
+            self.target = Some(MapTarget::new(&context, size));
+            self.resources = Some(MapRenderResources::new(device, context.texture_format()));
         }
         let callback = self.map_callback(width, height);
         let target = self.target.as_ref().expect("map target created");
@@ -836,18 +827,19 @@ impl RgisWebApp {
             label: Some("rgis-map-encoder"),
         });
         let resources = self.resources.take().expect("map resources created");
-        self.resources = Some(resources.render_into(
-            device,
-            queue,
-            &mut encoder,
-            if rgis_render::MSAA_SAMPLES > 1 {
-                &target.msaa_view
-            } else {
-                &target.view
-            },
-            (rgis_render::MSAA_SAMPLES > 1).then_some(&target.view),
-            &callback,
-        ));
+        self.resources = Some(
+            resources.render_into(
+                device,
+                queue,
+                &mut encoder,
+                target
+                    .msaa_view
+                    .as_ref()
+                    .unwrap_or_else(|| target.target.view()),
+                target.msaa_view.as_ref().map(|_| target.target.view()),
+                &callback,
+            ),
+        );
         queue.submit([encoder.finish()]);
     }
 
@@ -978,26 +970,10 @@ impl Render for RgisWebApp {
             self.project.viewport.width_px as f32,
             self.project.viewport.height_px as f32,
         );
-        let map_texture = self.target.as_ref().map(|target| {
-            (
-                target.texture.clone(),
-                Size {
-                    width: DevicePixels::from(target.size.0),
-                    height: DevicePixels::from(target.size.1),
-                },
-            )
-        });
+        let map_surface = self.target.as_ref().map(|target| target.target.surface());
         let mut map_content = div().size_full().relative();
-        if let Some((texture, texture_size)) = map_texture {
-            map_content = map_content.child(
-                gpui::canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, _| {
-                        window.paint_surface(bounds, texture.clone(), texture_size);
-                    },
-                )
-                .size_full(),
-            );
+        if let Some(surface) = map_surface {
+            map_content = map_content.child(surface.size_full());
         }
         let map = div()
             .flex_1()
