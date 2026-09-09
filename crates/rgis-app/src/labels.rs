@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rgis_render::{BasemapTileDraw, GlyphBitmapRanges, LabelGlyphInstance, TileDraw};
+use rgis_render::{
+    BasemapTileDraw, GlyphBitmapRanges, LabelGlyphInstance, TileDraw, VECTOR_TEXTURE_KEY,
+};
 use rgis_tiles::{GLYPH_BUFFER, GLYPH_PIXELS_PER_EM, GlyphFetcher, SpriteAtlas, glyph_range_start};
 
-const SPRITE_ATLAS_TILE_KEY: u64 = u64::MAX;
+// Keep this distinct from rgis-render's stable user-vector texture key.
+const SPRITE_ATLAS_TILE_KEY: u64 = VECTOR_TEXTURE_KEY - 1;
 
 #[derive(Clone, Copy)]
 struct LabelRect {

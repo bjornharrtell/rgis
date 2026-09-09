@@ -5,7 +5,7 @@ use rgis_core::Feature;
 use serde_json::Value;
 use shapefile::dbase::FieldValue;
 
-use crate::{IoError, LoadedLayer};
+use crate::{IoError, LoadedLayer, extract_epsg_code, normalize_epsg};
 
 pub fn load_shapefile(path: &Path) -> Result<LoadedLayer, IoError> {
     let name = path
@@ -16,6 +16,19 @@ pub fn load_shapefile(path: &Path) -> Result<LoadedLayer, IoError> {
 
     let mut reader =
         shapefile::Reader::from_path(path).map_err(|e| IoError::Shapefile(e.to_string()))?;
+
+    let epsg = match std::fs::read_to_string(path.with_extension("prj")) {
+        Ok(wkt) => {
+            let code = extract_epsg_code(&wkt).ok_or_else(|| {
+                IoError::Shapefile(
+                    "the .prj file does not contain a recognizable EPSG authority code".to_owned(),
+                )
+            })?;
+            normalize_epsg(Some(code))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(IoError::Shapefile(error.to_string())),
+    };
 
     let mut features = Vec::new();
 
@@ -39,7 +52,7 @@ pub fn load_shapefile(path: &Path) -> Result<LoadedLayer, IoError> {
     Ok(LoadedLayer {
         name,
         features,
-        epsg: None,
+        epsg,
     })
 }
 

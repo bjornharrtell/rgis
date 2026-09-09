@@ -22,7 +22,6 @@ use rgis_core::{
 };
 use rgis_render::{
     MapCallback, MapRenderResources, StyleSheet, TileMesh, build_background_mesh, build_tile_mesh,
-    render_vector_layers,
 };
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 use wasm_bindgen::JsCast;
@@ -150,17 +149,6 @@ fn wasm_memory_bytes() -> u32 {
     }
 }
 
-fn vector_draw_key(image: &image::RgbaImage) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    image.width().hash(&mut hasher);
-    image.height().hash(&mut hasher);
-    image.as_raw().hash(&mut hasher);
-    hasher.finish() | (1 << 63)
-}
-
 fn icon(path: &str, color: u32) -> impl IntoElement {
     let data = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
@@ -199,6 +187,7 @@ pub struct RgisWebApp {
     raster_tile_cache: raster::RasterTileCaches,
     gpu_basemap_meshes: HashMap<TileCoord, Arc<TileMesh>>,
     pending_tiles: HashSet<TileCoord>,
+    vector_render_cache: rgis_render::VectorRenderCache,
     resources: Option<MapRenderResources>,
     target: Option<MapTarget>,
     dragging: bool,
@@ -214,8 +203,11 @@ pub struct RgisWebApp {
 impl RgisWebApp {
     fn new(_cx: &mut Context<Self>) -> Self {
         let mut project = Project::default();
-        if let Ok(loaded) =
-            rgis_io::load_bytes("sample.geojson", include_bytes!("../assets/sample.geojson"))
+        if let Ok(loaded) = rgis_io::load_bytes_with_crs(
+            "sample.geojson",
+            include_bytes!("../assets/sample.geojson"),
+        )
+        .and_then(|loaded| loaded.into_web_mercator())
         {
             let id = project.next_layer_id();
             let layer = Layer::new(id, loaded.name, loaded.features);
@@ -238,6 +230,7 @@ impl RgisWebApp {
             raster_tile_cache: raster::RasterTileCaches::new(),
             gpu_basemap_meshes: HashMap::new(),
             pending_tiles: HashSet::new(),
+            vector_render_cache: rgis_render::VectorRenderCache::default(),
             resources: None,
             target: None,
             dragging: false,
@@ -780,11 +773,15 @@ impl RgisWebApp {
             Vec::new()
         };
         let raster_tile_count = tiles.len() as u32;
-        if let Some(rgba) = render_vector_layers(&self.project.layers, &self.project.viewport) {
+        if let Some(vector_tile) = self.vector_render_cache.render_with_preview(
+            &self.project.layers,
+            &self.project.viewport,
+            self.dragging,
+        ) {
             tiles.push(rgis_render::TileDraw {
-                key: vector_draw_key(&rgba),
-                rect: [0.0, 0.0, width, height],
-                rgba: Arc::new(rgba),
+                key: vector_tile.key,
+                rect: vector_tile.rect,
+                rgba: vector_tile.image,
                 uv_rect: [0.0, 0.0, 1.0, 1.0],
                 opacity: 1.0,
             });
@@ -950,7 +947,7 @@ impl RgisWebApp {
 
 impl Render for RgisWebApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
+        window.on_next_frame(|_, cx| cx.refresh_windows());
         self.apply_debug_viewport();
         let window_size = window.viewport_size();
         let scale = window.scale_factor();

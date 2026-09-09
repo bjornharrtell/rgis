@@ -127,7 +127,33 @@ pub struct TileDraw {
 }
 
 struct TileGpuTexture {
+    texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    source: Arc<image::RgbaImage>,
+    size: (u32, u32),
+}
+
+fn write_tile_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, image: &image::RgbaImage) {
+    let size = wgpu::Extent3d {
+        width: image.width(),
+        height: image.height(),
+        depth_or_array_layers: 1,
+    };
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        image.as_raw(),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * image.width()),
+            rows_per_image: Some(image.height()),
+        },
+        size,
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -621,20 +647,25 @@ impl MapRenderResources {
     }
 
     fn ensure_tile_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tile: &TileDraw) {
-        if self.tile_textures.get(&tile.key).is_some() {
-            // Already cached; `get` (rather than `peek`) promotes it to
-            // most-recently-used so it isn't the next thing evicted.
+        let size = (tile.rgba.width(), tile.rgba.height());
+        if let Some(cached) = self.tile_textures.get_mut(&tile.key)
+            && cached.size == size
+        {
+            if !Arc::ptr_eq(&cached.source, &tile.rgba) {
+                write_tile_texture(queue, &cached.texture, &tile.rgba);
+                cached.source = Arc::clone(&tile.rgba);
+            }
             return;
         }
 
-        let size = wgpu::Extent3d {
-            width: tile.rgba.width(),
-            height: tile.rgba.height(),
+        let texture_size = wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
             depth_or_array_layers: 1,
         };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rgis-tile-texture"),
-            size,
+            size: texture_size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -642,21 +673,7 @@ impl MapRenderResources {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            tile.rgba.as_raw(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * tile.rgba.width()),
-                rows_per_image: Some(tile.rgba.height()),
-            },
-            size,
-        );
+        write_tile_texture(queue, &texture, &tile.rgba);
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -674,8 +691,15 @@ impl MapRenderResources {
             ],
         });
 
-        self.tile_textures
-            .put(tile.key, TileGpuTexture { bind_group });
+        self.tile_textures.put(
+            tile.key,
+            TileGpuTexture {
+                texture,
+                bind_group,
+                source: Arc::clone(&tile.rgba),
+                size,
+            },
+        );
     }
 
     /// Uploads a basemap tile's fill + line meshes to the GPU once; a no-op

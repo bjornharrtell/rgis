@@ -3,7 +3,7 @@ use std::path::Path;
 use rgis_core::Feature;
 use serde_json::Value;
 
-use crate::{IoError, LoadedLayer};
+use crate::{IoError, LoadedLayer, extract_epsg_code, normalize_epsg};
 
 pub fn load_geojson(path: &Path) -> Result<LoadedLayer, IoError> {
     let name = path
@@ -91,13 +91,10 @@ fn extract_epsg(gj: &geojson::GeoJson) -> Result<Option<u16>, IoError> {
     else {
         return Ok(None);
     };
-    if crs_name.contains("CRS84") || crs_name.contains("4326") {
+    if crs_name.to_ascii_uppercase().contains("CRS84") {
         return Ok(None);
     }
-    let code = crs_name
-        .rsplit(':')
-        .next()
-        .and_then(|s| s.parse::<u16>().ok())
+    let code = extract_epsg_code(crs_name)
         .ok_or_else(|| IoError::GeoJson(format!("unrecognized CRS \"{crs_name}\"")))?;
-    Ok(Some(code))
+    Ok(normalize_epsg(Some(code)))
 }

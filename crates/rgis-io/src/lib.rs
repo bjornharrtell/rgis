@@ -13,6 +13,8 @@ pub enum IoError {
     Shapefile(String),
     #[error("flatgeobuf error: {0}")]
     FlatGeobuf(String),
+    #[error("projection error: {0}")]
+    Projection(String),
 }
 
 mod flatgeobuf_reader;
@@ -29,14 +31,31 @@ pub struct LoadedLayer {
     pub name: String,
     pub features: Vec<Feature>,
     /// EPSG code of the source CRS, if known and not WGS-84. `None` means
-    /// the coordinates are assumed to already be WGS-84 (lon/lat degrees).
+    /// the coordinates are assumed to be WGS-84 (lon/lat degrees).
     pub epsg: Option<u16>,
+}
+
+impl LoadedLayer {
+    /// Transform the layer into the Web Mercator coordinates used by the
+    /// renderer. This is intentionally separate from file loading so callers
+    /// can confirm a detected non-WGS-84 CRS before transforming it.
+    pub fn into_web_mercator(mut self) -> Result<Self, IoError> {
+        self.features = reproject_features(self.features, self.epsg)?;
+        self.epsg = None;
+        Ok(self)
+    }
 }
 
 /// Load a layer from a file path, dispatching on file extension. Native-only:
 /// shapefiles need their `.shx`/`.dbf` sibling files, which only a real
 /// filesystem path (not in-memory bytes) can resolve.
 pub fn load_path(path: impl AsRef<std::path::Path>) -> Result<LoadedLayer, IoError> {
+    load_path_with_crs(path)?.into_web_mercator()
+}
+
+/// Load a layer without transforming it, retaining its detected source CRS
+/// for callers that need to confirm reprojection before adding the layer.
+pub fn load_path_with_crs(path: impl AsRef<std::path::Path>) -> Result<LoadedLayer, IoError> {
     let path = path.as_ref();
     let ext = path
         .extension()
@@ -44,13 +63,12 @@ pub fn load_path(path: impl AsRef<std::path::Path>) -> Result<LoadedLayer, IoErr
         .unwrap_or("")
         .to_lowercase();
 
-    let mut loaded = match ext.as_str() {
+    let loaded = match ext.as_str() {
         "geojson" | "json" => load_geojson(path)?,
         "shp" => load_shapefile(path)?,
         "fgb" => load_flatgeobuf(path)?,
         other => return Err(IoError::UnsupportedFormat(other.to_owned())),
     };
-    loaded.features = reproject_features(loaded.features, loaded.epsg)?;
     Ok(loaded)
 }
 
@@ -59,19 +77,54 @@ pub fn load_path(path: impl AsRef<std::path::Path>) -> Result<LoadedLayer, IoErr
 /// browser file picker). Shapefiles are not supported here since they need
 /// sibling `.shx`/`.dbf` files; use [`load_path`] on native for those.
 pub fn load_bytes(name: &str, bytes: &[u8]) -> Result<LoadedLayer, IoError> {
+    load_bytes_with_crs(name, bytes)?.into_web_mercator()
+}
+
+/// Load a layer from bytes without transforming it, retaining its detected
+/// source CRS for callers that need to confirm reprojection first.
+pub fn load_bytes_with_crs(name: &str, bytes: &[u8]) -> Result<LoadedLayer, IoError> {
     let ext = std::path::Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    let mut loaded = match ext.as_str() {
+    let loaded = match ext.as_str() {
         "geojson" | "json" => geojson_reader::load_geojson_bytes(name, bytes)?,
         "fgb" => flatgeobuf_reader::load_flatgeobuf_bytes(name, bytes)?,
         other => return Err(IoError::UnsupportedFormat(other.to_owned())),
     };
-    loaded.features = reproject_features(loaded.features, loaded.epsg)?;
     Ok(loaded)
+}
+
+/// Extract an EPSG code from common CRS strings and WKT authority/ID clauses.
+/// The supported readers all expose CRS metadata in one of these forms.
+pub(crate) fn extract_epsg_code(reference: &str) -> Option<u16> {
+    let upper = reference.to_ascii_uppercase();
+    let mut search_from = 0;
+    while let Some(relative_pos) = upper[search_from..].find("EPSG") {
+        let start = search_from + relative_pos + "EPSG".len();
+        let rest = &reference[start..];
+        let Some(digits_start) = rest.find(|character: char| character.is_ascii_digit()) else {
+            search_from = start;
+            continue;
+        };
+        let digits = &rest[digits_start..];
+        let digits_end = digits
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(digits.len());
+        if let Ok(code) = digits[..digits_end].parse::<u16>()
+            && code != 0
+        {
+            return Some(code);
+        }
+        search_from = start;
+    }
+    None
+}
+
+pub(crate) fn normalize_epsg(epsg: Option<u16>) -> Option<u16> {
+    epsg.filter(|code| *code != 4326)
 }
 
 /// Reproject all feature geometries to Web Mercator (EPSG:3857, metres).
@@ -88,7 +141,7 @@ fn reproject_features(features: Vec<Feature>, epsg: Option<u16>) -> Result<Vec<F
         .map(|f| {
             let geometry = match epsg {
                 Some(code) => rgis_core::reproject_geometry_to_mercator(code, f.geometry)
-                    .map_err(IoError::GeoJson)?,
+                    .map_err(IoError::Projection)?,
                 None => f.geometry.try_map_coords(|c| {
                     if !(-180.0..=180.0).contains(&c.x) || !(-90.0..=90.0).contains(&c.y) {
                         return Err(IoError::GeoJson(format!(
@@ -119,7 +172,9 @@ mod tests {
         // explicit `crs` member, which previously produced non-finite
         // Web Mercator coordinates and crashed the tessellator.
         let geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[569290,6287398.8],[569188,6287422],[569151.2,6287397.2],[569180.8,6287364],[569154.4,6287340.4],[569110.8,6287184.4],[569132.4,6287178],[569254,6287326.4],[569287.6,6287368],[569290,6287398.8]]]},"properties":{"lokalitet_id":250417}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::25832"}}}"#;
-        let loaded = load_bytes("layer.geojson", geojson.as_bytes()).unwrap();
+        let loaded = load_bytes_with_crs("layer.geojson", geojson.as_bytes()).unwrap();
+        assert_eq!(loaded.epsg, Some(25832));
+        let loaded = loaded.into_web_mercator().unwrap();
         assert_eq!(loaded.features.len(), 1);
         let Geometry::Polygon(poly) = &loaded.features[0].geometry else {
             panic!("expected polygon");
@@ -127,5 +182,18 @@ mod tests {
         for c in poly.exterior().coords() {
             assert!(c.x.is_finite() && c.y.is_finite());
         }
+    }
+
+    #[test]
+    fn extracts_epsg_codes_from_common_crs_definitions() {
+        assert_eq!(
+            extract_epsg_code("urn:ogc:def:crs:EPSG::25832"),
+            Some(25832)
+        );
+        assert_eq!(
+            extract_epsg_code(r#"PROJCRS["ETRS89 / UTM zone 32N",ID["EPSG",25832]]"#),
+            Some(25832)
+        );
+        assert_eq!(normalize_epsg(Some(4326)), None);
     }
 }
