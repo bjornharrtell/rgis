@@ -1,5 +1,7 @@
 use geo_types::{Coord, Geometry, Rect};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 // ── IDs ───────────────────────────────────────────────────────────────────────
 
@@ -365,6 +367,38 @@ impl Layer {
             z_order: 0,
         }
     }
+
+    /// Replace the runtime geometry and refresh the cached bounds.
+    pub fn set_features(&mut self, features: Vec<Feature>) {
+        self.feature_bounds = features
+            .iter()
+            .map(|feature| geometry_bounds(&feature.geometry))
+            .collect();
+        self.bounds = compute_bounds(&features);
+        self.features = features;
+    }
+
+    pub fn state(&self) -> LayerState {
+        LayerState::from_layer(self)
+    }
+
+    /// Apply persisted metadata without touching the loaded geometry.
+    pub fn apply_state(&mut self, state: &LayerState) {
+        self.id = state.id;
+        self.name = state.name.clone();
+        self.source_path = state.source_path.clone();
+        self.style = state.style.clone();
+        self.visible = state.visible;
+        self.z_order = state.z_order;
+    }
+
+    /// Create a layer from persisted metadata. Geometry can be loaded later
+    /// from `source_path` with [`Layer::set_features`].
+    pub fn from_state(state: &LayerState) -> Self {
+        let mut layer = Self::new(state.id, state.name.clone(), Vec::new());
+        layer.apply_state(state);
+        layer
+    }
 }
 
 fn compute_bounds(features: &[Feature]) -> Option<Bounds> {
@@ -383,6 +417,171 @@ fn compute_bounds(features: &[Feature]) -> Option<Bounds> {
 fn geometry_bounds(geometry: &geo_types::Geometry) -> Option<Bounds> {
     use geo::BoundingRect;
     geometry.bounding_rect().map(Bounds::from_rect)
+}
+
+// ── Project state ─────────────────────────────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Persisted metadata for one vector layer.
+///
+/// Feature geometry is deliberately not part of the project file. It stays
+/// loaded in memory and is restored from `source_path` by the application.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerState {
+    pub id: LayerId,
+    pub name: String,
+    #[serde(
+        rename = "source",
+        alias = "source_path",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_path: Option<PathBuf>,
+    #[serde(default)]
+    pub style: Style,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub visible: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub z_order: u32,
+}
+
+impl LayerState {
+    pub fn from_layer(layer: &Layer) -> Self {
+        Self {
+            id: layer.id,
+            name: layer.name.clone(),
+            source_path: layer.source_path.clone(),
+            style: layer.style.clone(),
+            visible: layer.visible,
+            z_order: layer.z_order,
+        }
+    }
+}
+
+/// Persisted map camera state. Viewport dimensions are runtime window state
+/// and are intentionally not stored in project files.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MapState {
+    pub center: [f64; 2],
+    pub zoom: f64,
+}
+
+impl Default for MapState {
+    fn default() -> Self {
+        Self {
+            center: [0.0, 0.0],
+            zoom: 2.0,
+        }
+    }
+}
+
+impl MapState {
+    pub fn from_viewport(viewport: &Viewport) -> Self {
+        Self {
+            center: [viewport.center.x, viewport.center.y],
+            zoom: viewport.zoom,
+        }
+    }
+
+    pub fn apply_to_viewport(self, viewport: &mut Viewport) {
+        viewport.center = Coord {
+            x: self.center[0],
+            y: self.center[1],
+        };
+        viewport.zoom = self.zoom;
+    }
+
+    fn validate(self) -> Result<(), ProjectError> {
+        if !self.center.iter().all(|coordinate| coordinate.is_finite()) {
+            return Err(ProjectError::InvalidState(
+                "map center must contain finite coordinates".to_string(),
+            ));
+        }
+        if !self.zoom.is_finite() || !(0.0..=22.0).contains(&self.zoom) {
+            return Err(ProjectError::InvalidState(
+                "map zoom must be finite and between 0 and 22".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Serializable project representation used by the concise YAML file format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectState {
+    pub layers: Vec<LayerState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_sources: Vec<DataSource>,
+    #[serde(default)]
+    pub map: MapState,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_tiles: bool,
+}
+
+impl Default for ProjectState {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            data_sources: Vec::new(),
+            map: MapState::default(),
+            show_tiles: true,
+        }
+    }
+}
+
+impl ProjectState {
+    pub fn to_yaml(&self) -> Result<String, ProjectError> {
+        self.validate()?;
+        serde_yaml::to_string(self).map_err(ProjectError::from)
+    }
+
+    pub fn from_yaml(yaml: &str) -> Result<Self, ProjectError> {
+        let state: Self = serde_yaml::from_str(yaml).map_err(ProjectError::from)?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn validate(&self) -> Result<(), ProjectError> {
+        self.map.validate()?;
+        let mut layer_ids = HashSet::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            if !layer_ids.insert(layer.id) {
+                return Err(ProjectError::InvalidState(format!(
+                    "duplicate layer id {}",
+                    layer.id.0
+                )));
+            }
+        }
+        let mut data_source_ids = HashSet::with_capacity(self.data_sources.len());
+        for data_source in &self.data_sources {
+            if !data_source_ids.insert(data_source.id) {
+                return Err(ProjectError::InvalidState(format!(
+                    "duplicate data source id {}",
+                    data_source.id.0
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectError {
+    #[error("project YAML error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("invalid project state: {0}")]
+    InvalidState(String),
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
@@ -412,13 +611,13 @@ impl Default for Project {
 impl Project {
     pub fn next_layer_id(&mut self) -> LayerId {
         let id = LayerId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         id
     }
 
     pub fn next_data_source_id(&mut self) -> DataSourceId {
         let id = DataSourceId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         id
     }
 
@@ -445,6 +644,73 @@ impl Project {
 
     pub fn get_data_source_mut(&mut self, id: DataSourceId) -> Option<&mut DataSource> {
         self.data_sources.iter_mut().find(|source| source.id == id)
+    }
+
+    /// Return the serializable project metadata without copying loaded
+    /// geometry or runtime viewport dimensions.
+    pub fn to_state(&self) -> ProjectState {
+        ProjectState {
+            layers: self.layers.iter().map(Layer::state).collect(),
+            data_sources: self.data_sources.clone(),
+            map: MapState::from_viewport(&self.viewport),
+            show_tiles: self.show_tiles,
+        }
+    }
+
+    pub fn to_yaml(&self) -> Result<String, ProjectError> {
+        self.to_state().to_yaml()
+    }
+
+    /// Apply persisted state while preserving the current canvas dimensions
+    /// and geometry whose layer source is unchanged.
+    pub fn apply_state(&mut self, state: ProjectState) -> Result<(), ProjectError> {
+        state.validate()?;
+        let mut existing_layers = std::mem::take(&mut self.layers);
+        let mut layers = Vec::with_capacity(state.layers.len());
+        for layer_state in &state.layers {
+            let existing = existing_layers
+                .iter()
+                .position(|layer| layer.id == layer_state.id)
+                .map(|index| existing_layers.swap_remove(index));
+            let layer = match existing {
+                Some(mut layer) if layer.source_path == layer_state.source_path => {
+                    layer.apply_state(layer_state);
+                    layer
+                }
+                _ => Layer::from_state(layer_state),
+            };
+            layers.push(layer);
+        }
+        self.layers = layers;
+        self.data_sources = state.data_sources;
+        state.map.apply_to_viewport(&mut self.viewport);
+        self.show_tiles = state.show_tiles;
+        self.rebuild_id_counter();
+        Ok(())
+    }
+
+    pub fn apply_yaml(&mut self, yaml: &str) -> Result<(), ProjectError> {
+        self.apply_state(ProjectState::from_yaml(yaml)?)
+    }
+
+    pub fn from_state(state: ProjectState) -> Result<Self, ProjectError> {
+        let mut project = Self::default();
+        project.apply_state(state)?;
+        Ok(project)
+    }
+
+    pub fn from_yaml(yaml: &str) -> Result<Self, ProjectError> {
+        Self::from_state(ProjectState::from_yaml(yaml)?)
+    }
+
+    fn rebuild_id_counter(&mut self) {
+        self.next_id = self
+            .layers
+            .iter()
+            .map(|layer| layer.id.0)
+            .chain(self.data_sources.iter().map(|source| source.id.0))
+            .max()
+            .map_or(0, |id| id.saturating_add(1));
     }
 }
 
@@ -620,8 +886,125 @@ mod tests {
             "https://example.com/wms",
             "imagery",
         );
-        let yaml = serde_json::to_string(&source).unwrap();
-        assert!(yaml.contains("\"type\":\"wms\""));
-        assert!(yaml.contains("\"layers\":\"imagery\""));
+        let yaml = serde_yaml::to_string(&source).unwrap();
+        assert!(yaml.contains("type: wms"));
+        assert!(yaml.contains("layers: imagery"));
+    }
+
+    #[test]
+    fn project_state_round_trip_preserves_runtime_geometry_and_dimensions() {
+        let mut project = Project::default();
+        project.viewport.center = Coord {
+            x: 123.0,
+            y: -456.0,
+        };
+        project.viewport.zoom = 7.5;
+        project.viewport.width_px = 1_234;
+        project.viewport.height_px = 987;
+        project.show_tiles = false;
+
+        let layer_id = project.next_layer_id();
+        let mut layer = Layer::new(
+            layer_id,
+            "roads",
+            vec![Feature {
+                geometry: Geometry::Point(geo_types::Point::new(10.0, 20.0)),
+                properties: serde_json::json!({ "class": "primary" }),
+            }],
+        );
+        layer.source_path = Some(PathBuf::from("data/roads.geojson"));
+        layer.visible = false;
+        layer.style.stroke_width = 4.0;
+        project.add_layer(layer);
+        let data_source_id = project.next_data_source_id();
+        project.add_data_source(DataSource::wms(
+            data_source_id,
+            "Aerial",
+            "https://example.com/wms",
+            "imagery",
+        ));
+
+        let yaml = project.to_yaml().unwrap();
+        assert!(yaml.contains("layers:"));
+        assert!(yaml.contains("style:"));
+        assert!(yaml.contains("data_sources:"));
+        assert!(yaml.contains("map:"));
+        assert!(!yaml.contains("features:"));
+        assert!(!yaml.contains("width_px:"));
+        assert!(!yaml.contains("height_px:"));
+
+        let state = ProjectState::from_yaml(&yaml).unwrap();
+        let parsed_project = Project::from_yaml(&yaml).unwrap();
+        assert_eq!(parsed_project.to_state(), state);
+        assert!(parsed_project.layers[0].features.is_empty());
+        let mut restored = project;
+        restored.apply_state(state).unwrap();
+        assert_eq!(
+            restored.viewport.center,
+            Coord {
+                x: 123.0,
+                y: -456.0
+            }
+        );
+        assert_eq!(restored.viewport.zoom, 7.5);
+        assert_eq!(restored.viewport.width_px, 1_234);
+        assert_eq!(restored.viewport.height_px, 987);
+        assert!(!restored.show_tiles);
+        assert_eq!(restored.layers.len(), 1);
+        assert_eq!(restored.layers[0].features.len(), 1);
+        assert_eq!(restored.layers[0].style.stroke_width, 4.0);
+        assert!(!restored.layers[0].visible);
+        assert_eq!(restored.data_sources.len(), 1);
+    }
+
+    #[test]
+    fn project_state_replaces_geometry_when_source_changes() {
+        let mut project = Project::default();
+        let layer_id = project.next_layer_id();
+        let mut layer = Layer::new(
+            layer_id,
+            "old",
+            vec![Feature {
+                geometry: Geometry::Point(geo_types::Point::new(1.0, 2.0)),
+                properties: serde_json::Value::Null,
+            }],
+        );
+        layer.source_path = Some(PathBuf::from("old.geojson"));
+        project.add_layer(layer);
+
+        let mut state = project.to_state();
+        state.layers[0].source_path = Some(PathBuf::from("new.geojson"));
+        state.layers[0].name = "new".to_string();
+        project.apply_state(state).unwrap();
+
+        assert_eq!(project.layers[0].name, "new");
+        assert!(project.layers[0].features.is_empty());
+    }
+
+    #[test]
+    fn project_state_rejects_duplicate_ids() {
+        let state = ProjectState {
+            layers: vec![
+                LayerState {
+                    id: LayerId(1),
+                    name: "one".to_string(),
+                    source_path: None,
+                    style: Style::default(),
+                    visible: true,
+                    z_order: 0,
+                },
+                LayerState {
+                    id: LayerId(1),
+                    name: "two".to_string(),
+                    source_path: None,
+                    style: Style::default(),
+                    visible: true,
+                    z_order: 1,
+                },
+            ],
+            ..ProjectState::default()
+        };
+        let error = state.to_yaml().unwrap_err();
+        assert!(error.to_string().contains("duplicate layer id"));
     }
 }

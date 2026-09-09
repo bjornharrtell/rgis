@@ -83,6 +83,14 @@ impl LayerUi for RgisWebApp {
     }
 
     fn add_layer(&mut self, _window: &mut Window) {}
+
+    fn open_project(&mut self, _window: &mut Window) {
+        self.status = "Opening project files is only available in the native app".to_string();
+    }
+
+    fn save_project(&mut self, _window: &mut Window) {
+        self.status = "Saving project files is only available in the native app".to_string();
+    }
 }
 
 impl MapTarget {

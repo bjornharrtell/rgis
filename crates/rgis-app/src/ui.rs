@@ -110,6 +110,8 @@ pub trait LayerUi: Sized + 'static {
     fn set_status(&mut self, status: String);
     fn cursor_lonlat(&self) -> Option<(f64, f64)>;
     fn add_layer(&mut self, window: &mut Window);
+    fn open_project(&mut self, window: &mut Window);
+    fn save_project(&mut self, window: &mut Window);
 
     fn layers_expanded(&self) -> bool {
         self.layer_ui_state().layers_expanded()
@@ -622,6 +624,56 @@ fn data_sources_panel<T: LayerUi>(
     content
 }
 
+fn project_actions<T: LayerUi>(cx: &mut Context<T>) -> impl IntoElement {
+    div()
+        .h(px(30.0))
+        .w_full()
+        .px_2()
+        .gap_1()
+        .flex()
+        .items_center()
+        .text_xs()
+        .text_color(rgb(ZED_MUTED))
+        .child("PROJECT")
+        .child(
+            div()
+                .ml_auto()
+                .h(px(24.0))
+                .px_2()
+                .gap_1()
+                .flex()
+                .items_center()
+                .hover(|style| style.bg(rgb(ZED_SURFACE)))
+                .child(icon("M4 4h16v16H4zM8 4v4h8V4", ZED_MUTED))
+                .child("Open")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.open_project(window);
+                        cx.stop_propagation();
+                    }),
+                ),
+        )
+        .child(
+            div()
+                .h(px(24.0))
+                .px_2()
+                .gap_1()
+                .flex()
+                .items_center()
+                .hover(|style| style.bg(rgb(ZED_SURFACE)))
+                .child(icon("M5 4h10l4 4v12H5zM8 4v5h7V4M8 20v-6h8v6", ZED_MUTED))
+                .child("Save")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.save_project(window);
+                        cx.stop_propagation();
+                    }),
+                ),
+        )
+}
+
 pub fn sidebar<T: LayerUi>(
     state: &T,
     window: &mut Window,
@@ -638,6 +690,7 @@ pub fn sidebar<T: LayerUi>(
         .border_r_1()
         .border_color(rgb(ZED_BORDER))
         .text_color(rgb(ZED_TEXT))
+        .child(project_actions(cx))
         .child(
             div()
                 .h(px(30.0))

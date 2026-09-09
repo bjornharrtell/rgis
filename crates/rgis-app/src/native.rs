@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::{fs, path::PathBuf};
 
 use gpui::{
     App, Bounds, Context, CursorStyle, DevicePixels, MouseButton, Render, ResizeEdge, Window,
@@ -17,7 +18,9 @@ use poll_promise::Promise;
 use rgis_app::labels;
 use rgis_app::raster;
 use rgis_app::ui::{self, LayerUi, LayerUiState, StyleColorTarget};
-use rgis_core::{Bounds as GeoBounds, Color, Layer, LayerId, Project, mercator_to_lonlat};
+use rgis_core::{
+    Bounds as GeoBounds, Color, Layer, LayerId, Project, ProjectState, mercator_to_lonlat,
+};
 use rgis_render::{MapCallback, MapRenderResources, SceneMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
@@ -35,7 +38,13 @@ const ZED_MUTED: u32 = 0x929292;
 const ZED_ACCENT: u32 = 0x8ab4f8;
 const DEFAULT_STYLE_JSON: &str = include_str!("../../rgis-style/fixtures/liberty.json");
 
-type LoadResults = Vec<(String, Result<rgis_io::LoadedLayer, rgis_io::IoError>)>;
+type LoadResults = Vec<(PathBuf, Result<rgis_io::LoadedLayer, rgis_io::IoError>)>;
+
+struct LoadedProject {
+    state: ProjectState,
+    layers: Vec<(LayerId, PathBuf, Vec<rgis_core::Feature>)>,
+    path: PathBuf,
+}
 
 struct PendingVectorRender {
     layer_key: u64,
@@ -63,6 +72,44 @@ fn prepare_loaded_layer(
         }
     }
     loaded.into_web_mercator().map(Some)
+}
+
+fn load_project_file(path: PathBuf) -> Result<LoadedProject, String> {
+    let yaml = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let state = ProjectState::from_yaml(&yaml).map_err(|error| {
+        format!(
+            "failed to parse project {}: {error}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+        )
+    })?;
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut layers = Vec::new();
+    for layer in &state.layers {
+        let Some(source) = &layer.source_path else {
+            continue;
+        };
+        let source_path = if source.is_absolute() {
+            source.clone()
+        } else {
+            base.join(source)
+        };
+        let loaded = rgis_io::load_path(&source_path).map_err(|error| {
+            format!(
+                "failed to load layer {} from {}: {error}",
+                layer.name,
+                source_path.display()
+            )
+        })?;
+        layers.push((layer.id, source_path, loaded.features));
+    }
+    Ok(LoadedProject {
+        state,
+        layers,
+        path,
+    })
 }
 
 fn icon(path: &str, color: u32) -> impl IntoElement {
@@ -166,6 +213,8 @@ pub struct RgisNativeApp {
     resources: Option<MapRenderResources>,
     target: Option<MapTarget>,
     pending_loads: Vec<Promise<LoadResults>>,
+    pending_project_loads: Vec<Promise<Result<Option<LoadedProject>, String>>>,
+    pending_project_saves: Vec<Promise<Result<Option<PathBuf>, String>>>,
     status: String,
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
     cursor_lonlat: Option<(f64, f64)>,
@@ -205,7 +254,8 @@ impl RgisNativeApp {
                     Ok(loaded) => match prepare_loaded_layer(loaded, &name) {
                         Ok(Some(loaded)) => {
                             let id = project.next_layer_id();
-                            let layer = Layer::new(id, loaded.name, loaded.features);
+                            let mut layer = Layer::new(id, loaded.name, loaded.features);
+                            layer.source_path = Some(path.clone());
                             if let Some(bounds) = layer.bounds {
                                 project.add_layer(layer);
                                 project.viewport.fit_bounds(&bounds);
@@ -241,6 +291,8 @@ impl RgisNativeApp {
             resources: None,
             target: None,
             pending_loads: Vec::new(),
+            pending_project_loads: Vec::new(),
+            pending_project_saves: Vec::new(),
             status: "GPUI native renderer".to_string(),
             last_cursor: None,
             cursor_lonlat: None,
@@ -265,16 +317,142 @@ impl RgisNativeApp {
                 paths
                     .into_iter()
                     .map(|path| {
-                        let name = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("layer")
-                            .to_string();
-                        (name, rgis_io::load_path_with_crs(path))
+                        let result = rgis_io::load_path_with_crs(&path);
+                        (path, result)
                     })
                     .collect()
             }));
         window.on_next_frame(|_, cx| cx.refresh_windows());
+    }
+
+    fn queue_open_project(&mut self, window: &Window) {
+        if !self.pending_project_loads.is_empty() {
+            self.status = "A project is already opening".to_string();
+            return;
+        }
+        self.status = "Opening project...".to_string();
+        self.pending_project_loads
+            .push(Promise::spawn_thread("pick-and-load-project", || {
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Rgis project", &["rgis", "yaml", "yml"])
+                    .pick_file()
+                else {
+                    return Ok(None);
+                };
+                load_project_file(path).map(Some)
+            }));
+        window.on_next_frame(|_, cx| cx.refresh_windows());
+    }
+
+    fn queue_save_project(&mut self, window: &Window) {
+        if !self.pending_project_saves.is_empty() {
+            self.status = "A project is already saving".to_string();
+            return;
+        }
+        let yaml = match self.project.to_yaml() {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                self.status = format!("Failed to serialize project: {error}");
+                return;
+            }
+        };
+        self.status = "Saving project...".to_string();
+        self.pending_project_saves.push(Promise::spawn_thread(
+            "pick-and-save-project",
+            move || {
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Rgis project", &["rgis", "yaml", "yml"])
+                    .set_file_name("project.rgis")
+                    .save_file()
+                else {
+                    return Ok(None);
+                };
+                fs::write(&path, yaml)
+                    .map(|()| Some(path.clone()))
+                    .map_err(|error| format!("failed to write {}: {error}", path.display()))
+            },
+        ));
+        window.on_next_frame(|_, cx| cx.refresh_windows());
+    }
+
+    fn poll_project_io(&mut self, window: &Window) {
+        let pending_loads = std::mem::take(&mut self.pending_project_loads);
+        for promise in pending_loads {
+            match promise.try_take() {
+                Ok(Ok(Some(loaded))) => {
+                    let missing_sources = loaded
+                        .state
+                        .layers
+                        .iter()
+                        .filter(|layer| layer.source_path.is_none())
+                        .count();
+                    let dimensions = (
+                        self.project.viewport.width_px,
+                        self.project.viewport.height_px,
+                    );
+                    match Project::from_state(loaded.state) {
+                        Ok(mut project) => {
+                            project.viewport.width_px = dimensions.0;
+                            project.viewport.height_px = dimensions.1;
+                            for (layer_id, source_path, features) in loaded.layers {
+                                if let Some(layer) = project.get_layer_mut(layer_id) {
+                                    layer.set_features(features);
+                                    layer.source_path = Some(source_path);
+                                }
+                            }
+                            self.project = project;
+                            self.cancel_vector_render();
+                            let name = loaded
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("project");
+                            self.status = if missing_sources == 0 {
+                                format!("Opened project {name}")
+                            } else {
+                                format!(
+                                    "Opened project {name}; {missing_sources} layer(s) have no source file"
+                                )
+                            };
+                        }
+                        Err(error) => {
+                            self.status = format!("Failed to open project: {error}");
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {
+                    self.status = "Open project cancelled".to_string();
+                }
+                Ok(Err(error)) => {
+                    self.status = format!("Failed to open project: {error}");
+                }
+                Err(promise) => self.pending_project_loads.push(promise),
+            }
+        }
+
+        let pending_saves = std::mem::take(&mut self.pending_project_saves);
+        for promise in pending_saves {
+            match promise.try_take() {
+                Ok(Ok(Some(path))) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("project");
+                    self.status = format!("Saved project {name}");
+                }
+                Ok(Ok(None)) => {
+                    self.status = "Save project cancelled".to_string();
+                }
+                Ok(Err(error)) => {
+                    self.status = format!("Failed to save project: {error}");
+                }
+                Err(promise) => self.pending_project_saves.push(promise),
+            }
+        }
+
+        if !self.pending_project_loads.is_empty() || !self.pending_project_saves.is_empty() {
+            window.on_next_frame(|_, cx| cx.refresh_windows());
+        }
     }
 
     fn sidebar_offset(&self) -> f32 {
@@ -290,12 +468,18 @@ impl RgisNativeApp {
         for promise in pending {
             match promise.try_take() {
                 Ok(results) => {
-                    for (name, result) in results {
+                    for (path, result) in results {
+                        let name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("layer")
+                            .to_string();
                         match result {
                             Ok(loaded) => match prepare_loaded_layer(loaded, &name) {
                                 Ok(Some(loaded)) => {
                                     let id = self.project.next_layer_id();
-                                    let layer = Layer::new(id, loaded.name, loaded.features);
+                                    let mut layer = Layer::new(id, loaded.name, loaded.features);
+                                    layer.source_path = Some(path);
                                     if self.project.layers.is_empty()
                                         && let Some(bounds) = layer.bounds
                                     {
@@ -1239,10 +1423,19 @@ impl LayerUi for RgisNativeApp {
     fn add_layer(&mut self, window: &mut Window) {
         self.queue_pick_files(window);
     }
+
+    fn open_project(&mut self, window: &mut Window) {
+        self.queue_open_project(window);
+    }
+
+    fn save_project(&mut self, window: &mut Window) {
+        self.queue_save_project(window);
+    }
 }
 
 impl Render for RgisNativeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.poll_project_io(window);
         self.render_map(window);
         let has_client_titlebar = matches!(
             window.window_decorations(),
