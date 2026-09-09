@@ -6,6 +6,78 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LayerId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DataSourceId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataSource {
+    pub id: DataSourceId,
+    pub name: String,
+    pub kind: DataSourceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DataSourceKind {
+    #[serde(rename = "postgresql")]
+    PostgreSQL {
+        host: String,
+        port: u16,
+        database: String,
+        username: String,
+        password: String,
+    },
+    #[serde(rename = "wms")]
+    Wms { url: String, layers: String },
+}
+
+impl DataSource {
+    pub fn postgresql(
+        id: DataSourceId,
+        name: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        database: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind: DataSourceKind::PostgreSQL {
+                host: host.into(),
+                port,
+                database: database.into(),
+                username: username.into(),
+                password: password.into(),
+            },
+        }
+    }
+
+    pub fn wms(
+        id: DataSourceId,
+        name: impl Into<String>,
+        url: impl Into<String>,
+        layers: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind: DataSourceKind::Wms {
+                url: url.into(),
+                layers: layers.into(),
+            },
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            DataSourceKind::PostgreSQL { .. } => "PostgreSQL",
+            DataSourceKind::Wms { .. } => "OGC WMS",
+        }
+    }
+}
+
 // ── Style ─────────────────────────────────────────────────────────────────────
 
 /// RGBA colour, components in [0.0, 1.0].
@@ -318,6 +390,7 @@ fn geometry_bounds(geometry: &geo_types::Geometry) -> Option<Bounds> {
 #[derive(Debug)]
 pub struct Project {
     pub layers: Vec<Layer>,
+    pub data_sources: Vec<DataSource>,
     pub viewport: Viewport,
     /// Whether the OSM tile background is visible.
     pub show_tiles: bool,
@@ -328,6 +401,7 @@ impl Default for Project {
     fn default() -> Self {
         Self {
             layers: Vec::new(),
+            data_sources: Vec::new(),
             viewport: Viewport::default(),
             show_tiles: true,
             next_id: 0,
@@ -342,17 +416,35 @@ impl Project {
         id
     }
 
+    pub fn next_data_source_id(&mut self) -> DataSourceId {
+        let id = DataSourceId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
     pub fn add_layer(&mut self, mut layer: Layer) {
         layer.z_order = self.layers.len() as u32;
         self.layers.push(layer);
+    }
+
+    pub fn add_data_source(&mut self, data_source: DataSource) {
+        self.data_sources.push(data_source);
     }
 
     pub fn remove_layer(&mut self, id: LayerId) {
         self.layers.retain(|l| l.id != id);
     }
 
+    pub fn remove_data_source(&mut self, id: DataSourceId) {
+        self.data_sources.retain(|source| source.id != id);
+    }
+
     pub fn get_layer_mut(&mut self, id: LayerId) -> Option<&mut Layer> {
         self.layers.iter_mut().find(|l| l.id == id)
+    }
+
+    pub fn get_data_source_mut(&mut self, id: DataSourceId) -> Option<&mut DataSource> {
+        self.data_sources.iter_mut().find(|source| source.id == id)
     }
 }
 
@@ -518,5 +610,18 @@ mod tests {
             (world_before.y - world_after.y).abs() < 1.0,
             "cursor world y should be stable after zoom"
         );
+    }
+
+    #[test]
+    fn data_sources_have_stable_yaml_shape() {
+        let source = DataSource::wms(
+            DataSourceId(3),
+            "Aerial WMS",
+            "https://example.com/wms",
+            "imagery",
+        );
+        let yaml = serde_json::to_string(&source).unwrap();
+        assert!(yaml.contains("\"type\":\"wms\""));
+        assert!(yaml.contains("\"layers\":\"imagery\""));
     }
 }

@@ -9,6 +9,7 @@ use gpui::{
     App, Bounds, Context, CursorStyle, DevicePixels, MouseButton, Render, ResizeEdge, Window,
     WindowBounds, WindowDecorations, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
 };
+use gpui_elements::editable_text::actions::{DEFAULT_INPUT_CONTEXT, default_bindings};
 use gpui_platform::application;
 use gpui_wgpu::{WgpuContextHandle, WgpuRenderTarget};
 use lru::LruCache;
@@ -1227,6 +1228,10 @@ impl LayerUi for RgisNativeApp {
         &self.status
     }
 
+    fn set_status(&mut self, status: String) {
+        self.status = status;
+    }
+
     fn cursor_lonlat(&self) -> Option<(f64, f64)> {
         self.cursor_lonlat
     }
@@ -1370,7 +1375,7 @@ impl Render for RgisNativeApp {
             .flex_1()
             .flex()
             .when(self.sidebar_visible, |content| {
-                content.child(ui::sidebar(self, cx))
+                content.child(ui::sidebar(self, window, cx))
             })
             .child(map);
         root = root.child(map_content).child(ui::status_bar(self, cx));
@@ -1462,6 +1467,7 @@ impl Render for RgisNativeApp {
 
 pub fn run(startup_paths: Vec<std::path::PathBuf>) {
     application().run(move |cx: &mut App| {
+        cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
         cx.open_window(
             WindowOptions {

@@ -10,6 +10,7 @@ A Rust GIS desktop application built on [egui](https://crates.io/crates/egui)/[e
 - Render vector layers as tessellated triangle meshes uploaded to the GPU via `wgpu`
 - Show OpenStreetMap raster tiles behind vector data, with an on-disk cache on native
 - Layer panel to toggle visibility and remove layers
+- Data source panel for PostgreSQL and OGC WMS connection definitions
 - Keep map state in Web Mercator while reporting cursor coordinates and scale in the status bar
 
 ## Building on Ubuntu
