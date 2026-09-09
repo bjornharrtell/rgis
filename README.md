@@ -11,6 +11,7 @@ A Rust GIS desktop application built on [egui](https://crates.io/crates/egui)/[e
 - Show OpenStreetMap raster tiles behind vector data, with an on-disk cache on native
 - Layer panel to toggle visibility and remove layers
 - Data source panel for PostgreSQL and OGC WMS connection definitions
+- Open and save concise YAML project files with layer styles, data sources, and map position
 - Keep map state in Web Mercator while reporting cursor coordinates and scale in the status bar
 
 ## Building on Ubuntu
@@ -80,6 +81,33 @@ Then open <http://127.0.0.1:8080/rgis/> in a browser.
 A `trunk build --release` produces static assets in `crates/rgis-web/dist`
 which are what the [`pages` workflow](.github/workflows/pages.yml)
 publishes to GitHub Pages on every push to `main`.
+
+## Project files
+
+Native builds expose **Open** and **Save** controls in the project sidebar.
+Project files use YAML (the recommended extension is `.rgis`) and contain
+layer metadata and styles, configured data sources, the map center and zoom,
+and the OpenFreeMap visibility setting. Loaded vector geometry is kept out of
+the file so projects stay concise; layers with a source path are loaded again
+when a project is opened. Viewport pixel dimensions are runtime window state
+and are preserved from the current window rather than stored in the project.
+
+The core format is intentionally plain YAML, for example:
+
+```yaml
+layers:
+  - id: 0
+    name: roads
+    source: data/roads.geojson
+    style:
+      fill: {r: 0.3, g: 0.6, b: 0.9, a: 0.5}
+      stroke: {r: 0.1, g: 0.3, b: 0.7, a: 1.0}
+      stroke_width: 1.5
+      point_radius: 5.0
+map:
+  center: [0.0, 0.0]
+  zoom: 2.0
+```
 
 ## Project layout
 
