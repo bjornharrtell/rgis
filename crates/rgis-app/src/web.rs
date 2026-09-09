@@ -70,6 +70,14 @@ impl LayerUi for RgisWebApp {
         self.style_editor_layer = layer;
     }
 
+    fn layer_menu_layer(&self) -> Option<LayerId> {
+        self.layer_menu_layer
+    }
+
+    fn set_layer_menu_layer(&mut self, layer: Option<LayerId>) {
+        self.layer_menu_layer = layer;
+    }
+
     fn style_color_target(&self) -> StyleColorTarget {
         self.style_color_target
     }
@@ -207,6 +215,7 @@ pub struct RgisWebApp {
     status: String,
     layers_expanded: bool,
     style_editor_layer: Option<LayerId>,
+    layer_menu_layer: Option<LayerId>,
     style_color_target: StyleColorTarget,
     cursor_lonlat: Option<(f64, f64)>,
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
@@ -247,6 +256,7 @@ impl RgisWebApp {
             status: "GPUI browser renderer".to_string(),
             layers_expanded: true,
             style_editor_layer: None,
+            layer_menu_layer: None,
             style_color_target: StyleColorTarget::Fill,
             cursor_lonlat: None,
             bbox_zoom_start: None,
