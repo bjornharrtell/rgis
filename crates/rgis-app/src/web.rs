@@ -761,12 +761,16 @@ impl RgisWebApp {
             }
         }
 
-        let mut tiles = raster::collect_draws(
-            &self.style,
-            &self.project.viewport,
-            &self.raster_fetchers,
-            &mut self.raster_tile_cache,
-        );
+        let mut tiles = if self.project.show_tiles {
+            raster::collect_draws(
+                &self.style,
+                &self.project.viewport,
+                &self.raster_fetchers,
+                &mut self.raster_tile_cache,
+            )
+        } else {
+            Vec::new()
+        };
         let raster_tile_count = tiles.len() as u32;
         if let Some(rgba) = render_vector_layers(&self.project.layers, &self.project.viewport) {
             tiles.push(rgis_render::TileDraw {

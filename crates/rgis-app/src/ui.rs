@@ -1,4 +1,4 @@
-use gpui::{Context, MouseButton, Window, div, prelude::*, px, rgb, rgba};
+use gpui::{Context, MouseButton, Window, deferred, div, prelude::*, px, rgb, rgba};
 use rgis_core::{Color, LayerId, Project};
 
 const SIDEBAR_WIDTH: f32 = 280.0;
@@ -22,6 +22,8 @@ pub trait LayerUi: Sized + 'static {
     fn set_layers_expanded(&mut self, expanded: bool);
     fn style_editor_layer(&self) -> Option<LayerId>;
     fn set_style_editor_layer(&mut self, layer: Option<LayerId>);
+    fn layer_menu_layer(&self) -> Option<LayerId>;
+    fn set_layer_menu_layer(&mut self, layer: Option<LayerId>);
     fn style_color_target(&self) -> StyleColorTarget;
     fn set_style_color_target(&mut self, target: StyleColorTarget);
     fn add_layer(&mut self, window: &mut Window);
@@ -165,7 +167,7 @@ pub fn sidebar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElement {
 }
 
 fn layer_row<T: LayerUi>(
-    _state: &T,
+    state: &T,
     layer_id: LayerId,
     name: String,
     visible: bool,
@@ -176,7 +178,11 @@ fn layer_row<T: LayerUi>(
     } else {
         "m3 3 18 18M10.6 6.2A10.7 10.7 0 0 1 12 6c6.5 0 10 6 10 6a18 18 0 0 1-3.2 3.8M6.2 6.3C3.4 8.3 2 12 2 12s3.5 6 10 6c1.1 0 2.1-.2 3-.5"
     };
-    div()
+    let menu_open = state.layer_menu_layer() == Some(layer_id);
+    let group_name = format!("layer-row-{}", layer_id.0);
+    let row = div()
+        .group(group_name.clone())
+        .relative()
         .h(px(30.0))
         .w_full()
         .px_2()
@@ -225,39 +231,79 @@ fn layer_row<T: LayerUi>(
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(icon(
-                    "m12 3 1.2 5.8L19 10l-5.8 1.2L12 17l-1.2-5.8L5 10l5.8-1.2L12 3Zm6.5 12 .6 2.4 2.4.6-2.4.6-.6-2.4-2.4-.6 2.4-.6.6-2.4Z",
-                    ZED_MUTED,
-                ))
+                .opacity(if menu_open { 1.0 } else { 0.0 })
+                .group_hover(group_name, |style| style.opacity(1.0))
+                .child(icon("M5 12h.01M12 12h.01M19 12h.01", ZED_MUTED))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
-                        this.set_style_editor_layer(
-                            (this.style_editor_layer() != Some(layer_id)).then_some(layer_id),
+                        this.set_layer_menu_layer(
+                            (this.layer_menu_layer() != Some(layer_id)).then_some(layer_id),
                         );
-                        this.set_style_color_target(StyleColorTarget::Fill);
                         cx.stop_propagation();
                         cx.notify();
                     }),
                 ),
-        )
-        .child(
-            div()
-                .w(px(22.0))
-                .h(px(24.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon("m6 6 12 12M18 6 6 18", ZED_MUTED))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.project_mut().remove_layer(layer_id);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                ),
-        )
+        );
+    if menu_open {
+        let menu = div()
+            .w(px(150.0))
+            .p_1()
+            .gap_1()
+            .flex()
+            .flex_col()
+            .bg(rgb(ZED_SURFACE))
+            .border_1()
+            .border_color(rgb(ZED_BORDER))
+            .child(
+                div()
+                    .h(px(26.0))
+                    .w_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .hover(|style| style.bg(rgb(ZED_PANEL)))
+                    .child(icon(
+                        "m12 3 1.2 5.8L19 10l-5.8 1.2L12 17l-1.2-5.8L5 10l5.8-1.2L12 3Zm6.5 12 .6 2.4 2.4.6-2.4.6-.6-2.4-2.4-.6 2.4-.6.6-2.4Z",
+                        ZED_MUTED,
+                    ))
+                    .child("Appearance")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_style_editor_layer(Some(layer_id));
+                            this.set_style_color_target(StyleColorTarget::Fill);
+                            this.set_layer_menu_layer(None);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(26.0))
+                    .w_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .hover(|style| style.bg(rgb(ZED_PANEL)))
+                    .child(icon("m6 6 12 12M18 6 6 18", ZED_MUTED))
+                    .child("Remove layer")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.project_mut().remove_layer(layer_id);
+                            this.set_layer_menu_layer(None);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        return row.child(deferred(menu.absolute().top(px(28.0)).right(px(8.0))));
+    }
+    row
 }
 
 fn color_chip<T: LayerUi>(

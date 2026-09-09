@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, DevicePixels, MouseButton, Render, Window, WindowBounds,
-    WindowDecorations, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
+    App, Bounds, Context, CursorStyle, DevicePixels, MouseButton, Render, ResizeEdge, Window,
+    WindowBounds, WindowDecorations, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
 };
 use gpui_platform::application;
 use gpui_wgpu::{WgpuContextHandle, WgpuRenderTarget};
@@ -57,6 +57,20 @@ fn format_color(color: Color) -> String {
         (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
         (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
         (color.b.clamp(0.0, 1.0) * 255.0).round() as u8
+    )
+}
+
+fn resize_handle<T: 'static>(
+    edge: ResizeEdge,
+    cursor: CursorStyle,
+    cx: &mut Context<T>,
+) -> gpui::Div {
+    div().cursor(cursor).on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |_, _, window, cx| {
+            window.start_window_resize(edge);
+            cx.stop_propagation();
+        }),
     )
 }
 
@@ -133,8 +147,10 @@ pub struct RgisNativeApp {
     cursor_lonlat: Option<(f64, f64)>,
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
     dragging: bool,
+    sidebar_visible: bool,
     layers_expanded: bool,
     style_editor_layer: Option<LayerId>,
+    layer_menu_layer: Option<LayerId>,
     style_color_target: StyleColorTarget,
 }
 
@@ -200,8 +216,10 @@ impl RgisNativeApp {
             cursor_lonlat: None,
             bbox_zoom_start: None,
             dragging: false,
+            sidebar_visible: true,
             layers_expanded: true,
             style_editor_layer: None,
+            layer_menu_layer: None,
             style_color_target: StyleColorTarget::Fill,
         }
     }
@@ -225,6 +243,14 @@ impl RgisNativeApp {
                     .collect()
             }));
         window.request_animation_frame();
+    }
+
+    fn sidebar_offset(&self) -> f32 {
+        if self.sidebar_visible {
+            SIDEBAR_WIDTH
+        } else {
+            0.0
+        }
     }
 
     fn poll_pending_loads(&mut self, window: &Window) {
@@ -361,12 +387,16 @@ impl RgisNativeApp {
         }
         let vector_tile =
             rgis_render::render_vector_layers(&self.project.layers, &self.project.viewport);
-        let mut tiles = raster::collect_draws(
-            &self.style,
-            &self.project.viewport,
-            &self.raster_fetchers,
-            &mut self.raster_tile_cache,
-        );
+        let mut tiles = if self.project.show_tiles {
+            raster::collect_draws(
+                &self.style,
+                &self.project.viewport,
+                &self.raster_fetchers,
+                &mut self.raster_tile_cache,
+            )
+        } else {
+            Vec::new()
+        };
         let raster_tile_count = tiles.len() as u32;
         if let Some(rgba) = vector_tile {
             tiles.push(rgis_render::TileDraw {
@@ -420,7 +450,7 @@ impl RgisNativeApp {
 
         let scale_factor = window.scale_factor();
         let viewport_size = window.viewport_size();
-        let width = (viewport_size.width - px(SIDEBAR_WIDTH)).max(px(1.0));
+        let width = (viewport_size.width - px(self.sidebar_offset())).max(px(1.0));
         let has_client_titlebar = matches!(
             window.window_decorations(),
             gpui::Decorations::Client { .. }
@@ -1006,7 +1036,7 @@ impl RgisNativeApp {
         div()
             .h(px(TITLEBAR_HEIGHT))
             .w_full()
-            .px_2()
+            .px_3()
             .flex()
             .items_center()
             .gap_2()
@@ -1017,73 +1047,22 @@ impl RgisNativeApp {
             .text_color(rgb(ZED_TEXT))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, window, cx| {
-                    window.start_window_move();
+                cx.listener(|_, event: &gpui::MouseDownEvent, window, cx| {
+                    if event.click_count == 2 {
+                        window.zoom_window();
+                    } else {
+                        window.start_window_move();
+                    }
                     cx.stop_propagation();
                 }),
             )
+            .child(icon(
+                "M12 2 20 6.5v9L12 20l-8-4.5v-9L12 2Zm0 5v8m-4-6 4 2 4-2",
+                ZED_ACCENT,
+            ))
             .child(
                 div()
-                    .w(px(24.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(
-                        "M12 2 20 6.5v9L12 20l-8-4.5v-9L12 2Zm0 5v8m-4-6 4 2 4-2",
-                        ZED_ACCENT,
-                    )),
-            )
-            .child(div().w(px(180.0)).text_sm().child("rgis"))
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(24.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgb(ZED_PANEL))
-                    .text_xs()
-                    .text_color(rgb(ZED_MUTED))
-                    .child("Map"),
-            )
-            .child(
-                div()
-                    .w(px(32.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|style| style.bg(rgb(ZED_SURFACE)).text_color(rgb(ZED_TEXT)))
-                    .child(icon("M5 12h14", ZED_MUTED))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, window, cx| {
-                            window.minimize_window();
-                            cx.stop_propagation();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(32.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|style| style.bg(rgb(ZED_SURFACE)).text_color(rgb(ZED_TEXT)))
-                    .child(icon("M5 5h14v14H5z", ZED_MUTED))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, window, cx| {
-                            window.zoom_window();
-                            cx.stop_propagation();
-                        }),
-                    ),
-            )
-            .child(
-                div()
+                    .ml_auto()
                     .w(px(32.0))
                     .h(px(28.0))
                     .flex()
@@ -1125,6 +1104,14 @@ impl LayerUi for RgisNativeApp {
 
     fn set_style_editor_layer(&mut self, layer: Option<LayerId>) {
         self.style_editor_layer = layer;
+    }
+
+    fn layer_menu_layer(&self) -> Option<LayerId> {
+        self.layer_menu_layer
+    }
+
+    fn set_layer_menu_layer(&mut self, layer: Option<LayerId>) {
+        self.layer_menu_layer = layer;
     }
 
     fn style_color_target(&self) -> StyleColorTarget {
@@ -1178,7 +1165,7 @@ impl Render for RgisNativeApp {
                             };
                             let to_map = |point: gpui::Point<gpui::Pixels>| {
                                 [
-                                    ((f32::from(point.x) - SIDEBAR_WIDTH) * scale)
+                                    ((f32::from(point.x) - this.sidebar_offset()) * scale)
                                         .clamp(0.0, this.project.viewport.width_px as f32),
                                     ((f32::from(point.y) - titlebar) * scale)
                                         .clamp(0.0, this.project.viewport.height_px as f32),
@@ -1209,7 +1196,7 @@ impl Render for RgisNativeApp {
                         0.0
                     };
                     let cursor = [
-                        ((f32::from(event.position.x) - SIDEBAR_WIDTH) * scale)
+                        ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
                             .clamp(0.0, this.project.viewport.width_px as f32),
                         ((f32::from(event.position.y) - titlebar) * scale)
                             .clamp(0.0, this.project.viewport.height_px as f32),
@@ -1233,7 +1220,7 @@ impl Render for RgisNativeApp {
                     let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
                     let scale = window.scale_factor();
                     let cursor = [
-                        ((f32::from(event.position.x) - SIDEBAR_WIDTH) * scale)
+                        ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
                             .clamp(0.0, this.project.viewport.width_px as f32),
                         ((f32::from(event.position.y)
                             - if matches!(
@@ -1262,40 +1249,179 @@ impl Render for RgisNativeApp {
             .flex()
             .flex_col()
             .bg(rgb(ZED_CANVAS))
-            .border_1()
-            .rounded_lg()
-            .border_color(rgb(0x484848))
             .overflow_hidden();
+        if !window.is_maximized() {
+            root = root.border_1().rounded_lg().border_color(rgb(0x484848));
+        }
         if has_client_titlebar {
             root = root.child(self.client_titlebar(cx));
         }
-        root = root
-            .child(
+        let map_content = div()
+            .flex_1()
+            .flex()
+            .when(self.sidebar_visible, |content| {
+                content.child(ui::sidebar(self, cx))
+            })
+            .child(map);
+        root = root.child(map_content).child(
+            div()
+                .h(px(STATUS_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .border_t_1()
+                .border_color(rgb(ZED_BORDER))
+                .bg(rgb(ZED_TITLEBAR))
+                .text_xs()
+                .text_color(rgb(ZED_MUTED))
+                .child(
+                    div()
+                        .h_full()
+                        .w(px(if self.sidebar_visible {
+                            SIDEBAR_WIDTH
+                        } else {
+                            32.0
+                        }))
+                        .flex()
+                        .items_center()
+                        .justify_start()
+                        .px_2()
+                        .border_r_1()
+                        .border_color(rgb(ZED_BORDER))
+                        .hover(|style| style.bg(rgb(ZED_SURFACE)))
+                        .child(icon(
+                            if self.sidebar_visible {
+                                "M4 5h16v14H4zM9 5v14"
+                            } else {
+                                "M4 5h16v14H4zM7 5v14"
+                            },
+                            ZED_MUTED,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.sidebar_visible = !this.sidebar_visible;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .h_full()
+                        .flex_1()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .child(self.status.clone()),
+                )
+                .child(
+                    div()
+                        .h_full()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .border_l_1()
+                        .border_color(rgb(ZED_BORDER))
+                        .child(format!("zoom {:.2}", self.project.viewport.zoom)),
+                )
+                .child(
+                    div()
+                        .h_full()
+                        .min_w(px(150.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .border_l_1()
+                        .border_color(rgb(ZED_BORDER))
+                        .child(
+                            self.cursor_lonlat
+                                .map(|(lon, lat)| format!("{lon:.5}, {lat:.5}"))
+                                .unwrap_or_else(|| "-".to_string()),
+                        ),
+                ),
+        );
+        if !window.is_maximized() {
+            const RESIZE_ZONE: f32 = 8.0;
+            root = root.child(
                 div()
-                    .flex_1()
-                    .flex()
-                    .child(ui::sidebar(self, cx))
-                    .child(map),
-            )
-            .child(
-                div()
-                    .h(px(STATUS_HEIGHT))
-                    .px_3()
-                    .border_t_1()
-                    .border_color(rgb(ZED_BORDER))
-                    .bg(rgb(ZED_TITLEBAR))
-                    .items_center()
-                    .text_xs()
-                    .text_color(rgb(ZED_MUTED))
-                    .child(format!(
-                        "{}  ·  zoom {:.2}{}",
-                        self.status,
-                        self.project.viewport.zoom,
-                        self.cursor_lonlat
-                            .map(|(lon, lat)| format!("  ·  {lon:.5}, {lat:.5}"))
-                            .unwrap_or_default()
-                    )),
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .child(
+                        resize_handle(ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight, cx)
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(RESIZE_ZONE))
+                            .h(px(RESIZE_ZONE)),
+                    )
+                    .child(
+                        resize_handle(ResizeEdge::Top, CursorStyle::ResizeUpDown, cx)
+                            .absolute()
+                            .top_0()
+                            .left(px(RESIZE_ZONE))
+                            .right(px(RESIZE_ZONE))
+                            .h(px(RESIZE_ZONE)),
+                    )
+                    .child(
+                        resize_handle(ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft, cx)
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(RESIZE_ZONE))
+                            .h(px(RESIZE_ZONE)),
+                    )
+                    .child(
+                        resize_handle(ResizeEdge::Left, CursorStyle::ResizeLeftRight, cx)
+                            .absolute()
+                            .top(px(RESIZE_ZONE))
+                            .bottom(px(RESIZE_ZONE))
+                            .left_0()
+                            .w(px(RESIZE_ZONE)),
+                    )
+                    .child(
+                        resize_handle(ResizeEdge::Right, CursorStyle::ResizeLeftRight, cx)
+                            .absolute()
+                            .top(px(RESIZE_ZONE))
+                            .bottom(px(RESIZE_ZONE))
+                            .right_0()
+                            .w(px(RESIZE_ZONE)),
+                    )
+                    .child(
+                        resize_handle(
+                            ResizeEdge::BottomLeft,
+                            CursorStyle::ResizeUpRightDownLeft,
+                            cx,
+                        )
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(RESIZE_ZONE))
+                        .h(px(RESIZE_ZONE)),
+                    )
+                    .child(
+                        resize_handle(ResizeEdge::Bottom, CursorStyle::ResizeUpDown, cx)
+                            .absolute()
+                            .bottom_0()
+                            .left(px(RESIZE_ZONE))
+                            .right(px(RESIZE_ZONE))
+                            .h(px(RESIZE_ZONE)),
+                    )
+                    .child(
+                        resize_handle(
+                            ResizeEdge::BottomRight,
+                            CursorStyle::ResizeUpLeftDownRight,
+                            cx,
+                        )
+                        .absolute()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(RESIZE_ZONE))
+                        .h(px(RESIZE_ZONE)),
+                    ),
             );
+        }
         root
     }
 }
@@ -1306,10 +1432,8 @@ pub fn run(startup_paths: Vec<std::path::PathBuf>) {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("rgis".into()),
-                    ..Default::default()
-                }),
+                titlebar: Some(gpui::TitlebarOptions::default()),
+                is_resizable: true,
                 // Draw the titlebar in the GPUI view. Wayland compositors are
                 // not required to provide the server-decoration protocol.
                 window_decorations: Some(WindowDecorations::Client),
