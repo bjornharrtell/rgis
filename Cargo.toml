@@ -55,11 +55,13 @@ directories = "6"
 
 # UI / rendering
 wgpu        = "=29.0.4"
-gpui        = { git = "https://github.com/gpui-ce/gpui-ce", rev = "9e72350b09856b8c80040672842d9e91a7ed987e", package = "gpui-ce" }
-gpui-platform = { git = "https://github.com/gpui-ce/gpui-ce", rev = "9e72350b09856b8c80040672842d9e91a7ed987e", package = "gpui_ce_platform", features = ["wayland", "x11"] }
-gpui-web    = { git = "https://github.com/gpui-ce/gpui-ce", rev = "9e72350b09856b8c80040672842d9e91a7ed987e", package = "gpui_ce_web", default-features = false }
-gpui-wgpu   = { git = "https://github.com/gpui-ce/gpui-ce", rev = "9e72350b09856b8c80040672842d9e91a7ed987e", package = "gpui_ce_wgpu" }
-gpui-elements = { git = "https://github.com/gpui-ce/gpui-ce", rev = "9e72350b09856b8c80040672842d9e91a7ed987e", package = "gpui_ce_elements" }
+# The map renderer relies on the custom texture-surface API. Do not mix this
+# fork with gpui-kit/gpui-pre crates, which use a different GPUI type graph.
+gpui        = { git = "https://github.com/bjornharrtell/gpui-ce.git", rev = "8e3caf6d0ca3d2208fe22ef21e013b7567021680", package = "gpui-ce", features = ["custom-gpu"] }
+gpui-platform = { git = "https://github.com/bjornharrtell/gpui-ce.git", rev = "8e3caf6d0ca3d2208fe22ef21e013b7567021680", package = "gpui_ce_platform", features = ["wayland", "x11"] }
+gpui-web    = { git = "https://github.com/bjornharrtell/gpui-ce.git", rev = "8e3caf6d0ca3d2208fe22ef21e013b7567021680", package = "gpui_ce_web", default-features = false }
+gpui-wgpu   = { git = "https://github.com/bjornharrtell/gpui-ce.git", rev = "8e3caf6d0ca3d2208fe22ef21e013b7567021680", package = "gpui_ce_wgpu", features = ["custom-gpu"] }
+gpui-elements = { git = "https://github.com/bjornharrtell/gpui-ce.git", rev = "8e3caf6d0ca3d2208fe22ef21e013b7567021680", package = "gpui_ce_elements" }
 rearcut     = "1.0.0"
 tiny-skia   = { version = "0.11", default-features = false, features = ["std"] }
 bytemuck    = { version = "1.25.2", features = ["derive"] }
