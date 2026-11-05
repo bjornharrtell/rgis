@@ -8,6 +8,7 @@ members = [
     "crates/rgis-style",
     "crates/rgis-tiles",
     "crates/rgis-web",
+    "crates/rgis-kit-spike",
 ]
 # rgis-web only compiles for wasm32 (built via `trunk`, not `cargo`), so it's
 # excluded here: plain `cargo run`/`build`/`test` (no `-p`/`--workspace`) target
