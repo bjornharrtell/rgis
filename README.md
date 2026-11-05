@@ -1,6 +1,6 @@
 # rgis
 
-A Rust GIS desktop application built on [egui](https://crates.io/crates/egui)/[eframe](https://crates.io/crates/eframe) for UI and [wgpu](https://crates.io/crates/wgpu) (with [earcut](https://crates.io/crates/earcut) tessellation) for map rendering. The same app runs natively and compiles to `wasm32-unknown-unknown` for the browser.
+A Rust GIS desktop application built on [GPUI](https://github.com/gpui-ce/gpui-ce) (the community edition of Zed's UI framework) for UI and [wgpu](https://crates.io/crates/wgpu) (with earcut tessellation) for map rendering. The same app runs natively and compiles to `wasm32-unknown-unknown` for the browser.
 
 ## Features
 
@@ -9,6 +9,7 @@ A Rust GIS desktop application built on [egui](https://crates.io/crates/egui)/[e
 - Ships with a bundled demo dataset ([crates/rgis-app/assets/sample.geojson](crates/rgis-app/assets/sample.geojson)), loaded when the native app is started with no file arguments and always in the browser build
 - Render vector layers as tessellated triangle meshes uploaded to the GPU via `wgpu`
 - Show OpenStreetMap raster tiles behind vector data, with an on-disk cache on native
+- Render an [OpenFreeMap](https://openfreemap.org/) vector basemap from MapLibre/Mapbox-style documents (the `liberty` style by default), including labels, glyphs and sprites; styles are parsed and evaluated at runtime by `rgis-style`
 - Layer panel to toggle visibility and remove layers
 - Data source panel for PostgreSQL and OGC WMS connection definitions
 - Open and save concise YAML project files with layer styles, data sources, and map position
@@ -26,7 +27,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### 2. Install system dependencies
 
-`eframe`/`winit` on Linux needs Wayland/Vulkan/font/text/input libraries. This workspace also uses image loading and HTTP tile fetching.
+GPUI (Wayland and X11 backends) on Linux needs Wayland/Vulkan/font/text/input libraries. The native desktop build currently targets Linux and FreeBSD. This workspace also uses image loading and HTTP tile fetching.
 
 ```sh
 sudo apt update
@@ -64,7 +65,7 @@ cargo run
 ## Building for the browser (wasm)
 
 [crates/rgis-web](crates/rgis-web) boots the same `rgis_app::RgisApp` (used by
-the native binary) into an HTML5 `<canvas>` via `eframe::WebRunner`, using
+the native binary) into an HTML5 `<canvas>` via GPUI's web backend, using
 whichever `wgpu` backend (WebGPU or WebGL2) the browser supports. It always
 loads the bundled demo dataset so the map has something to show without using
 the file picker.
@@ -113,22 +114,25 @@ map:
 
 | Crate | Purpose |
 | --- | --- |
-| [crates/rgis-app](crates/rgis-app) | Shared `eframe::App` (UI, layer panel, status bar, pan/zoom) and the `rgis` native binary |
+| [crates/rgis-app](crates/rgis-app) | Shared GPUI app (UI, layer panel, status bar, pan/zoom, labels) and the `rgis` native binary |
 | [crates/rgis-core](crates/rgis-core) | Core GIS types, styling, projection helpers, project/viewport state |
 | [crates/rgis-io](crates/rgis-io) | GeoJSON / Shapefile / FlatGeobuf readers, CRS detection, and reprojection to Web Mercator |
-| [crates/rgis-render](crates/rgis-render) | Tessellates layer geometry into `wgpu` vertex/index buffers and draws them via an `egui-wgpu` paint callback |
-| [crates/rgis-tiles](crates/rgis-tiles) | Raster tile fetching and caching |
-| [crates/rgis-web](crates/rgis-web) | wasm/browser entry point that boots `rgis-app` via `eframe::WebRunner` |
+| [crates/rgis-style](crates/rgis-style) | Parser and evaluator for the MapLibre/Mapbox style spec (expressions, filters, style sheets) |
+| [crates/rgis-render](crates/rgis-render) | Tessellates layer and basemap geometry into `wgpu` vertex/index buffers, draws them into a GPUI custom GPU surface, and has a `tiny-skia` CPU vector path |
+| [crates/rgis-tiles](crates/rgis-tiles) | Raster and vector tile fetching and caching, glyphs and sprites |
+| [crates/rgis-web](crates/rgis-web) | wasm/browser entry point that boots `rgis-app` via GPUI's web backend |
+
+[tools/parity](tools/parity) generates reference screenshots from maplibre-gl-js for the visual-parity test in `rgis-render`.
 
 ## Architecture notes
 
-- `rgis-core`, `rgis-io`, and `rgis-tiles` stay backend-agnostic.
-- `rgis-render` tessellates `rgis-core::Layer` geometry (via `earcut` for fills, with hand-extruded stroke/point quads) into a `SceneMesh`, then draws it each frame from an `egui-wgpu` `MapCallback` paint callback.
-- `rgis-app` owns the `eframe::App` implementation: the layer panel, status bar, tile image cache, and pan/zoom interactions, shared verbatim between the native binary and the wasm build.
+- `rgis-core`, `rgis-io`, `rgis-style` and `rgis-tiles` stay backend-agnostic.
+- `rgis-render` tessellates `rgis-core::Layer` geometry (via `rearcut` for fills, with hand-extruded stroke/point quads) into a `SceneMesh`, and vector basemap tiles into per-tile meshes styled by `rgis-style`, then draws them each frame through a `MapCallback` into GPUI's custom texture-surface API.
+- `rgis-app` owns the GPUI application: the layer panel, status bar, tile caches, label placement, and pan/zoom interactions, shared between the native binary and the wasm build.
 
 ## Development
 
-CI runs `cargo fmt --all -- --check`, so run `cargo fmt --all` before
+CI runs `cargo fmt --all -- --check`, `cargo clippy` (warnings are errors) and `cargo test`, so run `cargo fmt --all` before
 committing. To catch this locally, enable the repo's git hook once per clone:
 
 ```sh
