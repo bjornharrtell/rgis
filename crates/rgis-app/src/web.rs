@@ -10,13 +10,11 @@ use std::{
 use crate::labels;
 use crate::raster;
 use crate::ui::{self, LayerUi, LayerUiState, StyleColorTarget};
+use gpui::web::WebPlatform;
 use gpui::{
-    App, Bounds, Context, DevicePixels, MouseButton, Render, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size,
+    App, Bounds, Context, MouseButton, Render, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, rgb, size,
 };
-use gpui_elements::editable_text::actions::{DEFAULT_INPUT_CONTEXT, default_bindings};
-use gpui_web::WebPlatform;
-use gpui_wgpu::{WgpuContextHandle, WgpuRenderTarget};
 use rgis_core::{
     Bounds as GeoBounds, Color, Layer, LayerId, Project, Viewport, lonlat_to_mercator,
     mercator_to_lonlat,
@@ -39,10 +37,124 @@ const ZED_TEXT: u32 = 0xd4d4d4;
 const ZED_MUTED: u32 = 0x929292;
 const ZED_ACCENT: u32 = 0x8ab4f8;
 
+// WebGL2 has no BGRA render targets, so frames are rendered as RGBA and
+// swizzled on the CPU while being copied into GPUI's BGRA image.
+const MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Our own wgpu device. gpui-pre has no external-texture surface, so the map
+/// is rendered offscreen here and shown as an image.
+struct OffscreenGpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    _surface: Option<wgpu::Surface<'static>>,
+}
+
+#[derive(Debug)]
+struct WebDisplaySource;
+
+impl raw_window_handle::HasDisplayHandle for WebDisplaySource {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(raw_window_handle::DisplayHandle::web())
+    }
+}
+
+enum GpuState {
+    Idle,
+    Starting,
+    Ready(OffscreenGpu),
+    Failed(String),
+}
+
+fn start_gpu(slot: Rc<std::cell::RefCell<GpuState>>) {
+    *slot.borrow_mut() = GpuState::Starting;
+    wasm_bindgen_futures::spawn_local(async move {
+        let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(WebDisplaySource))
+        })
+        .await;
+        // WebGL needs a surface to find an adapter. A detached canvas that is
+        // never presented to is enough; frames are read back instead.
+        let canvas = match web_sys::window() {
+            None => Err("no window".to_string()),
+            Some(window) => match window.document() {
+                None => Err("no document".to_string()),
+                Some(document) => match document.create_element("canvas") {
+                    Err(error) => Err(format!("create_element: {error:?}")),
+                    Ok(element) => element
+                        .dyn_into::<web_sys::HtmlCanvasElement>()
+                        .map_err(|_| "element is not a canvas".to_string()),
+                },
+            },
+        };
+        let mut surface_error = String::new();
+        let surface = match canvas {
+            Ok(canvas) => match instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas)) {
+                Ok(surface) => Some(surface),
+                Err(error) => {
+                    surface_error = format!("surface: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                surface_error = error;
+                None
+            }
+        };
+        let adapter = match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: surface.as_ref(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                *slot.borrow_mut() = GpuState::Failed({
+                    let text = error.to_string();
+                    let useful: Vec<&str> = text
+                        .split(';')
+                        .filter(|part| !part.contains("not compiled in"))
+                        .collect();
+                    format!("GPU adapter failed ({surface_error}): {}", useful.join(";"))
+                });
+                return;
+            }
+        };
+        let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+        match adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok((device, queue)) => {
+                *slot.borrow_mut() = GpuState::Ready(OffscreenGpu {
+                    device,
+                    queue,
+                    _surface: surface,
+                });
+            }
+            Err(error) => {
+                *slot.borrow_mut() = GpuState::Failed(format!("no GPU device: {error}"));
+            }
+        }
+    });
+}
+
 struct MapTarget {
-    target: WgpuRenderTarget,
+    color: wgpu::Texture,
+    color_view: wgpu::TextureView,
     msaa_view: Option<wgpu::TextureView>,
+    readback: wgpu::Buffer,
+    padded_row: u32,
     size: (u32, u32),
+    image: Option<Arc<gpui::RenderImage>>,
+    /// Set by the `map_async` callback once the readback buffer is mapped.
+    in_flight: Option<Rc<std::cell::Cell<bool>>>,
 }
 
 impl LayerUi for RgisWebApp {
@@ -94,38 +206,126 @@ impl LayerUi for RgisWebApp {
 }
 
 impl MapTarget {
-    fn new(context: &WgpuContextHandle, dimensions: (u32, u32)) -> Self {
-        let target = WgpuRenderTarget::new(
-            context,
-            size(
-                DevicePixels(dimensions.0 as i32),
-                DevicePixels(dimensions.1 as i32),
-            ),
-        );
+    fn new(device: &wgpu::Device, dimensions: (u32, u32)) -> Self {
+        let (w, h) = dimensions;
+        let extent = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rgis-map-color"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: MAP_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&Default::default());
         let msaa_view = (rgis_render::MSAA_SAMPLES > 1).then(|| {
-            context
-                .device()
+            device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("rgis-map-msaa"),
-                    size: wgpu::Extent3d {
-                        width: dimensions.0,
-                        height: dimensions.1,
-                        depth_or_array_layers: 1,
-                    },
+                    size: extent,
                     mip_level_count: 1,
                     sample_count: rgis_render::MSAA_SAMPLES,
                     dimension: wgpu::TextureDimension::D2,
-                    format: target.format(),
+                    format: MAP_FORMAT,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 })
                 .create_view(&Default::default())
         });
+        let padded_row = (w * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rgis-map-readback"),
+            size: padded_row as u64 * h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         Self {
-            target,
+            color,
+            color_view,
             msaa_view,
+            readback,
+            padded_row,
             size: dimensions,
+            image: None,
+            in_flight: None,
         }
+    }
+
+    /// Collects a finished readback, if any. Returns true while one is still
+    /// pending (the buffer can not be reused until then).
+    fn poll_readback(&mut self, device: &wgpu::Device) -> bool {
+        let Some(done) = self.in_flight.clone() else {
+            return false;
+        };
+        let _ = device.poll(wgpu::PollType::Poll);
+        if !done.get() {
+            return true;
+        }
+        let (w, h) = self.size;
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        {
+            let data = self
+                .readback
+                .slice(..)
+                .get_mapped_range()
+                .expect("mapped range");
+            for row in 0..h as usize {
+                let start = row * self.padded_row as usize;
+                pixels.extend_from_slice(&data[start..start + (w * 4) as usize]);
+            }
+        }
+        self.readback.unmap();
+        self.in_flight = None;
+        pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .for_each(|px| px.swap(0, 2));
+        if let Some(image) = image::RgbaImage::from_raw(w, h, pixels) {
+            self.image = Some(Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+                image::Frame::new(image)
+            ])));
+        }
+        false
+    }
+
+    /// Copies the rendered frame into the readback buffer and starts mapping it.
+    fn start_readback(&mut self, queue: &wgpu::Queue, mut encoder: wgpu::CommandEncoder) {
+        let (w, h) = self.size;
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let done = Rc::new(std::cell::Cell::new(false));
+        let flag = done.clone();
+        self.readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| flag.set(result.is_ok()));
+        self.in_flight = Some(done);
     }
 }
 
@@ -201,8 +401,10 @@ pub struct RgisWebApp {
     gpu_basemap_meshes: HashMap<TileCoord, Arc<TileMesh>>,
     pending_tiles: HashSet<TileCoord>,
     vector_render_cache: rgis_render::VectorRenderCache,
+    gpu: Rc<std::cell::RefCell<GpuState>>,
     resources: Option<MapRenderResources>,
     target: Option<MapTarget>,
+    last_render_key: Option<[u64; 8]>,
     dragging: bool,
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
     last_map_size: Option<(u32, u32)>,
@@ -244,8 +446,10 @@ impl RgisWebApp {
             gpu_basemap_meshes: HashMap::new(),
             pending_tiles: HashSet::new(),
             vector_render_cache: rgis_render::VectorRenderCache::default(),
+            gpu: Rc::new(std::cell::RefCell::new(GpuState::Idle)),
             resources: None,
             target: None,
+            last_render_key: None,
             dragging: false,
             last_cursor: None,
             last_map_size: None,
@@ -826,43 +1030,70 @@ impl RgisWebApp {
     }
 
     fn render_map(&mut self, window: &mut Window, width: f32, height: f32) {
-        let Some(context) = WgpuContextHandle::from_window(window) else {
-            self.status = "GPUI GPU context unavailable".to_string();
-            return;
-        };
-        if context.device_lost() {
-            self.resources = None;
-            self.target = None;
-            self.status = "Recovering GPU device".to_string();
-            return;
+        if matches!(*self.gpu.borrow(), GpuState::Idle) {
+            start_gpu(self.gpu.clone());
         }
-        let device = context.device();
-        let queue = context.queue();
+        let gpu_slot = self.gpu.clone();
+        let gpu_state = gpu_slot.borrow();
+        let gpu = match &*gpu_state {
+            GpuState::Ready(gpu) => gpu,
+            GpuState::Failed(message) => {
+                self.status = message.clone();
+                return;
+            }
+            _ => {
+                // Device request is still in flight; try again next frame.
+                window.on_next_frame(|_, cx| cx.refresh_windows());
+                return;
+            }
+        };
+        let (device, queue) = (&gpu.device, &gpu.queue);
         let size = (width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
         if self.target.as_ref().map(|target| target.size) != Some(size) {
-            self.target = Some(MapTarget::new(&context, size));
-            self.resources = Some(MapRenderResources::new(device, context.texture_format()));
+            self.target = Some(MapTarget::new(device, size));
+            self.last_render_key = None;
+        }
+        if self.resources.is_none() {
+            self.resources = Some(MapRenderResources::new(device, MAP_FORMAT));
+        }
+        let target = self.target.as_mut().expect("map target created");
+        if target.poll_readback(device) {
+            window.on_next_frame(|_, cx| cx.refresh_windows());
+            return;
         }
         let callback = self.map_callback(width, height);
-        let target = self.target.as_ref().expect("map target created");
+        // Only redraw when something that affects the picture changed; the
+        // readback is async, so an unconditional redraw would spin forever.
+        let viewport = &self.project.viewport;
+        let key = [
+            viewport.center.x.to_bits(),
+            viewport.center.y.to_bits(),
+            viewport.zoom.to_bits(),
+            callback.basemap_tiles.len() as u64,
+            callback.tiles.len() as u64,
+            callback.labels.len() as u64,
+            callback.mesh.indices.len() as u64,
+            callback.mesh.vertices.len() as u64,
+        ];
+        if self.last_render_key == Some(key) {
+            return;
+        }
+        self.last_render_key = Some(key);
+        let target = self.target.as_mut().expect("map target created");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rgis-map-encoder"),
         });
         let resources = self.resources.take().expect("map resources created");
-        self.resources = Some(
-            resources.render_into(
-                device,
-                queue,
-                &mut encoder,
-                target
-                    .msaa_view
-                    .as_ref()
-                    .unwrap_or_else(|| target.target.view()),
-                target.msaa_view.as_ref().map(|_| target.target.view()),
-                &callback,
-            ),
-        );
-        queue.submit([encoder.finish()]);
+        self.resources = Some(resources.render_into(
+            device,
+            queue,
+            &mut encoder,
+            target.msaa_view.as_ref().unwrap_or(&target.color_view),
+            target.msaa_view.as_ref().map(|_| &target.color_view),
+            &callback,
+        ));
+        target.start_readback(queue, encoder);
+        window.on_next_frame(|_, cx| cx.refresh_windows());
     }
 
     fn sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -993,10 +1224,25 @@ impl Render for RgisWebApp {
             self.project.viewport.width_px as f32,
             self.project.viewport.height_px as f32,
         );
-        let map_surface = self.target.as_ref().map(|target| target.target.surface());
+        let map_image = self.target.as_ref().and_then(|target| target.image.clone());
         let mut map_content = div().size_full().relative();
-        if let Some(surface) = map_surface {
-            map_content = map_content.child(surface.size_full());
+        if let Some(image) = map_image {
+            map_content = map_content.child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let _ = window.paint_image(
+                            bounds,
+                            bounds,
+                            gpui::Corners::default(),
+                            image.clone(),
+                            0,
+                            false,
+                        );
+                    },
+                )
+                .size_full(),
+            );
         }
         let map = div()
             .flex_1()
@@ -1098,24 +1344,26 @@ impl Render for RgisWebApp {
 }
 
 pub fn run() {
-    gpui_web::init_logging();
+    gpui::web::init_logging();
     let platform = Rc::new(WebPlatform::new(false));
     let http_client = std::sync::Arc::new(platform.fetch_http_client());
     let application = gpui::Application::with_platform(platform)
         .with_http_client(http_client)
         .run_embedded(|cx: &mut App| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            gpui::init(cx);
+            gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
             cx.text_system()
                 .add_fonts(vec![Cow::Borrowed(include_bytes!(
                     "../assets/fonts/IBMPlexSans-Regular.ttf"
                 ))])
                 .expect("failed to load embedded browser font");
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
-            cx.open_window(
+            gpui::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
+                cx,
                 |_, cx| cx.new(RgisWebApp::new),
             )
             .expect("failed to open rgis browser window");

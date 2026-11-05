@@ -320,7 +320,7 @@ fn render_offscreen(
         .expect("map_async callback never fired")
         .expect("failed to map readback buffer");
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("mapped range");
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     for row in 0..height {
         let start = (row * padded_bytes_per_row) as usize;

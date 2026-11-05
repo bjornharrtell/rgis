@@ -293,7 +293,7 @@ impl MapTarget {
         }
         let mut pixels = Vec::with_capacity((w * h * 4) as usize);
         {
-            let data = slice.get_mapped_range();
+            let data = slice.get_mapped_range().expect("mapped range");
             for row in 0..h as usize {
                 let start = row * self.padded_row as usize;
                 pixels.extend_from_slice(&data[start..start + (w * 4) as usize]);
