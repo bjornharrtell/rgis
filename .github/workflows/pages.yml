@@ -21,6 +21,9 @@ jobs:
   build:
     name: Build wasm (Trunk)
     runs-on: ubuntu-latest
+    env:
+      # rust-toolchain.toml pins stable; gpui-pre-web needs nightly.
+      RUSTUP_TOOLCHAIN: nightly
 
     steps:
       - uses: actions/checkout@v7
