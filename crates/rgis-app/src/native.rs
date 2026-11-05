@@ -136,6 +136,27 @@ fn format_color(color: Color) -> String {
     )
 }
 
+/// Space between the window edge and our content: gpui-component draws the
+/// client-side frame (shadow margin plus a 1px border) around the root view.
+/// Returns (left, top, right, bottom) in logical pixels.
+fn frame_insets(window: &Window) -> (f32, f32, f32, f32) {
+    match window.window_decorations() {
+        gpui::Decorations::Server => (0.0, 0.0, 0.0, 0.0),
+        gpui::Decorations::Client { tiling } => {
+            let paddings = gpui::component::window_paddings(window);
+            let edge = |padding: gpui::Pixels, tiled: bool| {
+                f32::from(padding) + if tiled { 0.0 } else { 1.0 }
+            };
+            (
+                edge(paddings.left, tiling.left),
+                edge(paddings.top, tiling.top),
+                edge(paddings.right, tiling.right),
+                edge(paddings.bottom, tiling.bottom),
+            )
+        }
+    }
+}
+
 fn resize_handle<T: 'static>(
     edge: ResizeEdge,
     cursor: CursorStyle,
@@ -838,7 +859,9 @@ impl RgisNativeApp {
 
         let scale_factor = window.scale_factor();
         let viewport_size = window.viewport_size();
-        let width = (viewport_size.width - px(self.sidebar_offset())).max(px(1.0));
+        let (frame_l, frame_t, frame_r, frame_b) = frame_insets(window);
+        let width =
+            (viewport_size.width - px(self.sidebar_offset() + frame_l + frame_r)).max(px(1.0));
         let has_client_titlebar = matches!(
             window.window_decorations(),
             gpui::Decorations::Client { .. }
@@ -848,7 +871,9 @@ impl RgisNativeApp {
         } else {
             px(0.0)
         };
-        let height = (viewport_size.height - titlebar_height - px(STATUS_HEIGHT)).max(px(1.0));
+        let height =
+            (viewport_size.height - titlebar_height - px(STATUS_HEIGHT + frame_t + frame_b))
+                .max(px(1.0));
         let size = (
             (f32::from(width) * scale_factor).ceil() as u32,
             (f32::from(height) * scale_factor).ceil() as u32,
@@ -1552,6 +1577,7 @@ impl Render for RgisNativeApp {
                         let end = event.position;
                         if (end.x - start.x).abs() > px(4.0) && (end.y - start.y).abs() > px(4.0) {
                             let scale = window.scale_factor();
+                            let (frame_l, frame_t, _, _) = frame_insets(window);
                             let titlebar = if matches!(
                                 window.window_decorations(),
                                 gpui::Decorations::Client { .. }
@@ -1562,9 +1588,10 @@ impl Render for RgisNativeApp {
                             };
                             let to_map = |point: gpui::Point<gpui::Pixels>| {
                                 [
-                                    ((f32::from(point.x) - this.sidebar_offset()) * scale)
+                                    ((f32::from(point.x) - this.sidebar_offset() - frame_l)
+                                        * scale)
                                         .clamp(0.0, this.project.viewport.width_px as f32),
-                                    ((f32::from(point.y) - titlebar) * scale)
+                                    ((f32::from(point.y) - titlebar - frame_t) * scale)
                                         .clamp(0.0, this.project.viewport.height_px as f32),
                                 ]
                             };
@@ -1584,6 +1611,7 @@ impl Render for RgisNativeApp {
             .on_mouse_move(
                 cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
                     let scale = window.scale_factor();
+                    let (frame_l, frame_t, _, _) = frame_insets(window);
                     let titlebar = if matches!(
                         window.window_decorations(),
                         gpui::Decorations::Client { .. }
@@ -1593,9 +1621,9 @@ impl Render for RgisNativeApp {
                         0.0
                     };
                     let cursor = [
-                        ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
+                        ((f32::from(event.position.x) - this.sidebar_offset() - frame_l) * scale)
                             .clamp(0.0, this.project.viewport.width_px as f32),
-                        ((f32::from(event.position.y) - titlebar) * scale)
+                        ((f32::from(event.position.y) - titlebar - frame_t) * scale)
                             .clamp(0.0, this.project.viewport.height_px as f32),
                     ];
                     let world = this.project.viewport.screen_to_world(cursor);
@@ -1615,10 +1643,12 @@ impl Render for RgisNativeApp {
             .on_scroll(cx.listener(|this, event: &gpui::ScrollEvent, window, cx| {
                 let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
                 let scale = window.scale_factor();
+                let (frame_l, frame_t, _, _) = frame_insets(window);
                 let cursor = [
-                    ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
+                    ((f32::from(event.position.x) - this.sidebar_offset() - frame_l) * scale)
                         .clamp(0.0, this.project.viewport.width_px as f32),
                     ((f32::from(event.position.y)
+                        - frame_t
                         - if matches!(
                             window.window_decorations(),
                             gpui::Decorations::Client { .. }
@@ -1660,9 +1690,6 @@ impl Render for RgisNativeApp {
             .flex_col()
             .bg(rgb(ZED_CANVAS))
             .overflow_hidden();
-        if !window.is_maximized() {
-            root = root.border_1().rounded_lg().border_color(rgb(0x484848));
-        }
         if has_client_titlebar {
             root = root.child(self.client_titlebar(cx));
         }
@@ -1674,88 +1701,6 @@ impl Render for RgisNativeApp {
             })
             .child(map);
         root = root.child(map_content).child(ui::status_bar(self, cx));
-        if !window.is_maximized() {
-            const RESIZE_ZONE: f32 = 8.0;
-            root = root.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .child(
-                        resize_handle(ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight, cx)
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .w(px(RESIZE_ZONE))
-                            .h(px(RESIZE_ZONE)),
-                    )
-                    .child(
-                        resize_handle(ResizeEdge::Top, CursorStyle::ResizeUpDown, cx)
-                            .absolute()
-                            .top_0()
-                            .left(px(RESIZE_ZONE))
-                            .right(px(RESIZE_ZONE))
-                            .h(px(RESIZE_ZONE)),
-                    )
-                    .child(
-                        resize_handle(ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft, cx)
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .w(px(RESIZE_ZONE))
-                            .h(px(RESIZE_ZONE)),
-                    )
-                    .child(
-                        resize_handle(ResizeEdge::Left, CursorStyle::ResizeLeftRight, cx)
-                            .absolute()
-                            .top(px(RESIZE_ZONE))
-                            .bottom(px(RESIZE_ZONE))
-                            .left_0()
-                            .w(px(RESIZE_ZONE)),
-                    )
-                    .child(
-                        resize_handle(ResizeEdge::Right, CursorStyle::ResizeLeftRight, cx)
-                            .absolute()
-                            .top(px(RESIZE_ZONE))
-                            .bottom(px(RESIZE_ZONE))
-                            .right_0()
-                            .w(px(RESIZE_ZONE)),
-                    )
-                    .child(
-                        resize_handle(
-                            ResizeEdge::BottomLeft,
-                            CursorStyle::ResizeUpRightDownLeft,
-                            cx,
-                        )
-                        .absolute()
-                        .bottom_0()
-                        .left_0()
-                        .w(px(RESIZE_ZONE))
-                        .h(px(RESIZE_ZONE)),
-                    )
-                    .child(
-                        resize_handle(ResizeEdge::Bottom, CursorStyle::ResizeUpDown, cx)
-                            .absolute()
-                            .bottom_0()
-                            .left(px(RESIZE_ZONE))
-                            .right(px(RESIZE_ZONE))
-                            .h(px(RESIZE_ZONE)),
-                    )
-                    .child(
-                        resize_handle(
-                            ResizeEdge::BottomRight,
-                            CursorStyle::ResizeUpLeftDownRight,
-                            cx,
-                        )
-                        .absolute()
-                        .bottom_0()
-                        .right_0()
-                        .w(px(RESIZE_ZONE))
-                        .h(px(RESIZE_ZONE)),
-                    ),
-            );
-        }
         root
     }
 }
@@ -1763,6 +1708,7 @@ impl Render for RgisNativeApp {
 pub fn run(startup_paths: Vec<std::path::PathBuf>) {
     gpui::application().run(move |cx: &mut App| {
         gpui::init(cx);
+        gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
         gpui::open_window(
             WindowOptions {
