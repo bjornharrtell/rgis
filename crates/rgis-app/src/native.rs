@@ -7,12 +7,9 @@ use std::sync::{
 use std::{fs, path::PathBuf};
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, DevicePixels, MouseButton, Render, ResizeEdge, Window,
-    WindowBounds, WindowDecorations, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
+    App, Bounds, Context, CursorStyle, MouseButton, Render, ResizeEdge, Window, WindowBounds,
+    WindowDecorations, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
 };
-use gpui_elements::editable_text::actions::{DEFAULT_INPUT_CONTEXT, default_bindings};
-use gpui_platform::application;
-use gpui_wgpu::{WgpuContextHandle, WgpuRenderTarget};
 use lru::LruCache;
 use poll_promise::Promise;
 use rgis_app::labels;
@@ -153,44 +150,140 @@ fn resize_handle<T: 'static>(
     )
 }
 
+const MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+
+/// Our own wgpu device: gpui-pre exposes no way to render into the window's
+/// device or to composite an external texture, so the map is drawn offscreen
+/// here and shown as an image.
+struct OffscreenGpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+impl OffscreenGpu {
+    fn new() -> Option<Self> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .ok()?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        Some(Self { device, queue })
+    }
+}
+
 struct MapTarget {
-    target: WgpuRenderTarget,
+    color: wgpu::Texture,
+    color_view: wgpu::TextureView,
     msaa_view: Option<wgpu::TextureView>,
+    readback: wgpu::Buffer,
+    padded_row: u32,
     size: (u32, u32),
+    image: Option<Arc<gpui::RenderImage>>,
 }
 
 impl MapTarget {
-    fn new(context: &WgpuContextHandle, dimensions: (u32, u32)) -> Self {
-        let target = WgpuRenderTarget::new(
-            context,
-            size(
-                DevicePixels(dimensions.0 as i32),
-                DevicePixels(dimensions.1 as i32),
-            ),
-        );
+    fn new(device: &wgpu::Device, dimensions: (u32, u32)) -> Self {
+        let (w, h) = dimensions;
+        let extent = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rgis-map-color"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: MAP_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&Default::default());
         let msaa_view = (rgis_render::MSAA_SAMPLES > 1).then(|| {
-            context
-                .device()
+            device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("rgis-map-msaa"),
-                    size: wgpu::Extent3d {
-                        width: dimensions.0,
-                        height: dimensions.1,
-                        depth_or_array_layers: 1,
-                    },
+                    size: extent,
                     mip_level_count: 1,
                     sample_count: rgis_render::MSAA_SAMPLES,
                     dimension: wgpu::TextureDimension::D2,
-                    format: target.format(),
+                    format: MAP_FORMAT,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 })
                 .create_view(&Default::default())
         });
+        let padded_row = (w * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rgis-map-readback"),
+            size: padded_row as u64 * h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         Self {
-            target,
+            color,
+            color_view,
             msaa_view,
+            readback,
+            padded_row,
             size: dimensions,
+            image: None,
+        }
+    }
+
+    /// Copies the rendered frame to the CPU and wraps it as a GPUI image.
+    fn read_back(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mut encoder: wgpu::CommandEncoder,
+    ) {
+        let (w, h) = self.size;
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = self.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+            return;
+        }
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        {
+            let data = slice.get_mapped_range();
+            for row in 0..h as usize {
+                let start = row * self.padded_row as usize;
+                pixels.extend_from_slice(&data[start..start + (w * 4) as usize]);
+            }
+        }
+        self.readback.unmap();
+        // Frames are BGRA, matching GPUI's image path.
+        if let Some(image) = image::RgbaImage::from_raw(w, h, pixels) {
+            self.image = Some(Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+                image::Frame::new(image)
+            ])));
         }
     }
 }
@@ -210,6 +303,7 @@ pub struct RgisNativeApp {
     vector_render_cache: rgis_render::VectorRenderCache,
     vector_render_generation: Arc<AtomicU64>,
     pending_vector_render: Option<PendingVectorRender>,
+    gpu: Option<OffscreenGpu>,
     resources: Option<MapRenderResources>,
     target: Option<MapTarget>,
     pending_loads: Vec<Promise<LoadResults>>,
@@ -288,6 +382,7 @@ impl RgisNativeApp {
             vector_render_cache: rgis_render::VectorRenderCache::default(),
             vector_render_generation: Arc::new(AtomicU64::new(0)),
             pending_vector_render: None,
+            gpu: None,
             resources: None,
             target: None,
             pending_loads: Vec::new(),
@@ -731,18 +826,15 @@ impl RgisNativeApp {
     fn render_map(&mut self, window: &mut Window) {
         self.poll_pending_loads(window);
         self.poll_vector_render(window);
-        let Some(context) = WgpuContextHandle::from_window(window) else {
-            self.status = "GPUI GPU context unavailable".to_string();
+        if self.gpu.is_none() {
+            self.gpu = OffscreenGpu::new();
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            self.status = "No GPU adapter available".to_string();
             return;
         };
-        if context.device_lost() {
-            self.resources = None;
-            self.target = None;
-            self.status = "Recovering GPU device".to_string();
-            return;
-        }
-        let device = context.device();
-        let queue = context.queue();
+        let (device_owned, queue_owned) = (gpu.device.clone(), gpu.queue.clone());
+        let (device, queue) = (&device_owned, &queue_owned);
 
         let scale_factor = window.scale_factor();
         let viewport_size = window.viewport_size();
@@ -762,32 +854,29 @@ impl RgisNativeApp {
             (f32::from(height) * scale_factor).ceil() as u32,
         );
         if self.target.as_ref().map(|target| target.size) != Some(size) {
-            self.target = Some(MapTarget::new(&context, size));
-            self.resources = Some(MapRenderResources::new(device, context.texture_format()));
+            self.target = Some(MapTarget::new(device, size));
+        }
+        if self.resources.is_none() {
+            self.resources = Some(MapRenderResources::new(device, MAP_FORMAT));
         }
         let callback = self.map_callback(
             f32::from(width) * scale_factor,
             f32::from(height) * scale_factor,
         );
-        let target = self.target.as_ref().expect("map target created");
+        let target = self.target.as_mut().expect("map target created");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rgis-map-encoder"),
         });
         let resources = self.resources.take().expect("map resources created");
-        self.resources = Some(
-            resources.render_into(
-                device,
-                queue,
-                &mut encoder,
-                target
-                    .msaa_view
-                    .as_ref()
-                    .unwrap_or_else(|| target.target.view()),
-                target.msaa_view.as_ref().map(|_| target.target.view()),
-                &callback,
-            ),
-        );
-        queue.submit([encoder.finish()]);
+        self.resources = Some(resources.render_into(
+            device,
+            queue,
+            &mut encoder,
+            target.msaa_view.as_ref().unwrap_or(&target.color_view),
+            target.msaa_view.as_ref().map(|_| &target.color_view),
+            &callback,
+        ));
+        target.read_back(device, queue, encoder);
         if self.pending_vector_render.is_some() {
             window.on_next_frame(|_, cx| cx.refresh_windows());
         }
@@ -1441,7 +1530,7 @@ impl Render for RgisNativeApp {
             window.window_decorations(),
             gpui::Decorations::Client { .. }
         );
-        let map_surface = self.target.as_ref().map(|target| target.target.surface());
+        let map_image = self.target.as_ref().and_then(|target| target.image.clone());
         let map = div()
             .flex_1()
             .on_mouse_down(
@@ -1523,34 +1612,47 @@ impl Render for RgisNativeApp {
                     }
                 }),
             )
-            .on_scroll_wheel(
-                cx.listener(|this, event: &gpui::ScrollWheelEvent, window, cx| {
-                    let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
-                    let scale = window.scale_factor();
-                    let cursor = [
-                        ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
-                            .clamp(0.0, this.project.viewport.width_px as f32),
-                        ((f32::from(event.position.y)
-                            - if matches!(
-                                window.window_decorations(),
-                                gpui::Decorations::Client { .. }
-                            ) {
-                                TITLEBAR_HEIGHT
-                            } else {
-                                0.0
-                            })
-                            * scale)
-                            .clamp(0.0, this.project.viewport.height_px as f32),
-                    ];
-                    this.project.viewport.zoom_toward(cursor, delta);
-                    cx.notify();
-                }),
-            )
+            .on_scroll(cx.listener(|this, event: &gpui::ScrollEvent, window, cx| {
+                let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
+                let scale = window.scale_factor();
+                let cursor = [
+                    ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
+                        .clamp(0.0, this.project.viewport.width_px as f32),
+                    ((f32::from(event.position.y)
+                        - if matches!(
+                            window.window_decorations(),
+                            gpui::Decorations::Client { .. }
+                        ) {
+                            TITLEBAR_HEIGHT
+                        } else {
+                            0.0
+                        })
+                        * scale)
+                        .clamp(0.0, this.project.viewport.height_px as f32),
+                ];
+                this.project.viewport.zoom_toward(cursor, delta);
+                cx.notify();
+            }))
             .bg(rgb(ZED_CANVAS));
-        let map = if let Some(surface) = map_surface {
-            map.child(surface.size_full())
+        let map = if let Some(image) = map_image {
+            map.child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let _ = window.paint_image(
+                            bounds,
+                            bounds,
+                            gpui::Corners::default(),
+                            image.clone(),
+                            0,
+                            false,
+                        );
+                    },
+                )
+                .size_full(),
+            )
         } else {
-            map.child("GPU surface unavailable")
+            map.child("GPU unavailable")
         };
         let mut root = div()
             .size_full()
@@ -1659,10 +1761,10 @@ impl Render for RgisNativeApp {
 }
 
 pub fn run(startup_paths: Vec<std::path::PathBuf>) {
-    application().run(move |cx: &mut App| {
-        cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+    gpui::application().run(move |cx: &mut App| {
+        gpui::init(cx);
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
-        cx.open_window(
+        gpui::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions::default()),
@@ -1672,6 +1774,7 @@ pub fn run(startup_paths: Vec<std::path::PathBuf>) {
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
+            cx,
             move |_, cx| cx.new(|_| RgisNativeApp::new(&startup_paths)),
         )
         .expect("failed to open rgis window");

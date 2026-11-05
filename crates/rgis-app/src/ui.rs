@@ -1,7 +1,7 @@
+use gpui::component::input::{Input, InputState};
 use gpui::{
     Context, ElementId, Entity, MouseButton, Window, deferred, div, prelude::*, px, rgb, rgba,
 };
-use gpui_elements::editable_text::{EditableTextState, StringStorage, text_input};
 use rgis_core::{Color, DataSource, DataSourceId, LayerId, Project};
 
 const SIDEBAR_WIDTH: f32 = 280.0;
@@ -196,29 +196,20 @@ fn data_source_field<T: LayerUi>(
     initial: &str,
     window: &mut Window,
     cx: &mut Context<T>,
-) -> (Entity<EditableTextState>, gpui::Div) {
-    let id = id.into();
+) -> (Entity<InputState>, gpui::Div) {
+    let id: ElementId = id.into();
     let initial = initial.to_owned();
-    let state = EditableTextState::use_keyed_init(id.clone(), window, cx, move |_window, _cx| {
-        StringStorage::from(initial)
+    let state = window.use_keyed_state(id, cx, move |window, cx| {
+        InputState::new(window, cx)
+            .default_value(initial)
+            .placeholder(label)
     });
     let field = div()
         .gap_1()
         .flex()
         .flex_col()
         .child(div().text_xs().text_color(rgb(ZED_MUTED)).child(label))
-        .child(
-            text_input(id)
-                .state(state.downgrade())
-                .w_full()
-                .h(px(26.0))
-                .px_1()
-                .bg(rgb(ZED_SURFACE))
-                .border_1()
-                .border_color(rgb(ZED_BORDER))
-                .text_color(rgb(ZED_TEXT))
-                .placeholder(label),
-        );
+        .child(Input::new(&state).w_full());
     (state, field)
 }
 
@@ -419,17 +410,17 @@ fn data_source_form<T: LayerUi>(
 
 enum DataSourceFormValues {
     PostgreSQL {
-        name: Entity<EditableTextState>,
-        host: Entity<EditableTextState>,
-        port: Entity<EditableTextState>,
-        database: Entity<EditableTextState>,
-        username: Entity<EditableTextState>,
-        password: Entity<EditableTextState>,
+        name: Entity<InputState>,
+        host: Entity<InputState>,
+        port: Entity<InputState>,
+        database: Entity<InputState>,
+        username: Entity<InputState>,
+        password: Entity<InputState>,
     },
     Wms {
-        name: Entity<EditableTextState>,
-        url: Entity<EditableTextState>,
-        layers: Entity<EditableTextState>,
+        name: Entity<InputState>,
+        url: Entity<InputState>,
+        layers: Entity<InputState>,
     },
 }
 
@@ -463,12 +454,12 @@ fn data_source_form_actions<T: LayerUi>(
                                 username,
                                 password,
                             } => {
-                                let name = name.read(cx).as_str().trim().to_owned();
-                                let host = host.read(cx).as_str().trim().to_owned();
-                                let port_text = port.read(cx).as_str().trim().to_owned();
-                                let database = database.read(cx).as_str().trim().to_owned();
-                                let username = username.read(cx).as_str().trim().to_owned();
-                                let password = password.read(cx).as_str().to_owned();
+                                let name = name.read(cx).value().trim().to_owned();
+                                let host = host.read(cx).value().trim().to_owned();
+                                let port_text = port.read(cx).value().trim().to_owned();
+                                let database = database.read(cx).value().trim().to_owned();
+                                let username = username.read(cx).value().trim().to_owned();
+                                let password = password.read(cx).value().to_owned();
                                 let port = match port_text.parse::<u16>() {
                                     Ok(port) if port > 0 => port,
                                     _ => {
@@ -495,9 +486,9 @@ fn data_source_form_actions<T: LayerUi>(
                                 ))
                             }
                             DataSourceFormValues::Wms { name, url, layers } => {
-                                let name = name.read(cx).as_str().trim().to_owned();
-                                let url = url.read(cx).as_str().trim().to_owned();
-                                let layers = layers.read(cx).as_str().trim().to_owned();
+                                let name = name.read(cx).value().trim().to_owned();
+                                let url = url.read(cx).value().trim().to_owned();
+                                let layers = layers.read(cx).value().trim().to_owned();
                                 if name.is_empty() || url.is_empty() || layers.is_empty() {
                                     this.set_status(
                                         "Name, service URL, and layers are required".to_string(),
