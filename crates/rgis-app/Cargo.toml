@@ -18,22 +18,23 @@ rgis-io     = { path = "../rgis-io" }
 rgis-render = { path = "../rgis-render" }
 rgis-tiles  = { path = "../rgis-tiles" }
 smallvec    = "1"
-pollster    = "0.4"
 geo-types   = { workspace = true }
 
 wgpu        = { workspace = true }
 image       = { workspace = true }
-rfd         = { workspace = true }
-poll-promise = { workspace = true }
 lru         = { workspace = true }
 
 gpui = { package = "gpui-kit", version = "=0.9.0" }
 
-# Native file loading uses Promise::spawn_thread (blocking IO on a background
-# std::thread, needs no extra feature). The browser can't spawn OS threads, so
-# wasm uses Promise::spawn_local backed by wasm-bindgen-futures instead.
+# Native file dialogs, background loading and blocking GPU setup. The browser
+# build has none of these.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster    = "0.4"
+rfd         = { workspace = true }
+poll-promise = { workspace = true }
+
+# The browser build requests its GPU device and reads frames back asynchronously.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-poll-promise = { workspace = true, features = ["web"] }
 wasm-bindgen-futures = "0.4"
 raw-window-handle = "0.6"
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }

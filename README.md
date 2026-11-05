@@ -1,6 +1,6 @@
 # rgis
 
-A Rust GIS desktop application built on [GPUI](https://github.com/gpui-ce/gpui-ce) (the community edition of Zed's UI framework) for UI and [wgpu](https://crates.io/crates/wgpu) (with earcut tessellation) for map rendering. The same app runs natively and compiles to `wasm32-unknown-unknown` for the browser.
+A Rust GIS desktop application built on [GPUI](https://crates.io/crates/gpui-kit) (via gpui-kit and gpui-component, built on an unofficial release of Zed's UI framework) for UI and [wgpu](https://crates.io/crates/wgpu) (with earcut tessellation) for map rendering. The same app runs natively and compiles to `wasm32-unknown-unknown` for the browser.
 
 ## Features
 
@@ -27,7 +27,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### 2. Install system dependencies
 
-GPUI (Wayland and X11 backends) on Linux needs Wayland/Vulkan/font/text/input libraries. The native desktop build currently targets Linux and FreeBSD. This workspace also uses image loading and HTTP tile fetching.
+GPUI (Wayland and X11 backends, through gpui-kit) on Linux needs Wayland/Vulkan/font/text/input libraries. The native desktop build currently targets Linux and FreeBSD. This workspace also uses image loading and HTTP tile fetching.
 
 ```sh
 sudo apt update
@@ -70,11 +70,16 @@ whichever `wgpu` backend (WebGPU or WebGL2) the browser supports. It always
 loads the bundled demo dataset so the map has something to show without using
 the file picker.
 
+The browser build needs a **nightly** Rust compiler, because gpui-kit's web
+layer depends on `wasm_thread`, which uses unstable features. The workspace pins
+stable for everything else, so select nightly for these commands:
+
 ```sh
-rustup target add wasm32-unknown-unknown
+rustup toolchain install nightly
+rustup +nightly target add wasm32-unknown-unknown
 cargo install trunk
 cd crates/rgis-web
-trunk serve
+RUSTUP_TOOLCHAIN=nightly trunk serve
 ```
 
 Then open <http://127.0.0.1:8080/rgis/> in a browser.
@@ -118,7 +123,7 @@ map:
 | [crates/rgis-core](crates/rgis-core) | Core GIS types, styling, projection helpers, project/viewport state |
 | [crates/rgis-io](crates/rgis-io) | GeoJSON / Shapefile / FlatGeobuf readers, CRS detection, and reprojection to Web Mercator |
 | [crates/rgis-style](crates/rgis-style) | Parser and evaluator for the MapLibre/Mapbox style spec (expressions, filters, style sheets) |
-| [crates/rgis-render](crates/rgis-render) | Tessellates layer and basemap geometry into `wgpu` vertex/index buffers, draws them into a GPUI custom GPU surface, and has a `tiny-skia` CPU vector path |
+| [crates/rgis-render](crates/rgis-render) | Tessellates layer and basemap geometry into `wgpu` vertex/index buffers, renders them offscreen on its own `wgpu` device, and has a `tiny-skia` CPU vector path |
 | [crates/rgis-tiles](crates/rgis-tiles) | Raster and vector tile fetching and caching, glyphs and sprites |
 | [crates/rgis-web](crates/rgis-web) | wasm/browser entry point that boots `rgis-app` via GPUI's web backend |
 
@@ -127,7 +132,7 @@ map:
 ## Architecture notes
 
 - `rgis-core`, `rgis-io`, `rgis-style` and `rgis-tiles` stay backend-agnostic.
-- `rgis-render` tessellates `rgis-core::Layer` geometry (via `rearcut` for fills, with hand-extruded stroke/point quads) into a `SceneMesh`, and vector basemap tiles into per-tile meshes styled by `rgis-style`, then draws them each frame through a `MapCallback` into GPUI's custom texture-surface API.
+- `rgis-render` tessellates `rgis-core::Layer` geometry (via `rearcut` for fills, with hand-extruded stroke/point quads) into a `SceneMesh`, and vector basemap tiles into per-tile meshes styled by `rgis-style`, then draws them each frame through a `MapCallback` into an offscreen texture. `rgis-app` reads each frame back to the CPU and shows it with `Window::paint_image`, because upstream GPUI has no external-texture surface on Linux or the web.
 - `rgis-app` owns the GPUI application: the layer panel, status bar, tile caches, label placement, and pan/zoom interactions, shared between the native binary and the wasm build.
 
 ## Development
