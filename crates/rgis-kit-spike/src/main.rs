@@ -182,6 +182,11 @@ impl Offscreen {
     }
 }
 
+fn load_style() -> rgis_render::StyleSheet {
+    rgis_render::StyleSheet::parse(include_str!("../../rgis-style/fixtures/liberty.json"))
+        .expect("liberty style parses")
+}
+
 fn sample_project() -> Project {
     let mut project = Project::default();
     let bytes = include_bytes!("../../rgis-app/assets/sample.geojson");
@@ -198,16 +203,25 @@ fn sample_project() -> Project {
     project
 }
 
-fn callback(project: &mut Project, w: u32, h: u32, frame: u32) -> MapCallback {
+fn callback(
+    project: &mut Project,
+    style: &rgis_render::StyleSheet,
+    w: u32,
+    h: u32,
+    frame: u32,
+) -> MapCallback {
     project.viewport.width_px = w;
     project.viewport.height_px = h;
     // Slowly pan so every frame is different.
     let mut viewport = project.viewport.clone();
     viewport.center.x += frame as f64 * 500.0;
-    let mesh = build_scene_mesh(&project.layers, &viewport);
+    let background = rgis_render::build_background_mesh(&viewport, style);
+    let background_index_count = background.indices.len() as u32;
+    let mut mesh = background;
+    mesh.extend(build_scene_mesh(&project.layers, &viewport));
     MapCallback {
         mesh,
-        background_index_count: 0,
+        background_index_count,
         basemap_tiles: Vec::new(),
         tiles: Vec::new(),
         raster_tile_count: 0,
@@ -221,11 +235,12 @@ fn callback(project: &mut Project, w: u32, h: u32, frame: u32) -> MapCallback {
 
 fn bench(w: u32, h: u32, frames: u32) {
     let mut project = sample_project();
+    let style = load_style();
     let mut gpu = Offscreen::new((w, h));
     let mut t = Timings::default();
     let mut upload = Duration::ZERO;
     for f in 0..frames {
-        let cb = callback(&mut project, w, h, f);
+        let cb = callback(&mut project, &style, w, h, f);
         let px = gpu.render(&cb, &mut t);
         if f == 0
             && let Ok(path) = std::env::var("SPIKE_DUMP")
@@ -255,6 +270,7 @@ fn bench(w: u32, h: u32, frames: u32) {
 }
 
 struct MapView {
+    style: rgis_render::StyleSheet,
     gpu: Offscreen,
     project: Project,
     frame: u32,
@@ -270,7 +286,7 @@ impl Render for MapView {
         let w = ((f32::from(vp.width) - 220.0).max(1.0) * scale) as u32;
         let h = ((f32::from(vp.height) - 28.0).max(1.0) * scale) as u32;
         self.gpu.resize((w, h));
-        let cb = callback(&mut self.project, w, h, self.frame);
+        let cb = callback(&mut self.project, &self.style, w, h, self.frame);
         let pixels = self.gpu.render(&cb, &mut self.timings);
         let s = Instant::now();
         let img = image::RgbaImage::from_raw(w, h, pixels).expect("size");
@@ -360,6 +376,7 @@ fn main() {
         gpui_kit::init(cx);
         gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
             cx.new(|_| MapView {
+                style: load_style(),
                 gpu: Offscreen::new((1280, 720)),
                 project: sample_project(),
                 frame: 0,
