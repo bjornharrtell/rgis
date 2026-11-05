@@ -50,7 +50,7 @@ serde_yaml   = "0.9"
 thiserror   = "2"
 anyhow      = "1"
 image       = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lru         = "0.18"
+lru         = "0.19"
 directories = "6"
 
 # UI / rendering
