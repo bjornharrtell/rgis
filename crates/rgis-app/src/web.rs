@@ -9,15 +9,15 @@ use std::{
 
 use crate::labels;
 use crate::raster;
-use crate::ui::{self, LayerUi, LayerUiState, StyleColorTarget};
+use crate::ui::{self, LayerUi, LayerUiState};
+use gpui::component::ActiveTheme as _;
 use gpui::web::WebPlatform;
 use gpui::{
     App, Bounds, Context, MouseButton, Render, Window, WindowBounds, WindowOptions, div,
     prelude::*, px, rgb, size,
 };
 use rgis_core::{
-    Bounds as GeoBounds, Color, Layer, LayerId, Project, Viewport, lonlat_to_mercator,
-    mercator_to_lonlat,
+    Bounds as GeoBounds, Layer, Project, Viewport, lonlat_to_mercator, mercator_to_lonlat,
 };
 use rgis_render::{
     MapCallback, MapRenderResources, StyleSheet, TileMesh, build_background_mesh, build_tile_mesh,
@@ -28,14 +28,6 @@ use wgpu;
 
 const SIDEBAR_WIDTH: f32 = 280.0;
 const STATUS_HEIGHT: f32 = 28.0;
-const ZED_CANVAS: u32 = 0x121212;
-const ZED_PANEL: u32 = 0x1b1b1b;
-const ZED_TITLEBAR: u32 = 0x202020;
-const ZED_SURFACE: u32 = 0x2a2a2a;
-const ZED_BORDER: u32 = 0x343434;
-const ZED_TEXT: u32 = 0xd4d4d4;
-const ZED_MUTED: u32 = 0x929292;
-const ZED_ACCENT: u32 = 0x8ab4f8;
 
 // WebGL2 has no BGRA render targets, so frames are rendered as RGBA and
 // swizzled on the CPU while being copied into GPUI's BGRA image.
@@ -362,33 +354,6 @@ fn wasm_memory_bytes() -> u32 {
     }
 }
 
-fn icon(path: &str, color: u32) -> impl IntoElement {
-    let data = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-<path d="{path}" fill="none" stroke="#{color:06x}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>"##
-    );
-    gpui::svg()
-        .data(data.as_bytes())
-        .size(px(14.0))
-        .text_color(rgb(color))
-        .flex_none()
-}
-
-fn color_to_rgba(color: Color) -> u32 {
-    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
-    (channel(color.r) << 24) | (channel(color.g) << 16) | (channel(color.b) << 8) | channel(color.a)
-}
-
-fn format_color(color: Color) -> String {
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (color.b.clamp(0.0, 1.0) * 255.0).round() as u8
-    )
-}
-
 pub struct RgisWebApp {
     project: Project,
     style: Arc<StyleSheet>,
@@ -404,7 +369,7 @@ pub struct RgisWebApp {
     gpu: Rc<std::cell::RefCell<GpuState>>,
     resources: Option<MapRenderResources>,
     target: Option<MapTarget>,
-    last_render_key: Option<[u64; 8]>,
+    last_render_key: Option<[u64; 9]>,
     dragging: bool,
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
     last_map_size: Option<(u32, u32)>,
@@ -477,103 +442,6 @@ impl RgisWebApp {
         }
     }
 
-    fn layer_row(
-        &self,
-        layer_id: LayerId,
-        name: String,
-        visible: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let visibility_path = if visible {
-            "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z"
-        } else {
-            "m3 3 18 18M10.6 6.2A10.7 10.7 0 0 1 12 6c6.5 0 10 6 10 6a18 18 0 0 1-3.2 3.8M6.2 6.3C3.4 8.3 2 12 2 12s3.5 6 10 6c1.1 0 2.1-.2 3-.5"
-        };
-        div()
-            .h(px(30.0))
-            .w_full()
-            .px_2()
-            .gap_1()
-            .flex()
-            .items_center()
-            .text_sm()
-            .text_color(rgb(ZED_TEXT))
-            .hover(|style| style.bg(rgb(ZED_SURFACE)))
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(visibility_path, ZED_MUTED))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                layer.visible = !layer.visible;
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(
-                        "M12 2 3.5 6.5 12 11l8.5-4.5L12 2Zm-8.5 9.5L12 16l8.5-4.5M3.5 16.5 12 21l8.5-4.5",
-                        ZED_ACCENT,
-                    )),
-            )
-            .child(div().flex_1().child(name))
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(
-                        "m12 3 1.2 5.8L19 10l-5.8 1.2L12 17l-1.2-5.8L5 10l5.8-1.2L12 3Zm6.5 12 .6 2.4 2.4.6-2.4.6-.6 2.4-.6-2.4-2.4-.6 2.4-.6.6-2.4Z",
-                        ZED_MUTED,
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            let layer = this.layer_ui_state.style_editor_layer();
-                            this.layer_ui_state
-                                .set_style_editor_layer((layer != Some(layer_id)).then_some(layer_id));
-                            this.layer_ui_state
-                                .set_style_color_target(StyleColorTarget::Fill);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon("m6 6 12 12M18 6 6 18", ZED_MUTED))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.project.remove_layer(layer_id);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-    }
-
     fn process_basemap_tiles(&mut self) {
         raster::drain_fetchers(&self.raster_fetchers, &mut self.raster_tile_cache);
         for _ in 0..2 {
@@ -600,325 +468,6 @@ impl RgisWebApp {
             }
             self.vector_tile_fetcher.request(coord);
         }
-    }
-
-    fn color_chip(
-        &self,
-        layer_id: LayerId,
-        target: StyleColorTarget,
-        color: Color,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .w(px(24.0))
-            .h(px(24.0))
-            .rounded_sm()
-            .bg(gpui::rgba(color_to_rgba(color)))
-            .border_1()
-            .border_color(rgb(if selected { ZED_ACCENT } else { ZED_BORDER }))
-            .hover(|style| style.border_color(rgb(ZED_TEXT)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.layer_ui_state.set_style_color_target(target);
-                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                        let alpha = match target {
-                            StyleColorTarget::Fill => layer.style.fill.a,
-                            StyleColorTarget::Stroke => layer.style.stroke.a,
-                        };
-                        let chosen = Color { a: alpha, ..color };
-                        match target {
-                            StyleColorTarget::Fill => layer.style.fill = chosen,
-                            StyleColorTarget::Stroke => layer.style.stroke = chosen,
-                        }
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-    }
-
-    fn style_panel(&self, layer_id: LayerId, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(layer) = self
-            .project
-            .layers
-            .iter()
-            .find(|layer| layer.id == layer_id)
-        else {
-            return div();
-        };
-        let fill = layer.style.fill;
-        let stroke = layer.style.stroke;
-        let target = self.layer_ui_state.style_color_target();
-        let target_color = if target == StyleColorTarget::Fill {
-            fill
-        } else {
-            stroke
-        };
-        let palette_colors = [
-            (243, 139, 168),
-            (250, 179, 135),
-            (249, 226, 175),
-            (166, 227, 161),
-            (148, 226, 213),
-            (137, 220, 235),
-            (137, 180, 250),
-            (203, 166, 247),
-            (245, 194, 231),
-            (205, 214, 244),
-            (147, 153, 178),
-            (49, 50, 68),
-        ];
-        let mut palette = div().flex().flex_wrap().gap_1();
-        for (r, g, b) in palette_colors {
-            palette = palette.child(self.color_chip(
-                layer_id,
-                target,
-                Color::from_u8(r, g, b, 255),
-                false,
-                cx,
-            ));
-        }
-        let stroke_width = layer.style.stroke_width;
-        let point_radius = layer.style.point_radius;
-        div()
-            .w_full()
-            .pl(px(48.0))
-            .pr_2()
-            .py_2()
-            .gap_2()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x222222))
-            .border_l_1()
-            .border_color(rgb(ZED_BORDER))
-            .text_xs()
-            .text_color(rgb(ZED_MUTED))
-            .child(
-                div().flex().items_center().child("APPEARANCE").child(
-                    div()
-                        .ml_auto()
-                        .w(px(24.0))
-                        .h(px(24.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon("m6 6 12 12M18 6 6 18", ZED_MUTED))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.layer_ui_state.set_style_editor_layer(None);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        ),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(44.0)).child("Fill"))
-                    .child(self.color_chip(
-                        layer_id,
-                        StyleColorTarget::Fill,
-                        fill,
-                        target == StyleColorTarget::Fill,
-                        cx,
-                    ))
-                    .child(format_color(fill)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(44.0)).child("Stroke"))
-                    .child(self.color_chip(
-                        layer_id,
-                        StyleColorTarget::Stroke,
-                        stroke,
-                        target == StyleColorTarget::Stroke,
-                        cx,
-                    ))
-                    .child(format_color(stroke)),
-            )
-            .child(palette)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(84.0)).child("Opacity"))
-                    .child(self.adjust_style_button(layer_id, target, false, cx))
-                    .child(format!("{:.0}%", target_color.a * 100.0))
-                    .child(self.adjust_style_button(layer_id, target, true, cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(84.0)).child("Line width"))
-                    .child(self.adjust_numeric_button(layer_id, false, cx))
-                    .child(format!("{stroke_width:.1}"))
-                    .child(self.adjust_numeric_button(layer_id, true, cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(84.0)).child("Point radius"))
-                    .child(self.adjust_radius_button(layer_id, false, cx))
-                    .child(format!("{point_radius:.1}"))
-                    .child(self.adjust_radius_button(layer_id, true, cx)),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_color(rgb(ZED_MUTED))
-                    .child("Color applies to selected target")
-                    .child(
-                        div()
-                            .ml_auto()
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(ZED_SURFACE))
-                            .child("Reset")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        layer.style = rgis_core::Style::default();
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            )
-    }
-
-    fn adjust_style_button(
-        &self,
-        layer_id: LayerId,
-        target: StyleColorTarget,
-        increase: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .w(px(24.0))
-            .h(px(24.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(ZED_SURFACE))
-            .child(icon(
-                if increase {
-                    "M12 5v14M5 12h14"
-                } else {
-                    "M5 12h14"
-                },
-                ZED_MUTED,
-            ))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                        let color = match target {
-                            StyleColorTarget::Fill => &mut layer.style.fill,
-                            StyleColorTarget::Stroke => &mut layer.style.stroke,
-                        };
-                        color.a = if increase {
-                            (color.a + 0.05).min(1.0)
-                        } else {
-                            (color.a - 0.05).max(0.0)
-                        };
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-    }
-
-    fn adjust_numeric_button(
-        &self,
-        layer_id: LayerId,
-        increase: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .w(px(24.0))
-            .h(px(24.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(ZED_SURFACE))
-            .child(icon(
-                if increase {
-                    "M12 5v14M5 12h14"
-                } else {
-                    "M5 12h14"
-                },
-                ZED_MUTED,
-            ))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                        layer.style.stroke_width = if increase {
-                            layer.style.stroke_width + 0.5
-                        } else {
-                            (layer.style.stroke_width - 0.5).max(0.1)
-                        };
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-    }
-
-    fn adjust_radius_button(
-        &self,
-        layer_id: LayerId,
-        increase: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .w(px(24.0))
-            .h(px(24.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(ZED_SURFACE))
-            .child(icon(
-                if increase {
-                    "M12 5v14M5 12h14"
-                } else {
-                    "M5 12h14"
-                },
-                ZED_MUTED,
-            ))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                        layer.style.point_radius = if increase {
-                            layer.style.point_radius + 1.0
-                        } else {
-                            (layer.style.point_radius - 1.0).max(1.0)
-                        };
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
     }
 
     fn map_callback(&mut self, width: f32, height: f32) -> MapCallback {
@@ -1065,7 +614,32 @@ impl RgisWebApp {
         // Only redraw when something that affects the picture changed; the
         // readback is async, so an unconditional redraw would spin forever.
         let viewport = &self.project.viewport;
+        let layers_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for layer in &self.project.layers {
+                layer.id.hash(&mut hasher);
+                layer.visible.hash(&mut hasher);
+                let style = &layer.style;
+                for value in [
+                    style.fill.r,
+                    style.fill.g,
+                    style.fill.b,
+                    style.fill.a,
+                    style.stroke.r,
+                    style.stroke.g,
+                    style.stroke.b,
+                    style.stroke.a,
+                    style.stroke_width,
+                    style.point_radius,
+                ] {
+                    value.to_bits().hash(&mut hasher);
+                }
+            }
+            hasher.finish()
+        };
         let key = [
+            layers_key,
             viewport.center.x.to_bits(),
             viewport.center.y.to_bits(),
             viewport.zoom.to_bits(),
@@ -1094,98 +668,6 @@ impl RgisWebApp {
         ));
         target.start_readback(queue, encoder);
         window.on_next_frame(|_, cx| cx.refresh_windows());
-    }
-
-    fn sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut content = div()
-            .w(px(width))
-            .h_full()
-            .p_2()
-            .gap_1()
-            .flex()
-            .flex_col()
-            .bg(rgb(ZED_PANEL))
-            .border_r_1()
-            .border_color(rgb(ZED_BORDER))
-            .text_color(rgb(ZED_TEXT))
-            .child(
-                div()
-                    .h(px(30.0))
-                    .w_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .text_xs()
-                    .text_color(rgb(ZED_MUTED))
-                    .child(
-                        div()
-                            .w(px(18.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(if self.layer_ui_state.layers_expanded() {
-                                icon("m6 9 6 6 6-6", ZED_MUTED)
-                            } else {
-                                icon("m9 6 6 6-6 6", ZED_MUTED)
-                            }),
-                    )
-                    .child("LAYERS")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            let expanded = this.layer_ui_state.layers_expanded();
-                            this.layer_ui_state.set_layers_expanded(!expanded);
-                            cx.notify();
-                        }),
-                    ),
-            );
-        if self.layer_ui_state.layers_expanded() {
-            for layer in self.project.layers.iter().rev() {
-                content =
-                    content.child(self.layer_row(layer.id, layer.name.clone(), layer.visible, cx));
-                if self.layer_ui_state.style_editor_layer() == Some(layer.id) {
-                    content = content.child(self.style_panel(layer.id, cx));
-                }
-            }
-            content = content.child(
-                div()
-                    .h(px(30.0))
-                    .w_full()
-                    .px_2()
-                    .gap_1()
-                    .flex()
-                    .items_center()
-                    .text_sm()
-                    .text_color(rgb(ZED_MUTED))
-                    .hover(|style| style.bg(rgb(ZED_SURFACE)))
-                    .child(
-                        div()
-                            .w(px(22.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon(
-                                if self.project.show_tiles {
-                                    "M3 6 9 3l6 3 6-3v15l-6 3-6-3-6 3V6Zm6-3v15m6-12v15"
-                                } else {
-                                    "M3 3 21 21M3 6l6-3 6 3 6-3v9M3 12v9l6-3 2.2 1.1"
-                                },
-                                ZED_MUTED,
-                            )),
-                    )
-                    .child(div().flex_1().child("OpenFreeMap"))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.project.show_tiles = !this.project.show_tiles;
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        content
     }
 }
 
@@ -1309,26 +791,24 @@ impl Render for RgisWebApp {
                     }
                 }),
             )
-            .on_scroll_wheel(
-                cx.listener(|this, event: &gpui::ScrollWheelEvent, window, cx| {
-                    let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
-                    let scale = window.scale_factor();
-                    let cursor = [
-                        ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
-                            .clamp(0.0, this.project.viewport.width_px as f32),
-                        (f32::from(event.position.y) * scale)
-                            .clamp(0.0, this.project.viewport.height_px as f32),
-                    ];
-                    this.project.viewport.zoom_toward(cursor, delta);
-                    cx.notify();
-                }),
-            )
+            .on_scroll(cx.listener(|this, event: &gpui::ScrollEvent, window, cx| {
+                let delta = f32::from(event.delta.pixel_delta(px(16.0)).y) as f64 / 240.0;
+                let scale = window.scale_factor();
+                let cursor = [
+                    ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
+                        .clamp(0.0, this.project.viewport.width_px as f32),
+                    (f32::from(event.position.y) * scale)
+                        .clamp(0.0, this.project.viewport.height_px as f32),
+                ];
+                this.project.viewport.zoom_toward(cursor, delta);
+                cx.notify();
+            }))
             .child(map_content);
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(ZED_CANVAS))
+            .bg(cx.theme().tokens.background)
             .overflow_hidden()
             .child(
                 div()
@@ -1343,12 +823,26 @@ impl Render for RgisWebApp {
     }
 }
 
+/// Directory the page is served from (for example `/rgis`), where trunk copies
+/// the `assets/icons` that gpui-kit's wasm asset source downloads on demand.
+fn asset_endpoint() -> String {
+    // The loader hands this to `reqwest`, which needs an absolute URL.
+    let Some(location) = web_sys::window().map(|window| window.location()) else {
+        return String::new();
+    };
+    let origin = location.origin().unwrap_or_default();
+    let path = location.pathname().unwrap_or_default();
+    let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    format!("{origin}{dir}")
+}
+
 pub fn run() {
     gpui::web::init_logging();
     let platform = Rc::new(WebPlatform::new(false));
     let http_client = std::sync::Arc::new(platform.fetch_http_client());
     let application = gpui::Application::with_platform(platform)
         .with_http_client(http_client)
+        .with_assets(gpui::assets::Assets::new(asset_endpoint()))
         .run_embedded(|cx: &mut App| {
             gpui::init(cx);
             gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);

@@ -10,7 +10,7 @@ A Rust GIS desktop application built on [GPUI](https://crates.io/crates/gpui-kit
 - Render vector layers as tessellated triangle meshes uploaded to the GPU via `wgpu`
 - Show OpenStreetMap raster tiles behind vector data, with an on-disk cache on native
 - Render an [OpenFreeMap](https://openfreemap.org/) vector basemap from MapLibre/Mapbox-style documents (the `liberty` style by default), including labels, glyphs and sprites; styles are parsed and evaluated at runtime by `rgis-style`
-- Layer panel to toggle visibility and remove layers
+- Sidebar with separate **Layers** and **Data sources** sections; layer name, colours, stroke width and point radius are edited in a properties dialog
 - Data source panel for PostgreSQL and OGC WMS connection definitions
 - Open and save concise YAML project files with layer styles, data sources, and map position
 - Keep map state in Web Mercator while reporting cursor coordinates and scale in the status bar

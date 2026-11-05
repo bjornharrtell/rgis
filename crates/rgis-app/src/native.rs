@@ -6,15 +6,16 @@ use std::sync::{
 };
 use std::{fs, path::PathBuf};
 
+use gpui::component::{ActiveTheme as _, TitleBar};
 use gpui::{
     App, Bounds, Context, CursorStyle, MouseButton, Render, ResizeEdge, Window, WindowBounds,
-    WindowDecorations, WindowOptions, div, prelude::*, px, rgb, rgba, size, svg,
+    WindowDecorations, WindowOptions, div, prelude::*, px, size,
 };
 use lru::LruCache;
 use poll_promise::Promise;
 use rgis_app::labels;
 use rgis_app::raster;
-use rgis_app::ui::{self, LayerUi, LayerUiState, StyleColorTarget};
+use rgis_app::ui::{self, LayerUi, LayerUiState};
 use rgis_core::{
     Bounds as GeoBounds, Color, Layer, LayerId, Project, ProjectState, mercator_to_lonlat,
 };
@@ -22,17 +23,9 @@ use rgis_render::{MapCallback, MapRenderResources, SceneMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
 const SIDEBAR_WIDTH: f32 = 280.0;
-const TITLEBAR_HEIGHT: f32 = 32.0;
+const TITLEBAR_HEIGHT: f32 = 34.0;
 const STATUS_HEIGHT: f32 = 28.0;
 const TILE_CACHE_SIZE: usize = 256;
-const ZED_CANVAS: u32 = 0x121212;
-const ZED_PANEL: u32 = 0x1b1b1b;
-const ZED_TITLEBAR: u32 = 0x202020;
-const ZED_SURFACE: u32 = 0x2a2a2a;
-const ZED_BORDER: u32 = 0x343434;
-const ZED_TEXT: u32 = 0xd4d4d4;
-const ZED_MUTED: u32 = 0x929292;
-const ZED_ACCENT: u32 = 0x8ab4f8;
 const DEFAULT_STYLE_JSON: &str = include_str!("../../rgis-style/fixtures/liberty.json");
 
 type LoadResults = Vec<(PathBuf, Result<rgis_io::LoadedLayer, rgis_io::IoError>)>;
@@ -107,19 +100,6 @@ fn load_project_file(path: PathBuf) -> Result<LoadedProject, String> {
         layers,
         path,
     })
-}
-
-fn icon(path: &str, color: u32) -> impl IntoElement {
-    let data = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-<path d="{path}" fill="none" stroke="#{color:06x}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>"##
-    );
-    svg()
-        .data(data.as_bytes())
-        .size(px(14.0))
-        .text_color(rgb(color))
-        .flex_none()
 }
 
 fn color_to_rgba(color: Color) -> u32 {
@@ -907,593 +887,8 @@ impl RgisNativeApp {
         }
     }
 
-    fn layer_row(
-        &self,
-        layer_id: LayerId,
-        name: String,
-        visible: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let visibility_path = if visible {
-            "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z"
-        } else {
-            "m3 3 18 18M10.6 6.2A10.7 10.7 0 0 1 12 6c6.5 0 10 6 10 6a18 18 0 0 1-3.2 3.8M6.2 6.3C3.4 8.3 2 12 2 12s3.5 6 10 6c1.1 0 2.1-.2 3-.5"
-        };
-        div()
-            .h(px(30.0))
-            .w_full()
-            .px_2()
-            .gap_1()
-            .flex()
-            .items_center()
-            .text_sm()
-            .text_color(rgb(ZED_TEXT))
-            .hover(|style| style.bg(rgb(ZED_SURFACE)))
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(visibility_path, ZED_MUTED))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                layer.visible = !layer.visible;
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(
-                        "M12 2 3.5 6.5 12 11l8.5-4.5L12 2Zm-8.5 9.5L12 16l8.5-4.5M3.5 16.5 12 21l8.5-4.5",
-                        ZED_ACCENT,
-                    )),
-            )
-            .child(div().flex_1().child(name))
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(
-                        "m12 3 1.2 5.8L19 10l-5.8 1.2L12 17l-1.2-5.8L5 10l5.8-1.2L12 3Zm6.5 12 .6 2.4 2.4.6-2.4.6-.6 2.4-.6-2.4-2.4-.6 2.4-.6.6-2.4Z",
-                        ZED_MUTED,
-                    ))
-                    .hover(|style| style.text_color(rgb(ZED_TEXT)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            let layer = this.layer_ui_state.style_editor_layer();
-                            this.layer_ui_state
-                                .set_style_editor_layer((layer != Some(layer_id)).then_some(layer_id));
-                            this.layer_ui_state
-                                .set_style_color_target(StyleColorTarget::Fill);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(22.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon("m6 6 12 12M18 6 6 18", ZED_MUTED))
-                    .hover(|style| style.text_color(rgb(0xf38ba8)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.project.remove_layer(layer_id);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-    }
-
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut content = div()
-            .w(px(SIDEBAR_WIDTH))
-            .h_full()
-            .p_2()
-            .gap_1()
-            .flex()
-            .flex_col()
-            .bg(rgb(ZED_PANEL))
-            .border_r_1()
-            .border_color(rgb(ZED_BORDER))
-            .text_color(rgb(ZED_TEXT))
-            .child(
-                div()
-                    .h(px(30.0))
-                    .w_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .text_xs()
-                    .text_color(rgb(ZED_MUTED))
-                    .child(
-                        div()
-                            .w(px(18.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(if self.layer_ui_state.layers_expanded() {
-                                icon("m6 9 6 6 6-6", ZED_MUTED)
-                            } else {
-                                icon("m9 6 6 6-6 6", ZED_MUTED)
-                            }),
-                    )
-                    .child(div().text_xs().child("LAYERS"))
-                    .child(
-                        div()
-                            .ml_auto()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|style| style.bg(rgb(ZED_SURFACE)))
-                            .child(icon("M12 5v14M5 12h14", ZED_MUTED))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.queue_pick_files(window);
-                                    cx.stop_propagation();
-                                }),
-                            ),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            let expanded = this.layer_ui_state.layers_expanded();
-                            this.layer_ui_state.set_layers_expanded(!expanded);
-                            cx.notify();
-                        }),
-                    ),
-            );
-
-        if self.layer_ui_state.layers_expanded() {
-            for (id, name, visible) in self
-                .project
-                .layers
-                .iter()
-                .rev()
-                .map(|layer| (layer.id, layer.name.clone(), layer.visible))
-            {
-                content = content.child(self.layer_row(id, name, visible, cx));
-                if self.layer_ui_state.style_editor_layer() == Some(id) {
-                    content = content.child(self.style_panel(id, cx));
-                }
-            }
-            content = content.child(
-                div()
-                    .h(px(30.0))
-                    .w_full()
-                    .px_2()
-                    .gap_1()
-                    .flex()
-                    .items_center()
-                    .text_sm()
-                    .text_color(rgb(ZED_MUTED))
-                    .hover(|style| style.bg(rgb(ZED_SURFACE)))
-                    .child(
-                        div()
-                            .w(px(22.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon(
-                                if self.project.show_tiles {
-                                    "M3 6 9 3l6 3 6-3v15l-6 3-6-3-6 3V6Zm6-3v15m6-12v15"
-                                } else {
-                                    "M3 3 21 21M3 6l6-3 6 3 6-3v9M3 12v9l6-3 2.2 1.1"
-                                },
-                                ZED_MUTED,
-                            )),
-                    )
-                    .child(div().flex_1().child("OpenFreeMap"))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.project.show_tiles = !this.project.show_tiles;
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        content
-    }
-
-    fn color_chip(
-        &self,
-        layer_id: LayerId,
-        target: StyleColorTarget,
-        color: Color,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .w(px(24.0))
-            .h(px(24.0))
-            .rounded_sm()
-            .bg(rgba(color_to_rgba(color)))
-            .border_1()
-            .border_color(rgb(if selected { ZED_ACCENT } else { ZED_BORDER }))
-            .hover(|style| style.border_color(rgb(ZED_TEXT)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.layer_ui_state.set_style_color_target(target);
-                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                        let alpha = match target {
-                            StyleColorTarget::Fill => layer.style.fill.a,
-                            StyleColorTarget::Stroke => layer.style.stroke.a,
-                        };
-                        let chosen = Color { a: alpha, ..color };
-                        match target {
-                            StyleColorTarget::Fill => layer.style.fill = chosen,
-                            StyleColorTarget::Stroke => layer.style.stroke = chosen,
-                        }
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-    }
-
-    fn style_panel(&self, layer_id: LayerId, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(layer) = self
-            .project
-            .layers
-            .iter()
-            .find(|layer| layer.id == layer_id)
-        else {
-            return div();
-        };
-        let fill = layer.style.fill;
-        let stroke = layer.style.stroke;
-        let stroke_width = layer.style.stroke_width;
-        let point_radius = layer.style.point_radius;
-        let target = self.layer_ui_state.style_color_target();
-        let target_color = match target {
-            StyleColorTarget::Fill => fill,
-            StyleColorTarget::Stroke => stroke,
-        };
-        let palette_colors = [
-            (243, 139, 168),
-            (250, 179, 135),
-            (249, 226, 175),
-            (166, 227, 161),
-            (148, 226, 213),
-            (137, 220, 235),
-            (137, 180, 250),
-            (203, 166, 247),
-            (245, 194, 231),
-            (205, 214, 244),
-            (147, 153, 178),
-            (49, 50, 68),
-        ];
-        let mut palette = div().flex().flex_wrap().gap_1();
-        for (r, g, b) in palette_colors {
-            palette = palette.child(self.color_chip(
-                layer_id,
-                target,
-                Color::from_u8(r, g, b, 255),
-                false,
-                cx,
-            ));
-        }
-        div()
-            .w_full()
-            .pl(px(48.0))
-            .pr_2()
-            .py_2()
-            .gap_2()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x222222))
-            .border_l_1()
-            .border_color(rgb(ZED_BORDER))
-            .text_xs()
-            .text_color(rgb(ZED_MUTED))
-            .child(
-                div().flex().items_center().child("APPEARANCE").child(
-                    div()
-                        .ml_auto()
-                        .w(px(24.0))
-                        .h(px(24.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon("m6 6 12 12M18 6 6 18", ZED_MUTED))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.layer_ui_state.set_style_editor_layer(None);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        ),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(44.0)).child("Fill"))
-                    .child(self.color_chip(
-                        layer_id,
-                        StyleColorTarget::Fill,
-                        fill,
-                        target == StyleColorTarget::Fill,
-                        cx,
-                    ))
-                    .child(format_color(fill)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(44.0)).child("Stroke"))
-                    .child(self.color_chip(
-                        layer_id,
-                        StyleColorTarget::Stroke,
-                        stroke,
-                        target == StyleColorTarget::Stroke,
-                        cx,
-                    ))
-                    .child(format_color(stroke)),
-            )
-            .child(palette)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(84.0)).child("Opacity"))
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(ZED_SURFACE))
-                            .child(icon("M5 12h14", ZED_MUTED))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        let color = match target {
-                                            StyleColorTarget::Fill => &mut layer.style.fill,
-                                            StyleColorTarget::Stroke => &mut layer.style.stroke,
-                                        };
-                                        color.a = (color.a - 0.05).max(0.0);
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(format!("{:.0}%", target_color.a * 100.0))
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(ZED_SURFACE))
-                            .child(icon("M12 5v14M5 12h14", ZED_MUTED))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        let color = match target {
-                                            StyleColorTarget::Fill => &mut layer.style.fill,
-                                            StyleColorTarget::Stroke => &mut layer.style.stroke,
-                                        };
-                                        color.a = (color.a + 0.05).min(1.0);
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(84.0)).child("Line width"))
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(ZED_SURFACE))
-                            .child(icon("M5 12h14", ZED_MUTED))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        layer.style.stroke_width =
-                                            (layer.style.stroke_width - 0.5).max(0.1);
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(format!("{stroke_width:.1}"))
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(ZED_SURFACE))
-                            .child(icon("M12 5v14M5 12h14", ZED_MUTED))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        layer.style.stroke_width += 0.5;
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(84.0)).child("Point radius"))
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(ZED_SURFACE))
-                            .child(icon("M5 12h14", ZED_MUTED))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        layer.style.point_radius =
-                                            (layer.style.point_radius - 1.0).max(1.0);
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(format!("{point_radius:.1}"))
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(ZED_SURFACE))
-                            .child(icon("M12 5v14M5 12h14", ZED_MUTED))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        layer.style.point_radius += 1.0;
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_color(rgb(ZED_MUTED))
-                    .child("Color applies to selected target")
-                    .child(
-                        div()
-                            .ml_auto()
-                            .px_2()
-                            .py_1()
-                            .bg(rgb(ZED_SURFACE))
-                            .child("Reset")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(layer) = this.project.get_layer_mut(layer_id) {
-                                        layer.style = rgis_core::Style::default();
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            )
-    }
-
-    fn client_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .h(px(TITLEBAR_HEIGHT))
-            .w_full()
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .bg(rgb(ZED_TITLEBAR))
-            .border_b_1()
-            .border_color(rgb(ZED_BORDER))
-            .text_sm()
-            .text_color(rgb(ZED_TEXT))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, event: &gpui::MouseDownEvent, window, cx| {
-                    if event.click_count == 2 {
-                        window.zoom_window();
-                    } else {
-                        window.start_window_move();
-                    }
-                    cx.stop_propagation();
-                }),
-            )
-            .child(icon(
-                "M12 2 20 6.5v9L12 20l-8-4.5v-9L12 2Zm0 5v8m-4-6 4 2 4-2",
-                ZED_ACCENT,
-            ))
-            .child(
-                div()
-                    .ml_auto()
-                    .w(px(32.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|style| style.bg(rgb(0x5a2a34)))
-                    .child(icon("m6 6 12 12M18 6 6 18", 0xf38ba8))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, window, cx| {
-                            window.remove_window();
-                            cx.stop_propagation();
-                        }),
-                    ),
-            )
+    fn client_titlebar(&self) -> impl IntoElement {
+        TitleBar::new().child(div().text_sm().child("rgis"))
     }
 }
 
@@ -1663,7 +1058,7 @@ impl Render for RgisNativeApp {
                 this.project.viewport.zoom_toward(cursor, delta);
                 cx.notify();
             }))
-            .bg(rgb(ZED_CANVAS));
+            .bg(cx.theme().tokens.background);
         let map = if let Some(image) = map_image {
             map.child(
                 gpui::canvas(
@@ -1688,10 +1083,10 @@ impl Render for RgisNativeApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(ZED_CANVAS))
+            .bg(cx.theme().tokens.background)
             .overflow_hidden();
         if has_client_titlebar {
-            root = root.child(self.client_titlebar(cx));
+            root = root.child(self.client_titlebar());
         }
         let map_content = div()
             .flex_1()
@@ -1706,27 +1101,29 @@ impl Render for RgisNativeApp {
 }
 
 pub fn run(startup_paths: Vec<std::path::PathBuf>) {
-    gpui::application().run(move |cx: &mut App| {
-        gpui::init(cx);
-        gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
-        let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
-        gpui::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions::default()),
-                is_resizable: true,
-                // Draw the titlebar in the GPUI view. Wayland compositors are
-                // not required to provide the server-decoration protocol.
-                window_decorations: Some(WindowDecorations::Client),
-                // gpui-pre defaults to an opaque window; the rounded client-side
-                // frame needs transparent corners.
-                window_background: gpui::WindowBackgroundAppearance::Transparent,
-                ..Default::default()
-            },
-            cx,
-            move |_, cx| cx.new(|_| RgisNativeApp::new(&startup_paths)),
-        )
-        .expect("failed to open rgis window");
-        cx.activate(true);
-    });
+    gpui::application()
+        .with_assets(gpui::assets::Assets)
+        .run(move |cx: &mut App| {
+            gpui::init(cx);
+            gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
+            let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+            gpui::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitleBar::title_bar_options()),
+                    is_resizable: true,
+                    // Draw the titlebar in the GPUI view. Wayland compositors are
+                    // not required to provide the server-decoration protocol.
+                    window_decorations: Some(WindowDecorations::Client),
+                    // gpui-pre defaults to an opaque window; the rounded client-side
+                    // frame needs transparent corners.
+                    window_background: gpui::WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                cx,
+                move |_, cx| cx.new(|_| RgisNativeApp::new(&startup_paths)),
+            )
+            .expect("failed to open rgis window");
+            cx.activate(true);
+        });
 }
