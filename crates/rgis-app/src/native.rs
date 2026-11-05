@@ -1772,6 +1772,9 @@ pub fn run(startup_paths: Vec<std::path::PathBuf>) {
                 // Draw the titlebar in the GPUI view. Wayland compositors are
                 // not required to provide the server-decoration protocol.
                 window_decorations: Some(WindowDecorations::Client),
+                // gpui-pre defaults to an opaque window; the rounded client-side
+                // frame needs transparent corners.
+                window_background: gpui::WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
             cx,
