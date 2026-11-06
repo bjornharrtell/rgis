@@ -1,5 +1,6 @@
 //! GPUI application entry points shared by the native and browser targets.
 
+pub mod header;
 pub mod labels;
 pub mod raster;
 pub mod ui;

@@ -13,6 +13,7 @@ use gpui::{
 };
 use lru::LruCache;
 use poll_promise::Promise;
+use rgis_app::header;
 use rgis_app::labels;
 use rgis_app::raster;
 use rgis_app::ui::{self, LayerUi, LayerUiState};
@@ -22,9 +23,7 @@ use rgis_core::{
 use rgis_render::{MapCallback, MapRenderResources, SceneMesh};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
-const SIDEBAR_WIDTH: f32 = 280.0;
 const TITLEBAR_HEIGHT: f32 = 34.0;
-const STATUS_HEIGHT: f32 = 28.0;
 const TILE_CACHE_SIZE: usize = 256;
 const DEFAULT_STYLE_JSON: &str = include_str!("../../rgis-style/fixtures/liberty.json");
 
@@ -552,11 +551,7 @@ impl RgisNativeApp {
     }
 
     fn sidebar_offset(&self) -> f32 {
-        if self.sidebar_visible {
-            SIDEBAR_WIDTH
-        } else {
-            0.0
-        }
+        ui::map_left(self.sidebar_visible)
     }
 
     fn poll_pending_loads(&mut self, window: &Window) {
@@ -852,7 +847,7 @@ impl RgisNativeApp {
             px(0.0)
         };
         let height =
-            (viewport_size.height - titlebar_height - px(STATUS_HEIGHT + frame_t + frame_b))
+            (viewport_size.height - titlebar_height - px(ui::STATUS_HEIGHT + frame_t + frame_b))
                 .max(px(1.0));
         let size = (
             (f32::from(width) * scale_factor).ceil() as u32,
@@ -885,10 +880,6 @@ impl RgisNativeApp {
         if self.pending_vector_render.is_some() {
             window.on_next_frame(|_, cx| cx.refresh_windows());
         }
-    }
-
-    fn client_titlebar(&self) -> impl IntoElement {
-        TitleBar::new().child(div().text_sm().child("rgis"))
     }
 }
 
@@ -952,7 +943,7 @@ impl Render for RgisNativeApp {
         );
         let map_image = self.target.as_ref().and_then(|target| target.image.clone());
         let map = div()
-            .flex_1()
+            .size_full()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -1083,19 +1074,14 @@ impl Render for RgisNativeApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(cx.theme().tokens.background)
+            .bg(cx.theme().title_bar)
             .overflow_hidden();
         if has_client_titlebar {
-            root = root.child(self.client_titlebar());
+            root = root.child(header::app_header(window, cx));
         }
-        let map_content = div()
-            .flex_1()
-            .flex()
-            .when(self.sidebar_visible, |content| {
-                content.child(ui::sidebar(self, window, cx))
-            })
-            .child(map);
-        root = root.child(map_content).child(ui::status_bar(self, cx));
+        root = root
+            .child(ui::workspace(self, map, window, cx))
+            .child(ui::status_bar(self, cx));
         root
     }
 }
@@ -1105,7 +1091,12 @@ pub fn run(startup_paths: Vec<std::path::PathBuf>) {
         .with_assets(gpui::assets::Assets)
         .run(move |cx: &mut App| {
             gpui::init(cx);
-            gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
+            ui::init_theme(cx);
+            cx.text_system()
+                .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/IBMPlexSans-Regular.ttf"
+                ))])
+                .expect("failed to load embedded font");
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
             gpui::open_window(
                 WindowOptions {

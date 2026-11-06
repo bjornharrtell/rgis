@@ -5749,6 +5749,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "js-sys",
+ "log",
  "lru",
  "poll-promise",
  "pollster",

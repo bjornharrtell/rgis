@@ -26,9 +26,6 @@ use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_til
 use wasm_bindgen::JsCast;
 use wgpu;
 
-const SIDEBAR_WIDTH: f32 = 280.0;
-const STATUS_HEIGHT: f32 = 28.0;
-
 // WebGL2 has no BGRA render targets, so frames are rendered as RGBA and
 // swizzled on the CPU while being copied into GPUI's BGRA image.
 const MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -435,11 +432,7 @@ impl RgisWebApp {
     }
 
     fn sidebar_offset(&self) -> f32 {
-        if self.sidebar_visible {
-            SIDEBAR_WIDTH
-        } else {
-            0.0
-        }
+        ui::map_left(self.sidebar_visible)
     }
 
     fn process_basemap_tiles(&mut self) {
@@ -682,7 +675,7 @@ impl Render for RgisWebApp {
         self.project.viewport.width_px =
             ((window_width - sidebar_width).max(1.0) * scale).round() as u32;
         self.project.viewport.height_px =
-            ((f32::from(window_size.height) - STATUS_HEIGHT).max(1.0) * scale).round() as u32;
+            ((f32::from(window_size.height) - ui::STATUS_HEIGHT).max(1.0) * scale).round() as u32;
         let map_size = (
             self.project.viewport.width_px,
             self.project.viewport.height_px,
@@ -727,7 +720,7 @@ impl Render for RgisWebApp {
             );
         }
         let map = div()
-            .flex_1()
+            .size_full()
             .bg(rgb(0xf8f4f0))
             .on_mouse_down(
                 MouseButton::Left,
@@ -751,7 +744,7 @@ impl Render for RgisWebApp {
                                 [
                                     ((f32::from(point.x) - this.sidebar_offset()) * scale)
                                         .clamp(0.0, this.project.viewport.width_px as f32),
-                                    (f32::from(point.y) * scale)
+                                    ((f32::from(point.y)) * scale)
                                         .clamp(0.0, this.project.viewport.height_px as f32),
                                 ]
                             };
@@ -774,7 +767,7 @@ impl Render for RgisWebApp {
                     let cursor = [
                         ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
                             .clamp(0.0, this.project.viewport.width_px as f32),
-                        (f32::from(event.position.y) * scale)
+                        ((f32::from(event.position.y)) * scale)
                             .clamp(0.0, this.project.viewport.height_px as f32),
                     ];
                     let world = this.project.viewport.screen_to_world(cursor);
@@ -797,7 +790,7 @@ impl Render for RgisWebApp {
                 let cursor = [
                     ((f32::from(event.position.x) - this.sidebar_offset()) * scale)
                         .clamp(0.0, this.project.viewport.width_px as f32),
-                    (f32::from(event.position.y) * scale)
+                    ((f32::from(event.position.y)) * scale)
                         .clamp(0.0, this.project.viewport.height_px as f32),
                 ];
                 this.project.viewport.zoom_toward(cursor, delta);
@@ -808,17 +801,9 @@ impl Render for RgisWebApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(cx.theme().tokens.background)
+            .bg(cx.theme().title_bar)
             .overflow_hidden()
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .when(self.sidebar_visible, |content| {
-                        content.child(ui::sidebar(self, window, cx))
-                    })
-                    .child(map),
-            )
+            .child(ui::workspace(self, map, window, cx))
             .child(ui::status_bar(self, cx))
     }
 }
@@ -845,7 +830,7 @@ pub fn run() {
         .with_assets(gpui::assets::Assets::new(asset_endpoint()))
         .run_embedded(|cx: &mut App| {
             gpui::init(cx);
-            gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
+            ui::init_theme(cx);
             cx.text_system()
                 .add_fonts(vec![Cow::Borrowed(include_bytes!(
                     "../assets/fonts/IBMPlexSans-Regular.ttf"

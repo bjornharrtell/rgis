@@ -16,11 +16,31 @@ use gpui::{
 };
 use rgis_core::{Color, DataSource, DataSourceId, Layer, LayerId, Project};
 
-const SIDEBAR_WIDTH: f32 = 280.0;
-const STATUS_HEIGHT: f32 = 28.0;
+pub const SIDEBAR_WIDTH: f32 = 280.0;
+pub const STATUS_HEIGHT: f32 = 28.0;
 
-const ICON_OPEN: &str = "M4 4h16v16H4zM8 4v4h8V4";
-const ICON_SAVE: &str = "M5 4h10l4 4v12H5zM8 4v5h7V4M8 20v-6h8v6";
+/// Left edge of the map inside the window content, in logical pixels.
+pub fn map_left(sidebar_visible: bool) -> f32 {
+    if sidebar_visible { SIDEBAR_WIDTH } else { 0.0 }
+}
+
+const THEME_JSON: &str = include_str!("../assets/zed-one-dark.json");
+const THEME_NAME: &str = "Zed One Dark";
+
+/// Applies the bundled Zed-style dark theme. Call after `gpui::init`.
+pub fn init_theme(cx: &mut App) {
+    use gpui::component::{Theme, ThemeMode, ThemeRegistry};
+    Theme::change(ThemeMode::Dark, None, cx);
+    let registry = ThemeRegistry::global_mut(cx);
+    if let Err(error) = registry.load_themes_from_str(THEME_JSON) {
+        log::warn!("failed to load theme: {error}");
+        return;
+    }
+    if let Some(config) = registry.themes().get(THEME_NAME).cloned() {
+        Theme::global_mut(cx).apply_config(&config);
+    }
+}
+
 const ICON_PLUS: &str = "M12 5v14M5 12h14";
 const ICON_SETTINGS: &str = "M4 6h10M18 6h2M4 12h2M10 12h10M4 18h12M20 18h0M14 4v4M8 10v4M16 16v4";
 const ICON_CLOSE: &str = "M6 6l12 12M18 6 6 18";
@@ -93,6 +113,23 @@ pub trait LayerUi: Sized + 'static {
     fn save_project(&mut self, window: &mut Window);
 }
 
+/// Lays out the sidebar and the map side by side, flat like Zed's panels.
+pub fn workspace<T: LayerUi>(
+    state: &T,
+    map: impl IntoElement,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> impl IntoElement {
+    let sidebar = state
+        .sidebar_visible()
+        .then(|| sidebar(state, window, cx).into_any_element());
+    h_flex()
+        .flex_1()
+        .min_h_0()
+        .children(sidebar)
+        .child(div().flex_1().h_full().child(map))
+}
+
 // ── Sidebar ──────────────────────────────────────────────────────────────
 
 pub fn sidebar<T: LayerUi>(
@@ -109,27 +146,6 @@ pub fn sidebar<T: LayerUi>(
     let background = theme.tokens.sidebar;
     let border = theme.tokens.sidebar_border;
     let foreground = theme.tokens.sidebar_foreground;
-
-    let toolbar = h_flex()
-        .w_full()
-        .p_2()
-        .gap_1()
-        .child(
-            Button::new("project-open")
-                .ghost()
-                .small()
-                .icon(icon(ICON_OPEN))
-                .label("Open")
-                .on_click(cx.listener(|this: &mut T, _, window, _| this.open_project(window))),
-        )
-        .child(
-            Button::new("project-save")
-                .ghost()
-                .small()
-                .icon(icon(ICON_SAVE))
-                .label("Save")
-                .on_click(cx.listener(|this: &mut T, _, window, _| this.save_project(window))),
-        );
 
     let tabs = div().w_full().px_2().pb_2().child(
         TabBar::new("sidebar-tabs")
@@ -160,8 +176,7 @@ pub fn sidebar<T: LayerUi>(
         .border_r_1()
         .border_color(border)
         .text_color(foreground)
-        .child(toolbar)
-        .child(tabs)
+        .child(tabs.pt_2())
         .child(body)
 }
 
@@ -367,7 +382,7 @@ fn data_source_summary(source: &DataSource) -> String {
 
 pub fn status_bar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElement {
     let theme = cx.theme();
-    let background = theme.tokens.sidebar;
+    let background = theme.title_bar;
     let border = theme.tokens.border;
     let muted = theme.muted_foreground;
     let visible = state.sidebar_visible();
@@ -375,71 +390,43 @@ pub fn status_bar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElemen
         .h(px(STATUS_HEIGHT))
         .flex_none()
         .items_center()
+        .gap_3()
+        .px_2()
+        .bg(background)
         .border_t_1()
         .border_color(border)
-        .bg(background)
         .text_xs()
         .text_color(muted)
         .child(
-            div()
-                .h_full()
-                .w(px(if visible { SIDEBAR_WIDTH } else { 36.0 }))
-                .flex()
-                .items_center()
-                .px_1()
-                .border_r_1()
-                .border_color(border)
-                .child(
-                    Button::new("sidebar-toggle")
-                        .ghost()
-                        .xsmall()
-                        .icon(icon(if visible {
-                            ICON_SIDEBAR
-                        } else {
-                            ICON_SIDEBAR_HIDDEN
-                        }))
-                        .tooltip("Toggle sidebar")
-                        .on_click(cx.listener(|this: &mut T, _, _, cx| {
-                            let visible = this.sidebar_visible();
-                            this.set_sidebar_visible(!visible);
-                            cx.notify();
-                        })),
-                ),
+            Button::new("sidebar-toggle")
+                .ghost()
+                .xsmall()
+                .icon(icon(if visible {
+                    ICON_SIDEBAR
+                } else {
+                    ICON_SIDEBAR_HIDDEN
+                }))
+                .tooltip("Toggle sidebar")
+                .on_click(cx.listener(|this: &mut T, _, _, cx| {
+                    let visible = this.sidebar_visible();
+                    this.set_sidebar_visible(!visible);
+                    cx.notify();
+                })),
         )
         .child(
             div()
-                .h_full()
                 .flex_1()
-                .px_3()
-                .flex()
-                .items_center()
+                .truncate()
                 .child(state.status_text().to_string()),
         )
+        .child(format!("zoom {:.2}", state.project().viewport.zoom))
         .child(
-            div()
-                .h_full()
-                .px_3()
-                .flex()
-                .items_center()
-                .border_l_1()
-                .border_color(border)
-                .child(format!("zoom {:.2}", state.project().viewport.zoom)),
-        )
-        .child(
-            div()
-                .h_full()
-                .min_w(px(150.0))
-                .px_3()
-                .flex()
-                .items_center()
-                .border_l_1()
-                .border_color(border)
-                .child(
-                    state
-                        .cursor_lonlat()
-                        .map(|(lon, lat)| format!("{lon:.5}, {lat:.5}"))
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
+            div().min_w(px(130.0)).child(
+                state
+                    .cursor_lonlat()
+                    .map(|(lon, lat)| format!("{lon:.5}, {lat:.5}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
         )
 }
 

@@ -18,6 +18,7 @@ rgis-io     = { path = "../rgis-io" }
 rgis-render = { path = "../rgis-render" }
 rgis-tiles  = { path = "../rgis-tiles" }
 smallvec    = "1"
+log         = "0.4"
 geo-types   = { workspace = true }
 
 wgpu        = { workspace = true }
