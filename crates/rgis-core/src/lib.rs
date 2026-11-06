@@ -196,6 +196,10 @@ pub struct Viewport {
     pub zoom: f64,
     pub width_px: u32,
     pub height_px: u32,
+    /// Extent, in project CRS units, that spans [`MAPLIBRE_TILE_SIZE`] pixels
+    /// at zoom 0. Web Mercator's full world width unless the project uses
+    /// another CRS (see [`crs_world_width`]).
+    pub world_width: f64,
 }
 
 /// Earth half-circumference in Web Mercator metres (EPSG:3857 extent).
@@ -217,9 +221,10 @@ pub const EARTH_HALF_CIRC: f64 = 20_037_508.342_789_244;
 pub const MAPLIBRE_TILE_SIZE: f64 = 512.0;
 
 impl Viewport {
-    /// Metres per pixel at the current zoom level (see [`MAPLIBRE_TILE_SIZE`]).
+    /// Project CRS units per pixel at the current zoom level (see
+    /// [`MAPLIBRE_TILE_SIZE`]).
     pub fn resolution(&self) -> f64 {
-        (2.0 * EARTH_HALF_CIRC) / (MAPLIBRE_TILE_SIZE * 2_f64.powf(self.zoom))
+        self.world_width / (MAPLIBRE_TILE_SIZE * 2_f64.powf(self.zoom))
     }
 
     /// Convert a Web Mercator coordinate to screen pixel position (top-left origin).
@@ -263,13 +268,14 @@ impl Viewport {
     /// the viewport. Safe to call with zero-size bounds (single point/line).
     pub fn fit_bounds(&mut self, bounds: &Bounds) {
         self.center = bounds.center();
-        let w = bounds.width().max(1.0);
-        let h = bounds.height().max(1.0);
+        let min_extent = self.world_width * 1e-9;
+        let w = bounds.width().max(min_extent);
+        let h = bounds.height().max(min_extent);
         let res_x = w / (self.width_px as f64 * 0.8);
         let res_y = h / (self.height_px as f64 * 0.8);
         let res = res_x.max(res_y);
         // zoom = log2( world_width / (tile_size_px * res) )
-        self.zoom = ((2.0 * EARTH_HALF_CIRC) / (MAPLIBRE_TILE_SIZE * res))
+        self.zoom = (self.world_width / (MAPLIBRE_TILE_SIZE * res))
             .log2()
             .clamp(0.0, 22.0);
     }
@@ -283,6 +289,7 @@ impl Default for Viewport {
             zoom: 2.0,
             width_px: 800,
             height_px: 600,
+            world_width: 2.0 * EARTH_HALF_CIRC,
         }
     }
 }
@@ -318,6 +325,72 @@ pub fn reproject_geometry_to_mercator(
     let from = proj4rs::Proj::from_epsg_code(epsg_code).map_err(|e| e.to_string())?;
     let to = proj4rs::Proj::from_epsg_code(3857).map_err(|e| e.to_string())?;
     proj4rs::transform::transform(&from, &to, &mut geometry).map_err(|e| e.to_string())?;
+    Ok(geometry)
+}
+
+/// EPSG code of Web Mercator, the CRS of the basemap and the default project CRS.
+pub const WEB_MERCATOR_EPSG: u16 = 3857;
+
+/// Basic facts about a coordinate reference system known to proj4rs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrsInfo {
+    pub epsg: u16,
+    /// True for lon/lat CRSs whose coordinates are degrees.
+    pub geographic: bool,
+    /// proj4 projection name, for example `utm` or `merc`.
+    pub projection: &'static str,
+}
+
+/// Looks up an EPSG code. Fails for codes proj4rs has no definition for.
+pub fn crs_info(epsg: u16) -> Result<CrsInfo, String> {
+    let proj = proj4rs::Proj::from_epsg_code(epsg)
+        .map_err(|_| format!("EPSG:{epsg} is not a known coordinate reference system"))?;
+    Ok(CrsInfo {
+        epsg,
+        geographic: proj.is_latlong(),
+        projection: proj.projname(),
+    })
+}
+
+/// Extent that spans one nominal world tile for the viewport's zoom scale:
+/// 360 degrees for geographic CRSs, Web Mercator's width otherwise.
+pub fn crs_world_width(info: &CrsInfo) -> f64 {
+    if info.geographic {
+        360.0
+    } else {
+        2.0 * EARTH_HALF_CIRC
+    }
+}
+
+/// Reproject a geometry between two EPSG CRSs. Geographic CRSs use degrees on
+/// both sides. Fails if any resulting coordinate is not finite, for example a
+/// point outside the target projection's domain.
+pub fn reproject_geometry(from: u16, to: u16, mut geometry: Geometry) -> Result<Geometry, String> {
+    use geo::{CoordsIter, MapCoordsInPlace};
+    if from == to {
+        return Ok(geometry);
+    }
+    let source = proj4rs::Proj::from_epsg_code(from).map_err(|e| e.to_string())?;
+    let target = proj4rs::Proj::from_epsg_code(to).map_err(|e| e.to_string())?;
+    if source.is_latlong() {
+        geometry.map_coords_in_place(|c| Coord {
+            x: c.x.to_radians(),
+            y: c.y.to_radians(),
+        });
+    }
+    proj4rs::transform::transform(&source, &target, &mut geometry).map_err(|e| e.to_string())?;
+    if target.is_latlong() {
+        geometry.map_coords_in_place(|c| Coord {
+            x: c.x.to_degrees(),
+            y: c.y.to_degrees(),
+        });
+    }
+    if geometry
+        .coords_iter()
+        .any(|c| !c.x.is_finite() || !c.y.is_finite())
+    {
+        return Err(format!("coordinates fall outside the domain of EPSG:{to}"));
+    }
     Ok(geometry)
 }
 
@@ -527,6 +600,19 @@ pub struct ProjectState {
     pub map: MapState,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub show_tiles: bool,
+    /// EPSG code of the project CRS; map and layer geometry use its units.
+    #[serde(default = "default_crs", skip_serializing_if = "is_default_crs")]
+    pub crs: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+fn default_crs() -> u16 {
+    WEB_MERCATOR_EPSG
+}
+
+fn is_default_crs(code: &u16) -> bool {
+    *code == WEB_MERCATOR_EPSG
 }
 
 impl Default for ProjectState {
@@ -536,6 +622,8 @@ impl Default for ProjectState {
             data_sources: Vec::new(),
             map: MapState::default(),
             show_tiles: true,
+            crs: WEB_MERCATOR_EPSG,
+            name: None,
         }
     }
 }
@@ -553,6 +641,7 @@ impl ProjectState {
     }
 
     pub fn validate(&self) -> Result<(), ProjectError> {
+        crs_info(self.crs).map_err(ProjectError::InvalidState)?;
         self.map.validate()?;
         let mut layer_ids = HashSet::with_capacity(self.layers.len());
         for layer in &self.layers {
@@ -593,6 +682,10 @@ pub struct Project {
     pub viewport: Viewport,
     /// Whether the OSM tile background is visible.
     pub show_tiles: bool,
+    /// EPSG code of the project CRS. Layer geometry and the viewport are in
+    /// its units; the basemap is only available in Web Mercator.
+    pub crs: u16,
+    pub name: Option<String>,
     next_id: u64,
 }
 
@@ -603,12 +696,80 @@ impl Default for Project {
             data_sources: Vec::new(),
             viewport: Viewport::default(),
             show_tiles: true,
+            crs: WEB_MERCATOR_EPSG,
+            name: None,
             next_id: 0,
         }
     }
 }
 
 impl Project {
+    /// Whether the project CRS is geographic (degrees). The viewport's world
+    /// width is 360 for those and Web Mercator's width otherwise.
+    pub fn is_geographic(&self) -> bool {
+        self.viewport.world_width <= 360.0
+    }
+
+    /// Whether the basemap is drawn: enabled and in its own CRS.
+    pub fn basemap_visible(&self) -> bool {
+        self.show_tiles && self.crs == WEB_MERCATOR_EPSG
+    }
+
+    /// Switches the project CRS, reprojecting every layer and the view. On
+    /// failure (unknown code, coordinates outside the new CRS's domain) the
+    /// project is left untouched.
+    pub fn set_crs(&mut self, epsg: u16) -> Result<(), String> {
+        if epsg == self.crs {
+            return Ok(());
+        }
+        let info = crs_info(epsg)?;
+        let from = self.crs;
+        let mut reprojected = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let features = layer
+                .features
+                .iter()
+                .map(|feature| {
+                    Ok(Feature {
+                        geometry: reproject_geometry(from, epsg, feature.geometry.clone())?,
+                        properties: feature.properties.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|error| format!("layer {}: {error}", layer.name))?;
+            reprojected.push(features);
+        }
+        let center = reproject_geometry(
+            from,
+            epsg,
+            Geometry::Point(geo_types::Point::new(
+                self.viewport.center.x,
+                self.viewport.center.y,
+            )),
+        );
+        for (layer, features) in self.layers.iter_mut().zip(reprojected) {
+            layer.set_features(features);
+        }
+        self.crs = epsg;
+        self.viewport.world_width = crs_world_width(&info);
+        let bounds = self
+            .layers
+            .iter()
+            .filter_map(|layer| layer.bounds)
+            .reduce(|left, right| left.union(&right));
+        if let Some(bounds) = bounds {
+            self.viewport.fit_bounds(&bounds);
+        } else if let Ok(Geometry::Point(point)) = center {
+            self.viewport.center = Coord {
+                x: point.x(),
+                y: point.y(),
+            };
+        } else {
+            self.viewport.center = Coord { x: 0.0, y: 0.0 };
+        }
+        Ok(())
+    }
+
     pub fn next_layer_id(&mut self) -> LayerId {
         let id = LayerId(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
@@ -654,6 +815,8 @@ impl Project {
             data_sources: self.data_sources.clone(),
             map: MapState::from_viewport(&self.viewport),
             show_tiles: self.show_tiles,
+            crs: self.crs,
+            name: self.name.clone(),
         }
     }
 
@@ -665,6 +828,8 @@ impl Project {
     /// and geometry whose layer source is unchanged.
     pub fn apply_state(&mut self, state: ProjectState) -> Result<(), ProjectError> {
         state.validate()?;
+        // Geometry loaded under another CRS can not be reused.
+        let same_crs = state.crs == self.crs;
         let mut existing_layers = std::mem::take(&mut self.layers);
         let mut layers = Vec::with_capacity(state.layers.len());
         for layer_state in &state.layers {
@@ -673,7 +838,7 @@ impl Project {
                 .position(|layer| layer.id == layer_state.id)
                 .map(|index| existing_layers.swap_remove(index));
             let layer = match existing {
-                Some(mut layer) if layer.source_path == layer_state.source_path => {
+                Some(mut layer) if same_crs && layer.source_path == layer_state.source_path => {
                     layer.apply_state(layer_state);
                     layer
                 }
@@ -683,6 +848,11 @@ impl Project {
         }
         self.layers = layers;
         self.data_sources = state.data_sources;
+        self.crs = state.crs;
+        self.name = state.name;
+        self.viewport.world_width = crs_info(state.crs)
+            .map(|info| crs_world_width(&info))
+            .map_err(ProjectError::InvalidState)?;
         state.map.apply_to_viewport(&mut self.viewport);
         self.show_tiles = state.show_tiles;
         self.rebuild_id_counter();
@@ -780,6 +950,7 @@ mod tests {
             zoom: 9.0,
             width_px: 768,
             height_px: 512,
+            ..Default::default()
         };
         // Captured from a live maplibre-gl-js `Map` with
         // `center: [12.7, 55.85], zoom: 9` and an empty style, via
@@ -837,6 +1008,7 @@ mod tests {
             zoom: 5.0,
             width_px: 800,
             height_px: 600,
+            ..Default::default()
         };
         let world = Coord {
             x: 100_000.0,
@@ -863,6 +1035,7 @@ mod tests {
             zoom: 5.0,
             width_px: 800,
             height_px: 600,
+            ..Default::default()
         };
         let cursor = [300.0_f32, 200.0_f32];
         let world_before = vp.screen_to_world(cursor);
@@ -1006,5 +1179,104 @@ mod tests {
         };
         let error = state.to_yaml().unwrap_err();
         assert!(error.to_string().contains("duplicate layer id"));
+    }
+
+    fn point_layer(project: &mut Project, x: f64, y: f64) {
+        let id = project.next_layer_id();
+        project.add_layer(Layer::new(
+            id,
+            "points",
+            vec![Feature {
+                geometry: Geometry::Point(geo_types::Point::new(x, y)),
+                properties: serde_json::Value::Null,
+            }],
+        ));
+    }
+
+    #[test]
+    fn crs_info_distinguishes_geographic_and_projected() {
+        assert!(crs_info(4326).unwrap().geographic);
+        assert!(!crs_info(3857).unwrap().geographic);
+        assert!(!crs_info(25832).unwrap().geographic);
+        assert!(crs_info(65000).is_err());
+    }
+
+    #[test]
+    fn reproject_between_geographic_and_mercator_matches_closed_form() {
+        let geometry = Geometry::Point(geo_types::Point::new(13.405, 52.52));
+        let Geometry::Point(point) = reproject_geometry(4326, 3857, geometry).unwrap() else {
+            panic!("expected a point");
+        };
+        let expected = lonlat_to_mercator(13.405, 52.52);
+        assert!((point.x() - expected.x).abs() < 1e-3);
+        assert!((point.y() - expected.y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn set_crs_reprojects_layers_and_view_and_round_trips() {
+        let mut project = Project::default();
+        let merc = lonlat_to_mercator(12.5, 55.7);
+        point_layer(&mut project, merc.x, merc.y);
+        project.set_crs(4326).unwrap();
+        assert_eq!(project.crs, 4326);
+        assert!(!project.basemap_visible());
+        assert_eq!(project.viewport.world_width, 360.0);
+        let Geometry::Point(point) = &project.layers[0].features[0].geometry else {
+            panic!("expected a point");
+        };
+        assert!((point.x() - 12.5).abs() < 1e-6 && (point.y() - 55.7).abs() < 1e-6);
+        project.set_crs(3857).unwrap();
+        assert!(project.basemap_visible());
+        let Geometry::Point(point) = &project.layers[0].features[0].geometry else {
+            panic!("expected a point");
+        };
+        assert!((point.x() - merc.x).abs() < 1e-3 && (point.y() - merc.y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn set_crs_failure_leaves_the_project_unchanged() {
+        let mut project = Project::default();
+        // Far outside any UTM zone's domain once converted: keep the project as is.
+        point_layer(&mut project, 0.0, 20_037_508.0);
+        let before = project.layers[0].features[0].geometry.clone();
+        assert!(project.set_crs(65000).is_err());
+        assert_eq!(project.crs, 3857);
+        assert_eq!(project.layers[0].features[0].geometry, before);
+    }
+
+    #[test]
+    fn project_state_round_trips_crs_and_name() {
+        let mut project = Project::default();
+        project.set_crs(25832).unwrap();
+        project.name = Some("Survey".to_string());
+        let yaml = project.to_yaml().unwrap();
+        assert!(yaml.contains("crs: 25832") && yaml.contains("name: Survey"));
+        let restored = Project::from_yaml(&yaml).unwrap();
+        assert_eq!(restored.crs, 25832);
+        assert_eq!(restored.name.as_deref(), Some("Survey"));
+        assert_eq!(restored.viewport.world_width, 2.0 * EARTH_HALF_CIRC);
+        // The default CRS is not written.
+        assert!(!Project::default().to_yaml().unwrap().contains("crs"));
+        assert!(ProjectState::from_yaml("layers: []\ncrs: 65000\n").is_err());
+    }
+
+    #[test]
+    fn fit_bounds_uses_the_geographic_world_width() {
+        let mut viewport = Viewport {
+            world_width: 360.0,
+            ..Default::default()
+        };
+        viewport.fit_bounds(&Bounds {
+            min_x: 10.0,
+            min_y: 50.0,
+            max_x: 14.0,
+            max_y: 54.0,
+        });
+        assert!((viewport.center.x - 12.0).abs() < 1e-9);
+        assert!(
+            viewport.zoom > 3.0 && viewport.zoom < 8.0,
+            "{}",
+            viewport.zoom
+        );
     }
 }

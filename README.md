@@ -13,7 +13,8 @@ A Rust GIS desktop application built on [GPUI](https://crates.io/crates/gpui-kit
 - Sidebar with separate **Layers** and **Data sources** sections; layer name, colours, stroke width and point radius are edited in a properties dialog
 - Data source panel for PostgreSQL and OGC WMS connection definitions
 - Open and save concise YAML project files with layer styles, data sources, and map position
-- Keep map state in Web Mercator while reporting cursor coordinates and scale in the status bar
+- Project CRS: pick any EPSG code proj4rs knows from the status bar (bottom right) or the project settings; layers and the view are reprojected, cursor coordinates follow the project CRS, and the basemap is available in EPSG:3857 only
+- Basic project settings (name, basemap, CRS) in **File → Project Settings…**
 
 ## Building on Ubuntu
 
@@ -111,8 +112,10 @@ layers:
       stroke_width: 1.5
       point_radius: 5.0
 map:
-  center: [0.0, 0.0]
+  center: [0.0, 0.0] # project CRS units
   zoom: 2.0
+crs: 25832 # EPSG code; omitted for the default, 3857
+name: Survey
 ```
 
 ## Project layout

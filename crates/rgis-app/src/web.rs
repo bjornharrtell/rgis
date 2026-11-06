@@ -16,9 +16,7 @@ use gpui::{
     App, Bounds, Context, MouseButton, Render, Window, WindowBounds, WindowOptions, div,
     prelude::*, px, rgb, size,
 };
-use rgis_core::{
-    Bounds as GeoBounds, Layer, Project, Viewport, lonlat_to_mercator, mercator_to_lonlat,
-};
+use rgis_core::{Bounds as GeoBounds, Layer, Project, Viewport, lonlat_to_mercator};
 use rgis_render::{
     MapCallback, MapRenderResources, StyleSheet, TileMesh, build_background_mesh, build_tile_mesh,
 };
@@ -179,8 +177,8 @@ impl LayerUi for RgisWebApp {
         self.status = status;
     }
 
-    fn cursor_lonlat(&self) -> Option<(f64, f64)> {
-        self.cursor_lonlat
+    fn cursor_coords(&self) -> Option<(f64, f64)> {
+        self.cursor_coords
     }
 
     fn add_layer(&mut self, _window: &mut Window) {}
@@ -373,7 +371,7 @@ pub struct RgisWebApp {
     status: String,
     sidebar_visible: bool,
     layer_ui_state: LayerUiState,
-    cursor_lonlat: Option<(f64, f64)>,
+    cursor_coords: Option<(f64, f64)>,
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
 }
 
@@ -418,7 +416,7 @@ impl RgisWebApp {
             status: "GPUI browser renderer".to_string(),
             sidebar_visible: true,
             layer_ui_state: LayerUiState::default(),
-            cursor_lonlat: None,
+            cursor_coords: None,
             bbox_zoom_start: None,
         }
     }
@@ -474,7 +472,7 @@ impl RgisWebApp {
         self.project.viewport.height_px = height.max(1.0) as u32;
 
         let mut basemap_tiles = Vec::new();
-        if self.project.show_tiles {
+        if self.project.basemap_visible() {
             let mut exact_tiles = Vec::new();
             let mut fallback_coords = HashSet::new();
             for coord in visible_tiles_for_zoom(&self.project.viewport, OPENFREEMAP_MAX_ZOOM) {
@@ -521,7 +519,7 @@ impl RgisWebApp {
             }
         }
 
-        let mut tiles = if self.project.show_tiles {
+        let mut tiles = if self.project.basemap_visible() {
             raster::collect_draws(
                 &self.style,
                 &self.project.viewport,
@@ -552,11 +550,7 @@ impl RgisWebApp {
             self.sprite_atlas.as_ref(),
         );
         tiles.extend(icons);
-        let background = if self.project.show_tiles {
-            build_background_mesh(&self.project.viewport, &self.style)
-        } else {
-            rgis_render::SceneMesh::default()
-        };
+        let background = build_background_mesh(&self.project.viewport, &self.style);
         MapCallback {
             background_index_count: background.indices.len() as u32,
             mesh: background,
@@ -632,7 +626,7 @@ impl RgisWebApp {
             hasher.finish()
         };
         let key = [
-            layers_key,
+            layers_key ^ u64::from(self.project.crs),
             viewport.center.x.to_bits(),
             viewport.center.y.to_bits(),
             viewport.zoom.to_bits(),
@@ -771,7 +765,7 @@ impl Render for RgisWebApp {
                             .clamp(0.0, this.project.viewport.height_px as f32),
                     ];
                     let world = this.project.viewport.screen_to_world(cursor);
-                    this.cursor_lonlat = Some(mercator_to_lonlat(world.x, world.y));
+                    this.cursor_coords = Some((world.x, world.y));
                     if this.dragging
                         && this.bbox_zoom_start.is_none()
                         && let Some(previous) = this.last_cursor.replace(event.position)

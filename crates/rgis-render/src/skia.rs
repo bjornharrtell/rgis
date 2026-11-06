@@ -224,6 +224,12 @@ fn layer_render_key(layers: &[Layer]) -> u64 {
         layer.visible.hash(&mut hasher);
         layer.z_order.hash(&mut hasher);
         layer.features.len().hash(&mut hasher);
+        // Reprojection keeps the feature count but moves the geometry.
+        if let Some(bounds) = layer.bounds {
+            for value in [bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y] {
+                value.to_bits().hash(&mut hasher);
+            }
+        }
         layer.style.fill.r.to_bits().hash(&mut hasher);
         layer.style.fill.g.to_bits().hash(&mut hasher);
         layer.style.fill.b.to_bits().hash(&mut hasher);
@@ -246,6 +252,7 @@ fn viewport_key(viewport: &Viewport) -> u64 {
     viewport.zoom.to_bits().hash(&mut hasher);
     viewport.width_px.hash(&mut hasher);
     viewport.height_px.hash(&mut hasher);
+    viewport.world_width.to_bits().hash(&mut hasher);
     hasher.finish()
 }
 

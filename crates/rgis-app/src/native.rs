@@ -17,10 +17,8 @@ use rgis_app::header;
 use rgis_app::labels;
 use rgis_app::raster;
 use rgis_app::ui::{self, LayerUi, LayerUiState};
-use rgis_core::{
-    Bounds as GeoBounds, Color, Layer, LayerId, Project, ProjectState, mercator_to_lonlat,
-};
-use rgis_render::{MapCallback, MapRenderResources, SceneMesh};
+use rgis_core::{Bounds as GeoBounds, Color, Layer, LayerId, Project, ProjectState};
+use rgis_render::{MapCallback, MapRenderResources};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
 const TITLEBAR_HEIGHT: f32 = 34.0;
@@ -45,14 +43,15 @@ struct PendingVectorRender {
 fn prepare_loaded_layer(
     loaded: rgis_io::LoadedLayer,
     file_name: &str,
+    crs: u16,
 ) -> Result<Option<rgis_io::LoadedLayer>, rgis_io::IoError> {
-    if let Some(epsg) = loaded.epsg {
+    if let Some(epsg) = loaded.epsg.filter(|epsg| *epsg != crs) {
         let result = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Warning)
             .set_title("Reproject layer?")
             .set_description(format!(
-                "\"{file_name}\" declares EPSG:{epsg}. Rgis renders layers in \
-                 Web Mercator (EPSG:3857). Transform this layer on the fly?"
+                "\"{file_name}\" declares EPSG:{epsg}. The project CRS is \
+                 EPSG:{crs}. Transform this layer on the fly?"
             ))
             .set_buttons(rfd::MessageButtons::YesNo)
             .show();
@@ -60,7 +59,7 @@ fn prepare_loaded_layer(
             return Ok(None);
         }
     }
-    loaded.into_web_mercator().map(Some)
+    loaded.into_crs(crs).map(Some)
 }
 
 fn load_project_file(path: PathBuf) -> Result<LoadedProject, String> {
@@ -85,13 +84,15 @@ fn load_project_file(path: PathBuf) -> Result<LoadedProject, String> {
         } else {
             base.join(source)
         };
-        let loaded = rgis_io::load_path(&source_path).map_err(|error| {
-            format!(
-                "failed to load layer {} from {}: {error}",
-                layer.name,
-                source_path.display()
-            )
-        })?;
+        let loaded = rgis_io::load_path_with_crs(&source_path)
+            .and_then(|loaded| loaded.into_crs(state.crs))
+            .map_err(|error| {
+                format!(
+                    "failed to load layer {} from {}: {error}",
+                    layer.name,
+                    source_path.display()
+                )
+            })?;
         layers.push((layer.id, source_path, loaded.features));
     }
     Ok(LoadedProject {
@@ -311,7 +312,7 @@ pub struct RgisNativeApp {
     pending_project_saves: Vec<Promise<Result<Option<PathBuf>, String>>>,
     status: String,
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
-    cursor_lonlat: Option<(f64, f64)>,
+    cursor_coords: Option<(f64, f64)>,
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
     dragging: bool,
     sidebar_visible: bool,
@@ -345,7 +346,7 @@ impl RgisNativeApp {
                     .unwrap_or("layer")
                     .to_string();
                 match rgis_io::load_path_with_crs(path) {
-                    Ok(loaded) => match prepare_loaded_layer(loaded, &name) {
+                    Ok(loaded) => match prepare_loaded_layer(loaded, &name, project.crs) {
                         Ok(Some(loaded)) => {
                             let id = project.next_layer_id();
                             let mut layer = Layer::new(id, loaded.name, loaded.features);
@@ -390,7 +391,7 @@ impl RgisNativeApp {
             pending_project_saves: Vec::new(),
             status: "GPUI native renderer".to_string(),
             last_cursor: None,
-            cursor_lonlat: None,
+            cursor_coords: None,
             bbox_zoom_start: None,
             dragging: false,
             sidebar_visible: true,
@@ -566,26 +567,30 @@ impl RgisNativeApp {
                             .unwrap_or("layer")
                             .to_string();
                         match result {
-                            Ok(loaded) => match prepare_loaded_layer(loaded, &name) {
-                                Ok(Some(loaded)) => {
-                                    let id = self.project.next_layer_id();
-                                    let mut layer = Layer::new(id, loaded.name, loaded.features);
-                                    layer.source_path = Some(path);
-                                    if self.project.layers.is_empty()
-                                        && let Some(bounds) = layer.bounds
-                                    {
-                                        self.project.viewport.fit_bounds(&bounds);
+                            Ok(loaded) => {
+                                match prepare_loaded_layer(loaded, &name, self.project.crs) {
+                                    Ok(Some(loaded)) => {
+                                        let id = self.project.next_layer_id();
+                                        let mut layer =
+                                            Layer::new(id, loaded.name, loaded.features);
+                                        layer.source_path = Some(path);
+                                        if self.project.layers.is_empty()
+                                            && let Some(bounds) = layer.bounds
+                                        {
+                                            self.project.viewport.fit_bounds(&bounds);
+                                        }
+                                        self.project.add_layer(layer);
+                                        self.status = format!("Loaded {name}");
                                     }
-                                    self.project.add_layer(layer);
-                                    self.status = format!("Loaded {name}");
+                                    Ok(None) => {
+                                        self.status =
+                                            format!("Skipped {name}: reprojection declined");
+                                    }
+                                    Err(error) => {
+                                        self.status = format!("Failed to load {name}: {error}");
+                                    }
                                 }
-                                Ok(None) => {
-                                    self.status = format!("Skipped {name}: reprojection declined");
-                                }
-                                Err(error) => {
-                                    self.status = format!("Failed to load {name}: {error}");
-                                }
-                            },
+                            }
                             Err(error) => {
                                 self.status = format!("Failed to load {name}: {error}");
                             }
@@ -722,7 +727,7 @@ impl RgisNativeApp {
         self.project.viewport.height_px = height.max(1.0) as u32;
         self.ensure_vector_render();
         let mut basemap_tiles = Vec::new();
-        if self.project.show_tiles {
+        if self.project.basemap_visible() {
             let mut exact_tiles = Vec::new();
             let mut fallback_coords = std::collections::HashSet::new();
             for coord in visible_tiles_for_zoom(&self.project.viewport, OPENFREEMAP_MAX_ZOOM) {
@@ -773,7 +778,7 @@ impl RgisNativeApp {
             &self.project.viewport,
             true,
         );
-        let mut tiles = if self.project.show_tiles {
+        let mut tiles = if self.project.basemap_visible() {
             raster::collect_draws(
                 &self.style,
                 &self.project.viewport,
@@ -800,11 +805,8 @@ impl RgisNativeApp {
             self.sprite_atlas.as_ref(),
         );
         tiles.extend(icons);
-        let mesh = if self.project.show_tiles {
-            rgis_render::build_background_mesh(&self.project.viewport, &self.style)
-        } else {
-            SceneMesh::default()
-        };
+        // The style's background colour also paints the map without a basemap.
+        let mesh = rgis_render::build_background_mesh(&self.project.viewport, &self.style);
         MapCallback {
             background_index_count: mesh.indices.len() as u32,
             mesh,
@@ -916,8 +918,8 @@ impl LayerUi for RgisNativeApp {
         self.status = status;
     }
 
-    fn cursor_lonlat(&self) -> Option<(f64, f64)> {
-        self.cursor_lonlat
+    fn cursor_coords(&self) -> Option<(f64, f64)> {
+        self.cursor_coords
     }
 
     fn add_layer(&mut self, window: &mut Window) {
@@ -930,6 +932,10 @@ impl LayerUi for RgisNativeApp {
 
     fn save_project(&mut self, window: &mut Window) {
         self.queue_save_project(window);
+    }
+
+    fn crs_changed(&mut self) {
+        self.cancel_vector_render();
     }
 }
 
@@ -1013,7 +1019,7 @@ impl Render for RgisNativeApp {
                             .clamp(0.0, this.project.viewport.height_px as f32),
                     ];
                     let world = this.project.viewport.screen_to_world(cursor);
-                    this.cursor_lonlat = Some(mercator_to_lonlat(world.x, world.y));
+                    this.cursor_coords = Some((world.x, world.y));
                     if this.dragging
                         && this.bbox_zoom_start.is_none()
                         && let Some(previous) = this.last_cursor.replace(event.position)
@@ -1077,7 +1083,14 @@ impl Render for RgisNativeApp {
             .bg(cx.theme().title_bar)
             .overflow_hidden();
         if has_client_titlebar {
-            root = root.child(header::app_header(window, cx));
+            root = root.child(header::app_header(
+                window,
+                cx,
+                self.project
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "rgis".to_string()),
+            ));
         }
         root = root
             .child(ui::workspace(self, map, window, cx))

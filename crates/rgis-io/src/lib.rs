@@ -44,6 +44,29 @@ impl LoadedLayer {
         self.epsg = None;
         Ok(self)
     }
+
+    /// Transform the layer into the project CRS `target`. Layers without a
+    /// detected CRS are taken as WGS-84 lon/lat.
+    pub fn into_crs(mut self, target: u16) -> Result<Self, IoError> {
+        if target == rgis_core::WEB_MERCATOR_EPSG {
+            return self.into_web_mercator();
+        }
+        let from = self.epsg.unwrap_or(4326);
+        self.features = self
+            .features
+            .into_iter()
+            .map(|feature| {
+                let geometry = rgis_core::reproject_geometry(from, target, feature.geometry)
+                    .map_err(IoError::Projection)?;
+                Ok(Feature {
+                    geometry,
+                    properties: feature.properties,
+                })
+            })
+            .collect::<Result<Vec<_>, IoError>>()?;
+        self.epsg = None;
+        Ok(self)
+    }
 }
 
 /// Load a layer from a file path, dispatching on file extension. Native-only:
@@ -195,5 +218,18 @@ mod tests {
             Some(25832)
         );
         assert_eq!(normalize_epsg(Some(4326)), None);
+    }
+
+    #[test]
+    fn into_crs_reprojects_wgs84_to_a_projected_crs() {
+        let geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[10.0,56.0]},"properties":{}}]}"#;
+        let loaded = load_bytes_with_crs("p.geojson", geojson.as_bytes()).unwrap();
+        let loaded = loaded.into_crs(25832).unwrap();
+        let geo_types::Geometry::Point(point) = &loaded.features[0].geometry else {
+            panic!("expected a point");
+        };
+        // 10°E, 56°N in UTM zone 32N (central meridian 9°E).
+        assert!((point.x() - 580_000.0).abs() < 20_000.0, "{}", point.x());
+        assert!((point.y() - 6_207_000.0).abs() < 20_000.0, "{}", point.y());
     }
 }

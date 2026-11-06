@@ -13,7 +13,7 @@ use gpui::{
     WeakEntity, Window, div, px,
 };
 
-use crate::ui::{LayerUi, SidebarTab, open_data_source_dialog};
+use crate::ui::{LayerUi, SidebarTab, open_data_source_dialog, open_project_settings_dialog};
 
 const ICON_MENU: &str = "M4 6h16M4 12h16M4 18h16";
 
@@ -30,6 +30,7 @@ const MENU_NAMES: [&str; 2] = ["File", "View"];
 enum Cmd {
     OpenProject,
     SaveProject,
+    ProjectSettings,
     AddLayer,
     AddDataSource,
     Quit,
@@ -46,6 +47,7 @@ fn menu_items(index: usize) -> Vec<Option<(&'static str, Cmd)>> {
         0 => vec![
             Some(("Open Project…", Cmd::OpenProject)),
             Some(("Save Project", Cmd::SaveProject)),
+            Some(("Project Settings…", Cmd::ProjectSettings)),
             None,
             Some(("Add Layer…", Cmd::AddLayer)),
             Some(("Add Data Source…", Cmd::AddDataSource)),
@@ -68,6 +70,7 @@ fn run_command<T: LayerUi>(command: Cmd, app: &mut T, window: &mut Window, cx: &
     match command {
         Cmd::OpenProject => app.open_project(window),
         Cmd::SaveProject => app.save_project(window),
+        Cmd::ProjectSettings => open_project_settings_dialog(app, window, cx),
         Cmd::AddLayer => app.add_layer(window),
         Cmd::AddDataSource => {
             app.set_sidebar_visible(true);
@@ -109,6 +112,7 @@ fn run_command<T: LayerUi>(command: Cmd, app: &mut T, window: &mut Window, cx: &
 
 pub struct AppHeader<T: LayerUi> {
     app: WeakEntity<T>,
+    title: String,
     /// The menu currently open. While one is open the hamburger is replaced by
     /// the full menu bar.
     open: Option<usize>,
@@ -120,6 +124,7 @@ impl<T: LayerUi> AppHeader<T> {
     fn new(app: WeakEntity<T>) -> Self {
         Self {
             app,
+            title: String::new(),
             open: None,
             popup: None,
             _popup_subscription: None,
@@ -221,6 +226,7 @@ impl<T: LayerUi> Render for AppHeader<T> {
         let background = theme.title_bar;
         let muted = theme.muted_foreground;
         let expanded = self.open.is_some();
+        let title = self.title.clone();
 
         let menu = if expanded {
             h_flex()
@@ -253,14 +259,25 @@ impl<T: LayerUi> Render for AppHeader<T> {
                     .child(menu)
                     // Like Zed, the project label gives way to the expanded menu bar.
                     .when(!expanded, |this| {
-                        this.child(div().text_sm().text_color(muted).child("rgis"))
+                        this.child(div().text_sm().text_color(muted).child(title))
                     }),
             )
     }
 }
 
 /// The header entity for the current window. Create it from the app's render.
-pub fn app_header<T: LayerUi>(window: &mut Window, cx: &mut Context<T>) -> Entity<AppHeader<T>> {
+pub fn app_header<T: LayerUi>(
+    window: &mut Window,
+    cx: &mut Context<T>,
+    title: String,
+) -> Entity<AppHeader<T>> {
     let app = cx.entity().downgrade();
-    window.use_keyed_state("app-header", cx, move |_, _| AppHeader::new(app))
+    let header = window.use_keyed_state("app-header", cx, move |_, _| AppHeader::new(app));
+    header.update(cx, |header, cx| {
+        if header.title != title {
+            header.title = title;
+            cx.notify();
+        }
+    });
+    header
 }

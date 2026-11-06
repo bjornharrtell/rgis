@@ -6,13 +6,16 @@ use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::checkbox::Checkbox;
 use gpui::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui::component::input::{Input, InputEvent, InputState};
+use gpui::component::popover::Popover;
 use gpui::component::slider::{Slider, SliderEvent, SliderState};
 use gpui::component::switch::Switch;
 use gpui::component::tab::{Tab, TabBar};
-use gpui::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui::{
-    App, Context, Entity, Hsla, IntoElement, Render, Rgba, Subscription, WeakEntity, Window, div,
-    prelude::*, px,
+    Anchor, App, Context, Entity, EventEmitter, Hsla, IntoElement, Render, Rgba, Subscription,
+    WeakEntity, Window, div, prelude::*, px,
 };
 use rgis_core::{Color, DataSource, DataSourceId, Layer, LayerId, Project};
 
@@ -80,6 +83,7 @@ pub enum SidebarTab {
 #[derive(Clone, Copy, Default)]
 pub struct LayerUiState {
     tab: SidebarTab,
+    crs_open: bool,
 }
 
 impl LayerUiState {
@@ -89,6 +93,15 @@ impl LayerUiState {
 
     pub fn set_tab(&mut self, tab: SidebarTab) {
         self.tab = tab;
+    }
+
+    /// Whether the status bar's quick CRS popover is open.
+    pub fn crs_open(&self) -> bool {
+        self.crs_open
+    }
+
+    pub fn set_crs_open(&mut self, open: bool) {
+        self.crs_open = open;
     }
 }
 
@@ -107,10 +120,59 @@ pub trait LayerUi: Sized + 'static {
     fn set_sidebar_visible(&mut self, visible: bool);
     fn status_text(&self) -> &str;
     fn set_status(&mut self, status: String);
-    fn cursor_lonlat(&self) -> Option<(f64, f64)>;
+    /// Cursor position over the map in project CRS units.
+    fn cursor_coords(&self) -> Option<(f64, f64)>;
     fn add_layer(&mut self, window: &mut Window);
     fn open_project(&mut self, window: &mut Window);
     fn save_project(&mut self, window: &mut Window);
+
+    /// Called after the project CRS changed so cached renders can be dropped.
+    fn crs_changed(&mut self) {}
+
+    /// Switches the project CRS, reprojecting layers and the view.
+    fn set_project_crs(&mut self, epsg: u16) -> Result<(), String> {
+        self.project_mut().set_crs(epsg)?;
+        self.crs_changed();
+        self.set_status(format!("Project CRS set to EPSG:{epsg}"));
+        Ok(())
+    }
+}
+
+/// Common CRSs offered in the quick picker. Any other EPSG code proj4rs knows
+/// can be typed in.
+const CRS_PRESETS: &[(u16, &str)] = &[
+    (3857, "WGS 84 / Pseudo-Mercator"),
+    (4326, "WGS 84"),
+    (4258, "ETRS89"),
+    (25832, "ETRS89 / UTM zone 32N"),
+    (25833, "ETRS89 / UTM zone 33N"),
+    (3006, "SWEREF99 TM"),
+    (3067, "ETRS89 / TM35FIN"),
+    (3035, "ETRS89 / LAEA Europe"),
+    (2154, "RGF93 v1 / Lambert-93"),
+    (27700, "OSGB36 / British National Grid"),
+    (2056, "CH1903+ / LV95"),
+    (32632, "WGS 84 / UTM zone 32N"),
+    (32633, "WGS 84 / UTM zone 33N"),
+    (5070, "NAD83 / Conus Albers"),
+];
+
+/// A short human label for a CRS, for example `WGS 84` for 4326.
+pub fn crs_name(epsg: u16) -> String {
+    CRS_PRESETS
+        .iter()
+        .find(|(code, _)| *code == epsg)
+        .map_or_else(|| format!("EPSG:{epsg}"), |(_, name)| (*name).to_string())
+}
+
+/// Formats a map position in project CRS units: degrees for geographic CRSs,
+/// metres (or the CRS's unit) otherwise.
+pub fn format_coords(geographic: bool, x: f64, y: f64) -> String {
+    if geographic {
+        format!("{x:.5}, {y:.5}")
+    } else {
+        format!("{x:.2}, {y:.2}")
+    }
 }
 
 /// Lays out the sidebar and the map side by side, flat like Zed's panels.
@@ -225,6 +287,7 @@ fn layers_section<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElemen
         );
     }
     let show_tiles = state.project().show_tiles;
+    let basemap_available = state.project().crs == rgis_core::WEB_MERCATOR_EPSG;
     let basemap = h_flex()
         .w_full()
         .px_3()
@@ -232,10 +295,21 @@ fn layers_section<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElemen
         .mt_2()
         .gap_2()
         .items_center()
-        .child(div().flex_1().text_sm().child("OpenFreeMap basemap"))
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .when(!basemap_available, |this| this.text_color(muted))
+                .child(if basemap_available {
+                    "OpenFreeMap basemap"
+                } else {
+                    "Basemap needs EPSG:3857"
+                }),
+        )
         .child(
             Switch::new("basemap-visible")
-                .checked(show_tiles)
+                .checked(show_tiles && basemap_available)
+                .disabled(!basemap_available)
                 .on_click(cx.listener(|this: &mut T, checked: &bool, _, cx| {
                     this.project_mut().show_tiles = *checked;
                     cx.notify();
@@ -423,11 +497,205 @@ pub fn status_bar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElemen
         .child(
             div().min_w(px(130.0)).child(
                 state
-                    .cursor_lonlat()
-                    .map(|(lon, lat)| format!("{lon:.5}, {lat:.5}"))
+                    .cursor_coords()
+                    .map(|(x, y)| format_coords(state.project().is_geographic(), x, y))
                     .unwrap_or_else(|| "-".to_string()),
             ),
         )
+        .child(crs_chip(state, cx))
+}
+
+/// The status bar's CRS button; opens a popover for quick CRS changes.
+fn crs_chip<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElement {
+    let crs = state.project().crs;
+    let open = state.layer_ui_state().crs_open();
+    let app = cx.entity().downgrade();
+    let content_app = app.clone();
+    Popover::new("crs-popover")
+        .anchor(Anchor::BottomRight)
+        .open(open)
+        .on_open_change(move |open, _, cx| {
+            let open = *open;
+            let _ = app.update(cx, |this, cx| {
+                this.layer_ui_state_mut().set_crs_open(open);
+                cx.notify();
+            });
+        })
+        .trigger(
+            Button::new("crs-chip")
+                .ghost()
+                .xsmall()
+                .label(format!("EPSG:{crs}"))
+                .tooltip(format!("Project CRS: {}", crs_name(crs))),
+        )
+        .content(move |_, window, cx| {
+            let app = content_app.clone();
+            let picker = window.use_keyed_state("crs-picker", cx, move |window, cx| {
+                CrsPicker::new(app, true, window, cx)
+            });
+            picker.update(cx, |picker, _| picker.current = crs);
+            picker
+        })
+}
+
+// ── CRS picker ───────────────────────────────────────────────────────────
+
+/// Emitted by [`CrsPicker`] after it switched the project CRS.
+pub struct CrsChanged(pub u16);
+
+/// Presets and a free EPSG field. Used in the status bar popover and the
+/// project settings dialog.
+pub struct CrsPicker<T: LayerUi> {
+    app: WeakEntity<T>,
+    input: Entity<InputState>,
+    error: Option<String>,
+    /// The project's current CRS, refreshed by whoever shows the picker.
+    pub current: u16,
+    /// Close the status bar popover after a change.
+    close_popover: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl<T: LayerUi> EventEmitter<CrsChanged> for CrsPicker<T> {}
+
+impl<T: LayerUi> CrsPicker<T> {
+    fn new(
+        app: WeakEntity<T>,
+        close_popover: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("EPSG code or name"));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, _, cx| match event {
+                InputEvent::PressEnter { .. } => this.apply_typed(cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            },
+        );
+        Self {
+            app,
+            input,
+            error: None,
+            current: rgis_core::WEB_MERCATOR_EPSG,
+            close_popover,
+            _subscriptions: vec![subscription],
+        }
+    }
+
+    fn apply_typed(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).value().trim().to_uppercase();
+        let digits = text.strip_prefix("EPSG:").unwrap_or(&text).trim();
+        match digits.parse::<u16>() {
+            Ok(code) => self.apply(code, cx),
+            Err(_) => {
+                self.error = Some("Enter an EPSG code, for example 25832".to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn apply(&mut self, epsg: u16, cx: &mut Context<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let close = self.close_popover;
+        let result = app.update(cx, |app, cx| {
+            let result = app.set_project_crs(epsg);
+            if result.is_ok() && close {
+                app.layer_ui_state_mut().set_crs_open(false);
+            }
+            cx.notify();
+            result
+        });
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.current = epsg;
+                self.input.update(cx, |_, _| {});
+                cx.emit(CrsChanged(epsg));
+            }
+            Err(error) => self.error = Some(error),
+        }
+        cx.notify();
+    }
+}
+
+impl<T: LayerUi> Render for CrsPicker<T> {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let hover = theme.tokens.sidebar_accent;
+        let filter = self.input.read(cx).value().trim().to_lowercase();
+        let current = self.current;
+        let rows: Vec<_> = CRS_PRESETS
+            .iter()
+            .filter(|(code, name)| {
+                filter.is_empty()
+                    || code.to_string().contains(&filter)
+                    || name.to_lowercase().contains(&filter)
+            })
+            .map(|(code, name)| {
+                let code = *code;
+                h_flex()
+                    .id(("crs-preset", u64::from(code)))
+                    .w_full()
+                    .h(px(28.0))
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .hover(move |style| style.bg(hover))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .child(if code == current { "✓" } else { "" }),
+                    )
+                    .child(div().w(px(52.0)).text_sm().child(code.to_string()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(*name),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.apply(code, cx)))
+            })
+            .collect();
+        v_flex()
+            .w(px(320.0))
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(Input::new(&self.input)))
+                    .child(
+                        Button::new("crs-apply")
+                            .small()
+                            .primary()
+                            .label("Set")
+                            .on_click(cx.listener(|this, _, _, cx| this.apply_typed(cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("crs-list")
+                    .max_h(px(240.0))
+                    .overflow_y_scroll()
+                    .gap_0p5()
+                    .children(rows),
+            )
+            .children(
+                self.error
+                    .clone()
+                    .map(|error| div().text_sm().text_color(danger).child(error)),
+            )
+    }
 }
 
 // ── Layer properties dialog ──────────────────────────────────────────────
@@ -701,6 +969,132 @@ impl<T: LayerUi> Render for LayerProperties<T> {
     }
 }
 
+// ── Project settings dialog ──────────────────────────────────────────────
+
+/// Opens the project settings (name, basemap, CRS). Call it from an event
+/// handler of the app, like [`open_layer_dialog`].
+pub fn open_project_settings_dialog<T: LayerUi>(app: &T, window: &mut Window, cx: &mut Context<T>) {
+    let name = app.project().name.clone().unwrap_or_default();
+    let (show_tiles, crs) = (app.project().show_tiles, app.project().crs);
+    let weak = cx.entity().downgrade();
+    let view = cx.new(|cx| ProjectSettings::new(weak, name, show_tiles, crs, window, cx));
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog
+            .title("Project settings")
+            .w(px(420.0))
+            .child(view.clone())
+    });
+}
+
+struct ProjectSettings<T: LayerUi> {
+    app: WeakEntity<T>,
+    name: Entity<InputState>,
+    picker: Entity<CrsPicker<T>>,
+    show_tiles: bool,
+    crs: u16,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl<T: LayerUi> ProjectSettings<T> {
+    fn new(
+        app: WeakEntity<T>,
+        name: String,
+        show_tiles: bool,
+        crs: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Untitled")
+                .default_value(name)
+        });
+        let picker = {
+            let app = app.clone();
+            cx.new(|cx| {
+                let mut picker = CrsPicker::new(app, false, window, cx);
+                picker.current = crs;
+                picker
+            })
+        };
+        let name_subscription = cx.subscribe_in(
+            &name_input,
+            window,
+            |this: &mut Self, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let name = input.read(cx).value().trim().to_string();
+                    let _ = this.app.update(cx, |app, cx| {
+                        app.project_mut().name = (!name.is_empty()).then_some(name);
+                        cx.notify();
+                    });
+                }
+            },
+        );
+        let crs_subscription =
+            cx.subscribe(&picker, |this: &mut Self, _, event: &CrsChanged, cx| {
+                this.crs = event.0;
+                cx.notify();
+            });
+        Self {
+            app,
+            name: name_input,
+            picker,
+            show_tiles,
+            crs,
+            _subscriptions: vec![name_subscription, crs_subscription],
+        }
+    }
+}
+
+impl<T: LayerUi> Render for ProjectSettings<T> {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let basemap_available = self.crs == rgis_core::WEB_MERCATOR_EPSG;
+        v_flex()
+            .w_full()
+            .gap_4()
+            .child(labelled("Name", muted, Input::new(&self.name)))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .child(div().text_sm().child("Show basemap"))
+                            .when(!basemap_available, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("The basemap is only available in EPSG:3857"),
+                                )
+                            }),
+                    )
+                    .child(
+                        Switch::new("settings-basemap")
+                            .checked(self.show_tiles && basemap_available)
+                            .disabled(!basemap_available)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.show_tiles = *checked;
+                                let show = *checked;
+                                let _ = this.app.update(cx, |app, cx| {
+                                    app.project_mut().show_tiles = show;
+                                    cx.notify();
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(labelled(
+                "Coordinate reference system",
+                muted,
+                self.picker.clone(),
+            ))
+    }
+}
+
 // ── Data source dialog ───────────────────────────────────────────────────
 
 pub fn open_data_source_dialog<T: LayerUi>(app: WeakEntity<T>, window: &mut Window, cx: &mut App) {
@@ -901,5 +1295,28 @@ impl<T: LayerUi> Render for DataSourceForm<T> {
                             })),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_preset_is_a_known_crs() {
+        for (code, name) in CRS_PRESETS {
+            assert!(rgis_core::crs_info(*code).is_ok(), "EPSG:{code} {name}");
+        }
+    }
+
+    #[test]
+    fn crs_names_and_coordinate_formats() {
+        assert_eq!(crs_name(4326), "WGS 84");
+        assert_eq!(crs_name(31467), "EPSG:31467");
+        assert_eq!(format_coords(true, 12.5, 55.7), "12.50000, 55.70000");
+        assert_eq!(
+            format_coords(false, 580000.456, 6207000.0),
+            "580000.46, 6207000.00"
+        );
     }
 }

@@ -407,6 +407,7 @@ fn renders_match_maplibre_gl_js_within_loose_tolerance() {
             zoom: spec.zoom,
             width_px: spec.width,
             height_px: spec.height,
+            ..Default::default()
         };
         let callback = build_frame(&style, &viewport);
         let actual = render_offscreen(&device, &queue, &callback, spec.width, spec.height);
