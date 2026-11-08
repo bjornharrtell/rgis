@@ -27,10 +27,10 @@ pub fn map_left(sidebar_visible: bool) -> f32 {
     if sidebar_visible { SIDEBAR_WIDTH } else { 0.0 }
 }
 
-const THEME_JSON: &str = include_str!("../assets/zed-one-dark.json");
-const THEME_NAME: &str = "Zed One Dark";
+const THEME_JSON: &str = include_str!("../assets/catppuccin-mocha.json");
+const THEME_NAME: &str = "Catppuccin Mocha";
 
-/// Applies the bundled Zed-style dark theme. Call after `gpui::init`.
+/// Applies the bundled Catppuccin Mocha theme. Call after `gpui::init`.
 pub fn init_theme(cx: &mut App) {
     use gpui::component::{Theme, ThemeMode, ThemeRegistry};
     Theme::change(ThemeMode::Dark, None, cx);
@@ -456,8 +456,9 @@ fn data_source_summary(source: &DataSource) -> String {
 
 pub fn status_bar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElement {
     let theme = cx.theme();
-    let background = theme.title_bar;
-    let border = theme.tokens.border;
+    // Darker than the header and the sidebar.
+    let background = theme.status_bar;
+    let border = theme.status_bar_border;
     let muted = theme.muted_foreground;
     let visible = state.sidebar_visible();
     h_flex()
@@ -1301,6 +1302,13 @@ impl<T: LayerUi> Render for DataSourceForm<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_theme_parses() {
+        let set: gpui::component::ThemeSet =
+            serde_json::from_str(THEME_JSON).expect("theme JSON parses");
+        assert!(set.themes.iter().any(|theme| theme.name == THEME_NAME));
+    }
 
     #[test]
     fn every_preset_is_a_known_crs() {

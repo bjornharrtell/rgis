@@ -5759,6 +5759,7 @@ dependencies = [
  "rgis-io",
  "rgis-render",
  "rgis-tiles",
+ "serde_json",
  "smallvec",
  "wasm-bindgen",
  "wasm-bindgen-futures",
