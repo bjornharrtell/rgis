@@ -82,7 +82,7 @@
         "table.head.foreground": "#525252",
         "table.row.border": "#262626b3",
         "title_bar.background": "#181825",
-        "title_bar.border": "#181825",
+        "title_bar.border": "#313244",
         "status_bar.background": "#11111b",
         "status_bar.border": "#313244",
         "warning.background": "#f9e2af",
@@ -215,7 +215,8 @@
       "font.size": 14,
       "font.family": "IBM Plex Sans",
       "radius": 6,
-      "radius.lg": 10
+      "radius.lg": 10,
+      "window.radius": 10
     }
   ]
 }

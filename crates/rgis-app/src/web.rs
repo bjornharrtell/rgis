@@ -798,7 +798,7 @@ impl Render for RgisWebApp {
             .bg(cx.theme().title_bar)
             .overflow_hidden()
             .child(ui::workspace(self, map, window, cx))
-            .child(ui::status_bar(self, cx))
+            .child(ui::status_bar(self, window, cx))
     }
 }
 

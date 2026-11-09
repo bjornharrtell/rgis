@@ -21,7 +21,7 @@ use rgis_core::{Bounds as GeoBounds, Color, Layer, LayerId, Project, ProjectStat
 use rgis_render::{MapCallback, MapRenderResources};
 use rgis_tiles::{OPENFREEMAP_MAX_ZOOM, TileCoord, VectorTileFetcher, visible_tiles_for_zoom};
 
-const TITLEBAR_HEIGHT: f32 = 34.0;
+const TITLEBAR_HEIGHT: f32 = ui::HEADER_HEIGHT;
 const TILE_CACHE_SIZE: usize = 256;
 const DEFAULT_STYLE_JSON: &str = include_str!("../../rgis-style/fixtures/liberty.json");
 
@@ -1076,11 +1076,16 @@ impl Render for RgisNativeApp {
         } else {
             map.child("GPU unavailable")
         };
+        let radii = gpui::component::window_corner_radii(window, cx);
         let mut root = div()
             .size_full()
             .flex()
             .flex_col()
             .bg(cx.theme().title_bar)
+            .rounded_tl(radii.top_left)
+            .rounded_tr(radii.top_right)
+            .rounded_bl(radii.bottom_left)
+            .rounded_br(radii.bottom_right)
             .overflow_hidden();
         if has_client_titlebar {
             root = root.child(header::app_header(
@@ -1094,7 +1099,7 @@ impl Render for RgisNativeApp {
         }
         root = root
             .child(ui::workspace(self, map, window, cx))
-            .child(ui::status_bar(self, cx));
+            .child(ui::status_bar(self, window, cx));
         root
     }
 }

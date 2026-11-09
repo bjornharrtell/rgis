@@ -13,7 +13,9 @@ use gpui::{
     WeakEntity, Window, div, px,
 };
 
-use crate::ui::{LayerUi, SidebarTab, open_data_source_dialog, open_project_settings_dialog};
+use crate::ui::{
+    HEADER_HEIGHT, LayerUi, SidebarTab, open_data_source_dialog, open_project_settings_dialog,
+};
 
 const ICON_MENU: &str = "M4 6h16M4 12h16M4 18h16";
 
@@ -203,7 +205,7 @@ impl<T: LayerUi> AppHeader<T> {
                     .trigger(
                         Button::new(("app-menu-trigger", index))
                             .ghost()
-                            .small()
+                            .xsmall()
                             .label(MENU_NAMES[index])
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_menu(index, window, cx);
@@ -240,7 +242,7 @@ impl<T: LayerUi> Render for AppHeader<T> {
         } else {
             Button::new("app-menu-hamburger")
                 .ghost()
-                .small()
+                .xsmall()
                 .icon(icon(ICON_MENU))
                 .tooltip("Open Application Menu")
                 .on_click(cx.listener(|this, _, window, cx| this.open_menu(0, window, cx)))
@@ -249,7 +251,9 @@ impl<T: LayerUi> Render for AppHeader<T> {
 
         TitleBar::new()
             .bg(background)
-            .border_color(background)
+            // The theme's title bar border draws the line against the content, like
+            // the status bar's top border.
+            .h(px(HEADER_HEIGHT))
             .pl(px(6.0))
             .child(
                 h_flex()

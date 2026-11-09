@@ -20,7 +20,8 @@ use gpui::{
 use rgis_core::{Color, DataSource, DataSourceId, Layer, LayerId, Project};
 
 pub const SIDEBAR_WIDTH: f32 = 280.0;
-pub const STATUS_HEIGHT: f32 = 28.0;
+pub const HEADER_HEIGHT: f32 = 33.0;
+pub const STATUS_HEIGHT: f32 = 31.0;
 
 /// Left edge of the map inside the window content, in logical pixels.
 pub fn map_left(sidebar_visible: bool) -> f32 {
@@ -454,7 +455,9 @@ fn data_source_summary(source: &DataSource) -> String {
 
 // ── Status bar ───────────────────────────────────────────────────────────
 
-pub fn status_bar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElement {
+pub fn status_bar<T: LayerUi>(state: &T, window: &Window, cx: &mut Context<T>) -> impl IntoElement {
+    // The bar touches the bottom window corners, so it follows their rounding.
+    let radii = gpui::component::window_corner_radii(window, cx);
     let theme = cx.theme();
     // Darker than the header and the sidebar.
     let background = theme.status_bar;
@@ -468,6 +471,8 @@ pub fn status_bar<T: LayerUi>(state: &T, cx: &mut Context<T>) -> impl IntoElemen
         .gap_3()
         .px_2()
         .bg(background)
+        .rounded_bl(radii.bottom_left)
+        .rounded_br(radii.bottom_right)
         .border_t_1()
         .border_color(border)
         .text_xs()
