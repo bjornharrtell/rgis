@@ -5,12 +5,12 @@
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::menu::{PopupMenu, PopupMenuItem};
 use gpui::component::popover::Popover;
-use gpui::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, h_flex};
+use gpui::component::{ActiveTheme as _, Icon, InteractiveElementExt as _, Sizable as _, h_flex};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Context, DismissEvent, Entity, Focusable as _, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription,
-    WeakEntity, Window, div, px,
+    Context, Decorations, DismissEvent, Entity, Focusable as _, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, Render, StatefulInteractiveElement as _,
+    Styled as _, Subscription, WeakEntity, Window, WindowControlArea, div, px,
 };
 
 use crate::ui::{
@@ -18,6 +18,7 @@ use crate::ui::{
 };
 
 const ICON_MENU: &str = "M4 6h16M4 12h16M4 18h16";
+const ICON_CLOSE: &str = "M6 6l12 12M18 6L6 18";
 
 fn icon(path: &str) -> Icon {
     let data = format!(
@@ -120,6 +121,8 @@ pub struct AppHeader<T: LayerUi> {
     open: Option<usize>,
     popup: Option<Entity<PopupMenu>>,
     _popup_subscription: Option<Subscription>,
+    /// Left button is down on the empty header area; the next move drags the window.
+    should_move: bool,
 }
 
 impl<T: LayerUi> AppHeader<T> {
@@ -130,6 +133,7 @@ impl<T: LayerUi> AppHeader<T> {
             open: None,
             popup: None,
             _popup_subscription: None,
+            should_move: false,
         }
     }
 
@@ -223,9 +227,10 @@ impl<T: LayerUi> AppHeader<T> {
 }
 
 impl<T: LayerUi> Render for AppHeader<T> {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let background = theme.title_bar;
+        let border = theme.title_bar_border;
         let muted = theme.muted_foreground;
         let expanded = self.open.is_some();
         let title = self.title.clone();
@@ -249,23 +254,95 @@ impl<T: LayerUi> Render for AppHeader<T> {
                 .into_any_element()
         };
 
-        TitleBar::new()
-            .bg(background)
-            // The theme's title bar border draws the line against the content, like
-            // the status bar's top border.
+        let radii = gpui::component::window_corner_radii(window, cx);
+        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        let theme = cx.theme();
+        let hover = theme.secondary_hover;
+        let foreground = theme.muted_foreground;
+        let hover_foreground = theme.foreground;
+        let show_close = client_decorated && !cfg!(target_family = "wasm");
+
+        // Only the empty space drags or maximizes, so double clicking the menu
+        // button never toggles the window.
+        let drag_area = div()
+            .id("header-drag")
+            .h_full()
+            .flex_1()
+            .when(!cfg!(target_family = "wasm"), |this| {
+                this.window_control_area(WindowControlArea::Drag)
+            })
+            .on_double_click(|_, window, _| {
+                if cfg!(target_os = "macos") {
+                    window.titlebar_double_click();
+                } else {
+                    window.zoom_window();
+                }
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = true),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = false),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.should_move {
+                    this.should_move = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_mouse_down(MouseButton::Right, |event, window, _| {
+                window.show_window_menu(event.position)
+            });
+
+        h_flex()
+            .id("app-header")
+            .w_full()
+            .flex_shrink_0()
             .h(px(HEADER_HEIGHT))
             .pl(px(6.0))
-            .child(
-                h_flex()
-                    .h_full()
-                    .gap_2()
-                    .items_center()
-                    .child(menu)
-                    // Like Zed, the project label gives way to the expanded menu bar.
-                    .when(!expanded, |this| {
-                        this.child(div().text_sm().text_color(muted).child(title))
-                    }),
-            )
+            .items_center()
+            .rounded_tl(radii.top_left)
+            .rounded_tr(radii.top_right)
+            .bg(background)
+            // Draws the line against the content, like the status bar's top border.
+            .border_b_1()
+            .border_color(border)
+            .child(menu)
+            // Like Zed, the project label gives way to the expanded menu bar.
+            .when(!expanded, |this| {
+                this.child(div().ml_2().text_sm().text_color(muted).child(title))
+            })
+            .child(drag_area)
+            .when(show_close, |this| {
+                // Close only, with a small, quiet hover highlight.
+                this.child(
+                    div()
+                        .id("window-close")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(22.0))
+                        .mr(px(6.0))
+                        .rounded(px(5.0))
+                        .text_color(foreground)
+                        .hover(|style| style.bg(hover).text_color(hover_foreground))
+                        .when(cfg!(target_os = "windows"), |this| {
+                            this.window_control_area(WindowControlArea::Close)
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        })
+                        .on_click(|_, window, cx| {
+                            cx.stop_propagation();
+                            window.remove_window();
+                        })
+                        .child(icon(ICON_CLOSE).small()),
+                )
+            })
     }
 }
 
