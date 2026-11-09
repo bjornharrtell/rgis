@@ -336,6 +336,20 @@ pub fn debug_distinct_tile_count() -> u32 {
     DISTINCT_TILES_SEEN.with(std::cell::Cell::get)
 }
 
+/// Milliseconds from a monotonic clock (`performance.now()` in the browser).
+fn js_now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return web_sys::window()
+            .and_then(|window| window.performance())
+            .map_or(0.0, |performance| performance.now());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
+    }
+}
+
 fn wasm_memory_bytes() -> u32 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -368,6 +382,8 @@ pub struct RgisWebApp {
     dragging: bool,
     last_cursor: Option<gpui::Point<gpui::Pixels>>,
     last_map_size: Option<(u32, u32)>,
+    zoom_animation: Option<rgis_core::ZoomAnimation>,
+    last_frame_ms: Option<f64>,
     status: String,
     sidebar_visible: bool,
     layer_ui_state: LayerUiState,
@@ -413,6 +429,8 @@ impl RgisWebApp {
             dragging: false,
             last_cursor: None,
             last_map_size: None,
+            zoom_animation: None,
+            last_frame_ms: None,
             status: "GPUI browser renderer".to_string(),
             sidebar_visible: true,
             layer_ui_state: LayerUiState::default(),
@@ -461,6 +479,21 @@ impl RgisWebApp {
         }
     }
 
+    /// Advances a running zoom animation by the time since the last frame.
+    fn step_zoom_animation(&mut self) {
+        let now = js_now_ms();
+        let dt = self
+            .last_frame_ms
+            .replace(now)
+            .map_or(1.0 / 60.0, |last| ((now - last) / 1000.0).clamp(0.0, 0.1));
+        let Some(animation) = &self.zoom_animation else {
+            return;
+        };
+        if !animation.step(&mut self.project.viewport, dt) {
+            self.zoom_animation = None;
+        }
+    }
+
     fn map_callback(&mut self, width: f32, height: f32) -> MapCallback {
         self.process_basemap_tiles();
         if let Some(fetcher) = &self.sprite_fetcher
@@ -474,24 +507,37 @@ impl RgisWebApp {
         let mut basemap_tiles = Vec::new();
         if self.project.basemap_visible() {
             let mut exact_tiles = Vec::new();
-            let mut fallback_coords = HashSet::new();
+            let mut fallback_coords: Vec<TileCoord> = Vec::new();
             for coord in visible_tiles_for_zoom(&self.project.viewport, OPENFREEMAP_MAX_ZOOM) {
                 if let Some(mesh) = self.gpu_basemap_meshes.get(&coord) {
                     exact_tiles.push((coord, Arc::clone(mesh)));
-                } else if self.pending_tiles.insert(coord) {
+                    continue;
+                }
+                if self.pending_tiles.insert(coord) {
                     self.vector_tile_fetcher.request(coord);
-                } else {
-                    for ancestor in raster::ancestor_coords(coord) {
-                        if self.gpu_basemap_meshes.contains_key(&ancestor) {
-                            fallback_coords.insert(ancestor);
-                            break;
-                        }
-                        if self.pending_tiles.insert(ancestor) {
-                            self.vector_tile_fetcher.request(ancestor);
-                        }
+                }
+                // Cover the gap with what is already loaded, in the same frame
+                // the tile is first needed, so zooming never flashes background.
+                let before = fallback_coords.len();
+                for ancestor in raster::ancestor_coords(coord) {
+                    if self.gpu_basemap_meshes.contains_key(&ancestor) {
+                        fallback_coords.push(ancestor);
+                        break;
+                    }
+                    if self.pending_tiles.insert(ancestor) {
+                        self.vector_tile_fetcher.request(ancestor);
                     }
                 }
+                if fallback_coords.len() == before {
+                    fallback_coords.extend(
+                        raster::descendant_coords(coord, 2)
+                            .filter(|descendant| self.gpu_basemap_meshes.contains_key(descendant)),
+                    );
+                }
             }
+            // Coarse tiles first so finer ones draw over them.
+            fallback_coords.sort_by_key(|coord| (coord.z, coord.x, coord.y));
+            fallback_coords.dedup();
             for coord in fallback_coords {
                 if let Some(mesh) = self.gpu_basemap_meshes.get(&coord) {
                     let transform =
@@ -686,6 +732,7 @@ impl Render for RgisWebApp {
             }
             self.last_map_size = Some(map_size);
         }
+        self.step_zoom_animation();
         let viewport = self.project.viewport.clone();
         self.request_basemap_tiles(&viewport);
         self.render_map(
@@ -787,7 +834,17 @@ impl Render for RgisWebApp {
                     ((f32::from(event.position.y)) * scale)
                         .clamp(0.0, this.project.viewport.height_px as f32),
                 ];
-                this.project.viewport.zoom_toward(cursor, delta);
+                match &mut this.zoom_animation {
+                    Some(animation) => animation.retarget(cursor, delta),
+                    None => {
+                        this.zoom_animation = Some(rgis_core::ZoomAnimation::new(
+                            &this.project.viewport,
+                            cursor,
+                            delta,
+                        ));
+                        this.last_frame_ms = None;
+                    }
+                }
                 cx.notify();
             }))
             .child(map_content);
