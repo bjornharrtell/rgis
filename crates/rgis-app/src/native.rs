@@ -315,6 +315,8 @@ pub struct RgisNativeApp {
     cursor_coords: Option<(f64, f64)>,
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
     dragging: bool,
+    zoom_animation: Option<rgis_core::ZoomAnimation>,
+    last_frame: Option<std::time::Instant>,
     sidebar_visible: bool,
     layer_ui_state: LayerUiState,
 }
@@ -394,6 +396,8 @@ impl RgisNativeApp {
             cursor_coords: None,
             bbox_zoom_start: None,
             dragging: false,
+            zoom_animation: None,
+            last_frame: None,
             sidebar_visible: true,
             layer_ui_state: LayerUiState::default(),
         }
@@ -677,7 +681,8 @@ impl RgisNativeApp {
             return;
         };
 
-        if self.dragging {
+        // Wait for the viewport to settle instead of rendering every frame.
+        if self.dragging || self.zoom_animation.is_some() {
             return;
         }
         if !self.vector_render_cache.needs_render(&viewport) {
@@ -729,24 +734,38 @@ impl RgisNativeApp {
         let mut basemap_tiles = Vec::new();
         if self.project.basemap_visible() {
             let mut exact_tiles = Vec::new();
-            let mut fallback_coords = std::collections::HashSet::new();
+            let mut fallback_coords: Vec<TileCoord> = Vec::new();
             for coord in visible_tiles_for_zoom(&self.project.viewport, OPENFREEMAP_MAX_ZOOM) {
                 if let Some(mesh) = self.tile_meshes.get(&coord) {
                     exact_tiles.push((coord, Arc::clone(mesh)));
-                } else if self.pending_tiles.insert(coord) {
+                    continue;
+                }
+                if self.pending_tiles.insert(coord) {
                     self.vector_tile_fetcher.request(coord);
-                } else {
-                    for ancestor in raster::ancestor_coords(coord) {
-                        if self.tile_meshes.contains(&ancestor) {
-                            fallback_coords.insert(ancestor);
-                            break;
-                        }
-                        if self.pending_tiles.insert(ancestor) {
-                            self.vector_tile_fetcher.request(ancestor);
-                        }
+                }
+                // Cover the gap with what is already loaded, in the same frame
+                // the tile is first needed, so zooming never flashes background.
+                let tile_meshes = &self.tile_meshes;
+                let before = fallback_coords.len();
+                for ancestor in raster::ancestor_coords(coord) {
+                    if tile_meshes.contains(&ancestor) {
+                        fallback_coords.push(ancestor);
+                        break;
+                    }
+                    if self.pending_tiles.insert(ancestor) {
+                        self.vector_tile_fetcher.request(ancestor);
                     }
                 }
+                if fallback_coords.len() == before {
+                    fallback_coords.extend(
+                        raster::descendant_coords(coord, 2)
+                            .filter(|descendant| tile_meshes.contains(descendant)),
+                    );
+                }
             }
+            // Coarse tiles first so finer ones draw over them.
+            fallback_coords.sort_by_key(|coord| (coord.z, coord.x, coord.y));
+            fallback_coords.dedup();
             for coord in fallback_coords {
                 if let Some(mesh) = self.tile_meshes.get(&coord) {
                     let transform =
@@ -821,7 +840,25 @@ impl RgisNativeApp {
         }
     }
 
+    /// Advances a running zoom animation by the time since the last frame.
+    fn step_zoom_animation(&mut self, window: &mut Window) {
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_frame
+            .replace(now)
+            .map_or(1.0 / 60.0, |last| (now - last).as_secs_f64().min(0.1));
+        let Some(animation) = &self.zoom_animation else {
+            return;
+        };
+        if animation.step(&mut self.project.viewport, dt) {
+            window.request_animation_frame();
+        } else {
+            self.zoom_animation = None;
+        }
+    }
+
     fn render_map(&mut self, window: &mut Window) {
+        self.step_zoom_animation(window);
         self.poll_pending_loads(window);
         self.poll_vector_render(window);
         if self.gpu.is_none() {
@@ -1052,7 +1089,18 @@ impl Render for RgisNativeApp {
                         * scale)
                         .clamp(0.0, this.project.viewport.height_px as f32),
                 ];
-                this.project.viewport.zoom_toward(cursor, delta);
+                this.cancel_vector_render();
+                match &mut this.zoom_animation {
+                    Some(animation) => animation.retarget(cursor, delta),
+                    None => {
+                        this.zoom_animation = Some(rgis_core::ZoomAnimation::new(
+                            &this.project.viewport,
+                            cursor,
+                            delta,
+                        ));
+                        this.last_frame = None;
+                    }
+                }
                 cx.notify();
             }))
             .bg(cx.theme().tokens.background);

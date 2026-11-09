@@ -71,6 +71,20 @@ pub fn ancestor_coords(coord: TileCoord) -> impl Iterator<Item = TileCoord> {
     ancestors.into_iter()
 }
 
+/// Tiles below `coord` down to `levels` levels deeper, coarsest first.
+pub fn descendant_coords(coord: TileCoord, levels: u8) -> impl Iterator<Item = TileCoord> {
+    (1..=levels).flat_map(move |level| {
+        let side = 1_u32 << level;
+        (0..side).flat_map(move |dy| {
+            (0..side).map(move |dx| TileCoord {
+                z: coord.z + level,
+                x: coord.x * side + dx,
+                y: coord.y * side + dy,
+            })
+        })
+    })
+}
+
 pub fn collect_draws(
     style: &StyleSheet,
     viewport: &rgis_core::Viewport,
@@ -108,6 +122,7 @@ pub fn collect_draws(
             }
 
             fetcher.request(coord);
+            let mut covered = false;
             let mut ancestor = coord;
             while ancestor.z > 0 {
                 ancestor = TileCoord {
@@ -131,11 +146,51 @@ pub fn collect_draws(
                         uv_rect: [min_u, min_v, max_u, max_v],
                         opacity,
                     });
+                    covered = true;
                     break;
                 }
                 fetcher.request(ancestor);
             }
+            if !covered {
+                // Zooming out: the finer tiles shown a moment ago still cover it.
+                for descendant in descendant_coords(coord, 2) {
+                    if let Some(image) = cache.get(&descendant).cloned() {
+                        draws.push(TileDraw {
+                            key: tile_draw_key(source_id, descendant),
+                            rect: tile_screen_rect(descendant, viewport),
+                            rgba: image,
+                            uv_rect: [0.0, 0.0, 1.0, 1.0],
+                            opacity,
+                        });
+                    }
+                }
+            }
         }
     }
     draws
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ancestors_walk_up_to_the_root() {
+        let coords: Vec<_> = ancestor_coords(TileCoord { z: 2, x: 3, y: 1 }).collect();
+        assert_eq!(
+            coords,
+            vec![
+                TileCoord { z: 1, x: 1, y: 0 },
+                TileCoord { z: 0, x: 0, y: 0 }
+            ]
+        );
+    }
+
+    #[test]
+    fn descendants_cover_the_tile() {
+        let coords: Vec<_> = descendant_coords(TileCoord { z: 1, x: 1, y: 0 }, 2).collect();
+        assert_eq!(coords.len(), 4 + 16);
+        assert!(coords.contains(&TileCoord { z: 2, x: 3, y: 1 }));
+        assert!(coords.contains(&TileCoord { z: 3, x: 7, y: 3 }));
+    }
 }

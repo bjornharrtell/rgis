@@ -281,6 +281,48 @@ impl Viewport {
     }
 }
 
+/// Eases the viewport's zoom toward a target around a fixed screen point, so
+/// wheel steps glide instead of jumping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoomAnimation {
+    target: f64,
+    anchor: [f32; 2],
+}
+
+impl ZoomAnimation {
+    /// Time constant of the exponential ease, in seconds.
+    const TAU: f64 = 0.08;
+    /// Remaining zoom distance at which the animation snaps to its target.
+    const EPSILON: f64 = 0.002;
+
+    /// Starts easing toward `viewport.zoom + delta` around `anchor`.
+    pub fn new(viewport: &Viewport, anchor: [f32; 2], delta: f64) -> Self {
+        Self {
+            target: (viewport.zoom + delta).clamp(0.0, 22.0),
+            anchor,
+        }
+    }
+
+    /// Adds another wheel step to a running animation, retargeting the anchor.
+    pub fn retarget(&mut self, anchor: [f32; 2], delta: f64) {
+        self.target = (self.target + delta).clamp(0.0, 22.0);
+        self.anchor = anchor;
+    }
+
+    /// Advances the viewport by `dt` seconds. Returns false once the target is
+    /// reached and the animation is finished.
+    pub fn step(&self, viewport: &mut Viewport, dt: f64) -> bool {
+        let remaining = self.target - viewport.zoom;
+        if remaining.abs() < Self::EPSILON {
+            viewport.zoom_toward(self.anchor, remaining);
+            return false;
+        }
+        let fraction = 1.0 - (-dt.max(0.0) / Self::TAU).exp();
+        viewport.zoom_toward(self.anchor, remaining * fraction);
+        true
+    }
+}
+
 impl Default for Viewport {
     /// Starts at zoom 2, centered on (0, 0) in EPSG:3857.
     fn default() -> Self {
@@ -1049,6 +1091,43 @@ mod tests {
             (world_before.y - world_after.y).abs() < 1.0,
             "cursor world y should be stable after zoom"
         );
+    }
+
+    #[test]
+    fn zoom_animation_eases_to_target_keeping_the_anchor() {
+        let mut vp = Viewport {
+            zoom: 5.0,
+            width_px: 800,
+            height_px: 600,
+            ..Default::default()
+        };
+        let anchor = [300.0_f32, 200.0_f32];
+        let world = vp.screen_to_world(anchor);
+        let mut animation = ZoomAnimation::new(&vp, anchor, 1.0);
+        animation.retarget(anchor, 1.0);
+        assert!(animation.step(&mut vp, 1.0 / 60.0));
+        assert!(vp.zoom > 5.0 && vp.zoom < 7.0);
+        let mut frames = 0;
+        while animation.step(&mut vp, 1.0 / 60.0) {
+            frames += 1;
+            assert!(frames < 600, "animation must finish");
+        }
+        assert!((vp.zoom - 7.0).abs() < 1e-9);
+        let after = vp.screen_to_world(anchor);
+        assert!((world.x - after.x).abs() < 1.0 && (world.y - after.y).abs() < 1.0);
+    }
+
+    #[test]
+    fn zoom_animation_target_is_clamped() {
+        let vp = Viewport {
+            zoom: 21.5,
+            ..Default::default()
+        };
+        let mut animation = ZoomAnimation::new(&vp, [0.0, 0.0], 5.0);
+        animation.retarget([0.0, 0.0], -30.0);
+        let mut vp = vp;
+        while animation.step(&mut vp, 0.1) {}
+        assert_eq!(vp.zoom, 0.0);
     }
 
     #[test]
