@@ -350,6 +350,11 @@ fn zoom_scale(delta: f64) -> f32 {
 /// layers -- rendered identically (flat, top-down) since this app has no
 /// camera pitch/tilt, matching how MapLibre itself renders an extrusion at
 /// pitch 0 (no visible side walls, just the flat top polygon).
+/// Width of a fill's edge line. MapLibre draws fill outlines as faint 1px
+/// hairlines; a full 1px antialiased stroke reads as much heavier, and the
+/// visual-parity test measurably prefers a half-pixel one.
+const FILL_OUTLINE_WIDTH_PX: f32 = 0.5;
+
 fn eval_fill_paint(layer: &Layer, ctx: &EvalContext) -> [f32; 4] {
     let (color_key, opacity_key) = if layer.kind == "fill-extrusion" {
         ("fill-extrusion-color", "fill-extrusion-opacity")
@@ -373,11 +378,18 @@ fn eval_fill_paint(layer: &Layer, ctx: &EvalContext) -> [f32; 4] {
 /// one, and turning it off here would only make edges jaggier without
 /// reproducing MapLibre's actual look.
 fn eval_fill_outline_paint(layer: &Layer, ctx: &EvalContext, fill_color: [f32; 4]) -> [f32; 4] {
+    // An explicit outline is drawn at the layer's `fill-opacity`, like the
+    // fill itself (the default already carries it through `fill_color`).
+    let opacity = layer.paint("fill-opacity").eval_f64(ctx, 1.0) as f32;
     layer
         .paint("fill-outline-color")
         .eval(ctx)
         .and_then(|v| v.as_color())
-        .map(Color::to_array)
+        .map(|color| {
+            let mut color = color.to_array();
+            color[3] *= opacity;
+            color
+        })
         .unwrap_or(fill_color)
 }
 
@@ -524,7 +536,13 @@ pub fn build_tile_mesh(tile: &VectorTile, coord: TileCoord, style: &StyleSheet) 
             // stroked lines (see `LineVertex`), instead of a raw jaggy
             // triangle edge -- see `eval_fill_outline_paint`.
             let outline_color = eval_fill_outline_paint(layer, &eval_ctx, fill_color);
-            append_outline(&mut lines, feature, &ctx, outline_color, 1.0);
+            append_outline(
+                &mut lines,
+                feature,
+                &ctx,
+                outline_color,
+                FILL_OUTLINE_WIDTH_PX,
+            );
         }
 
         // Push this layer's batch(es), in fill-then-line order (matching
