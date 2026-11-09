@@ -183,6 +183,8 @@ struct MapTarget {
     padded_row: u32,
     size: (u32, u32),
     image: Option<Arc<gpui::RenderImage>>,
+    /// Set by the `map_async` callback once the readback buffer is mapped.
+    in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl MapTarget {
@@ -233,16 +235,13 @@ impl MapTarget {
             padded_row,
             size: dimensions,
             image: None,
+            in_flight: None,
         }
     }
 
-    /// Copies the rendered frame to the CPU and wraps it as a GPUI image.
-    fn read_back(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        mut encoder: wgpu::CommandEncoder,
-    ) {
+    /// Copies the rendered frame into the readback buffer and starts mapping
+    /// it; [`Self::poll_readback`] collects it without stalling the frame.
+    fn start_readback(&mut self, queue: &wgpu::Queue, mut encoder: wgpu::CommandEncoder) {
         let (w, h) = self.size;
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -266,14 +265,34 @@ impl MapTarget {
             },
         );
         queue.submit([encoder.finish()]);
-        let slice = self.readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        if device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
-            return;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        self.readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                flag.store(result.is_ok(), Ordering::Release)
+            });
+        self.in_flight = Some(done);
+    }
+
+    /// Collects a finished readback, if any, as the new frame image. Returns
+    /// true while one is still pending (the buffer can't be reused until then).
+    fn poll_readback(&mut self, device: &wgpu::Device) -> bool {
+        let Some(done) = self.in_flight.clone() else {
+            return false;
+        };
+        let _ = device.poll(wgpu::PollType::Poll);
+        if !done.load(Ordering::Acquire) {
+            return true;
         }
+        let (w, h) = self.size;
         let mut pixels = Vec::with_capacity((w * h * 4) as usize);
         {
-            let data = slice.get_mapped_range().expect("mapped range");
+            let data = self
+                .readback
+                .slice(..)
+                .get_mapped_range()
+                .expect("mapped range");
             if self.padded_row == w * 4 {
                 pixels.extend_from_slice(&data);
             } else {
@@ -284,12 +303,14 @@ impl MapTarget {
             }
         }
         self.readback.unmap();
+        self.in_flight = None;
         // Frames are BGRA, matching GPUI's image path.
         if let Some(image) = image::RgbaImage::from_raw(w, h, pixels) {
             self.image = Some(Arc::new(gpui::RenderImage::new(smallvec::smallvec![
                 image::Frame::new(image)
             ])));
         }
+        false
     }
 }
 
@@ -939,6 +960,15 @@ impl RgisNativeApp {
         if self.resources.is_none() {
             self.resources = Some(MapRenderResources::new(device, MAP_FORMAT));
         }
+        // The previous frame's readback must land before the buffer is reused.
+        if self
+            .target
+            .as_mut()
+            .is_some_and(|target| target.poll_readback(device))
+        {
+            window.on_next_frame(|_, cx| cx.refresh_windows());
+            return;
+        }
         let callback = self.map_callback(
             f32::from(width) * scale_factor,
             f32::from(height) * scale_factor,
@@ -968,7 +998,9 @@ impl RgisNativeApp {
             target.msaa_view.as_ref().map(|_| &target.color_view),
             &callback,
         ));
-        target.read_back(device, queue, encoder);
+        target.start_readback(queue, encoder);
+        // Collect the readback on the next frame.
+        window.on_next_frame(|_, cx| cx.refresh_windows());
         if self.pending_vector_render.is_some() {
             window.on_next_frame(|_, cx| cx.refresh_windows());
         }
