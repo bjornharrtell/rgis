@@ -87,6 +87,10 @@ pub const DEFAULT_FONTSTACK: &str = "Noto Sans Regular";
 /// A single point label (a `place` or `poi` layer feature with a `name`),
 /// positioned in tile-local metres exactly like fill/line mesh vertices --
 /// see [`tile_screen_transform`] for projecting it to screen space.
+fn default_text_max_width() -> f32 {
+    10.0
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TileLabel {
     pub position: [f32; 2],
@@ -98,6 +102,15 @@ pub struct TileLabel {
     /// A lighter halo/outline color drawn behind the text for legibility
     /// over busy basemap tiles.
     pub halo_color: [f32; 4],
+    /// `text-halo-width` in screen pixels; 0 (the spec default) draws no halo.
+    #[serde(default)]
+    pub halo_width: f32,
+    /// `text-halo-blur` in screen pixels.
+    #[serde(default)]
+    pub halo_blur: f32,
+    /// `text-max-width` in ems: point labels wrap onto further lines past it.
+    #[serde(default = "default_text_max_width")]
+    pub max_width: f32,
     /// The layer's evaluated `text-font` (e.g. `"Noto Sans Italic"`,
     /// `"Noto Sans Bold"`), used to fetch/key the right glyph range --
     /// MapLibre styles lean on this to distinguish e.g. italic region/water
@@ -669,6 +682,18 @@ fn extract_labels(
                 .paint("text-halo-color")
                 .eval_color(&eval_ctx, Color([1.0, 1.0, 1.0, 0.9]))
                 .to_array();
+            let halo_width = layer
+                .paint("text-halo-width")
+                .eval_f64(&eval_ctx, 0.0)
+                .max(0.0) as f32;
+            let halo_blur = layer
+                .paint("text-halo-blur")
+                .eval_f64(&eval_ctx, 0.0)
+                .max(0.0) as f32;
+            let max_width = layer
+                .layout("text-max-width")
+                .eval_f64(&eval_ctx, 10.0)
+                .max(0.0) as f32;
             // `text-font` picks the glyph fontstack (regular/bold/italic)
             // -- e.g. liberty styles country names as `Noto Sans Bold` and
             // region/water names as `Noto Sans Italic`, distinct from the
@@ -756,6 +781,9 @@ fn extract_labels(
                     font_size,
                     color,
                     halo_color,
+                    halo_width,
+                    halo_blur,
+                    max_width,
                     fontstack,
                     priority,
                     angle: 0.0,
@@ -791,6 +819,9 @@ fn extract_labels(
                     font_size,
                     color,
                     halo_color,
+                    halo_width,
+                    halo_blur,
+                    max_width,
                     fontstack,
                     priority,
                     angle: 0.0,

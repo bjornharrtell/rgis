@@ -26,8 +26,7 @@ const LINE_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
 const TILE_VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32];
 
-const TEXT_VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4];
+const TEXT_VERTEX_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x2];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -46,6 +45,7 @@ struct TextVertex {
     uv: [f32; 2],
     color: [f32; 4],
     halo_color: [f32; 4],
+    halo: [f32; 2],
 }
 
 #[repr(C)]
@@ -901,24 +901,28 @@ impl MapRenderResources {
                     uv: [u0, v0],
                     color: label.color,
                     halo_color: label.halo_color,
+                    halo: label.halo,
                 },
                 TextVertex {
                     position: rotate(x + w, y),
                     uv: [u1, v0],
                     color: label.color,
                     halo_color: label.halo_color,
+                    halo: label.halo,
                 },
                 TextVertex {
                     position: rotate(x + w, y + h),
                     uv: [u1, v1],
                     color: label.color,
                     halo_color: label.halo_color,
+                    halo: label.halo,
                 },
                 TextVertex {
                     position: rotate(x, y + h),
                     uv: [u0, v1],
                     color: label.color,
                     halo_color: label.halo_color,
+                    halo: label.halo,
                 },
             ]);
             text_indices.extend(

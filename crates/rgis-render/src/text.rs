@@ -21,6 +21,9 @@ pub struct LabelGlyphInstance {
     pub codepoint: u32,
     pub color: [f32; 4],
     pub halo_color: [f32; 4],
+    /// `[edge, blur]` in SDF distance units: the threshold the halo extends
+    /// to (below the glyph's own edge) and its antialiasing width.
+    pub halo: [f32; 2],
 }
 
 /// Shared glyph-range data needed by the GPU callback to lazily pack any

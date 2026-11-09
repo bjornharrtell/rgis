@@ -12,6 +12,7 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) halo_color: vec4<f32>,
+    @location(4) halo: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -19,6 +20,7 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) halo_color: vec4<f32>,
+    @location(3) halo: vec2<f32>,
 };
 
 @vertex
@@ -30,6 +32,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.uv = in.uv;
     out.color = in.color;
     out.halo_color = in.halo_color;
+    out.halo = in.halo;
     return out;
 }
 
@@ -46,8 +49,9 @@ const FILL_EDGE: f32 = 0.75;
 // The halo is a second, larger shape at a lower threshold that the fill
 // draws on top of -- i.e. it must extend *outward* from the fill edge
 // (toward lower `dist`), not inward, or it can never show as an outline
-// around the letterforms the way MapLibre's own text rendering does.
-const HALO_EDGE: f32 = 0.5;
+// around the letterforms the way MapLibre's own text rendering does. Its
+// threshold (`halo.x`) and blur (`halo.y`) come from `text-halo-width` and
+// `text-halo-blur`, per label.
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -58,7 +62,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // smudge instead of just aliasing a bit.
     let w = clamp(fwidth(dist), 0.02, 0.15);
     let fill_alpha = smoothstep(FILL_EDGE - w, FILL_EDGE + w, dist);
-    let halo_alpha = smoothstep(HALO_EDGE - w, HALO_EDGE + w, dist);
+    let halo_w = max(w, in.halo.y);
+    let halo_alpha = smoothstep(in.halo.x - halo_w, in.halo.x + halo_w, dist);
     let color = mix(in.halo_color, in.color, fill_alpha);
     return vec4<f32>(color.rgb, color.a * halo_alpha);
 }
