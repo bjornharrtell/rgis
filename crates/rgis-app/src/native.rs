@@ -274,9 +274,13 @@ impl MapTarget {
         let mut pixels = Vec::with_capacity((w * h * 4) as usize);
         {
             let data = slice.get_mapped_range().expect("mapped range");
-            for row in 0..h as usize {
-                let start = row * self.padded_row as usize;
-                pixels.extend_from_slice(&data[start..start + (w * 4) as usize]);
+            if self.padded_row == w * 4 {
+                pixels.extend_from_slice(&data);
+            } else {
+                for row in 0..h as usize {
+                    let start = row * self.padded_row as usize;
+                    pixels.extend_from_slice(&data[start..start + (w * 4) as usize]);
+                }
             }
         }
         self.readback.unmap();
@@ -287,6 +291,39 @@ impl MapTarget {
             ])));
         }
     }
+}
+
+/// Hash of everything a map frame is drawn from: the camera, the layers and
+/// the identity of each tile and image drawn. Equal keys give identical pixels.
+fn map_render_key(
+    viewport: &rgis_core::Viewport,
+    layer_key: Option<u64>,
+    crs: u64,
+    callback: &MapCallback,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    layer_key.hash(&mut hasher);
+    crs.hash(&mut hasher);
+    viewport.center.x.to_bits().hash(&mut hasher);
+    viewport.center.y.to_bits().hash(&mut hasher);
+    viewport.zoom.to_bits().hash(&mut hasher);
+    viewport.width_px.hash(&mut hasher);
+    viewport.height_px.hash(&mut hasher);
+    for tile in &callback.basemap_tiles {
+        (tile.coord.z, tile.coord.x, tile.coord.y).hash(&mut hasher);
+        Arc::as_ptr(&tile.mesh).hash(&mut hasher);
+    }
+    for tile in &callback.tiles {
+        tile.key.hash(&mut hasher);
+        Arc::as_ptr(&tile.rgba).hash(&mut hasher);
+        tile.opacity.to_bits().hash(&mut hasher);
+    }
+    callback.labels.len().hash(&mut hasher);
+    callback.glyph_bitmaps.len().hash(&mut hasher);
+    callback.mesh.vertices.len().hash(&mut hasher);
+    callback.mesh.indices.len().hash(&mut hasher);
+    hasher.finish()
 }
 
 pub struct RgisNativeApp {
@@ -316,6 +353,8 @@ pub struct RgisNativeApp {
     bbox_zoom_start: Option<gpui::Point<gpui::Pixels>>,
     dragging: bool,
     zoom_animation: Option<rgis_core::ZoomAnimation>,
+    /// Fingerprint of what the last rendered map frame was drawn from.
+    last_render_key: Option<u64>,
     last_frame: Option<std::time::Instant>,
     sidebar_visible: bool,
     layer_ui_state: LayerUiState,
@@ -397,6 +436,7 @@ impl RgisNativeApp {
             bbox_zoom_start: None,
             dragging: false,
             zoom_animation: None,
+            last_render_key: None,
             last_frame: None,
             sidebar_visible: true,
             layer_ui_state: LayerUiState::default(),
@@ -894,6 +934,7 @@ impl RgisNativeApp {
         );
         if self.target.as_ref().map(|target| target.size) != Some(size) {
             self.target = Some(MapTarget::new(device, size));
+            self.last_render_key = None;
         }
         if self.resources.is_none() {
             self.resources = Some(MapRenderResources::new(device, MAP_FORMAT));
@@ -902,7 +943,19 @@ impl RgisNativeApp {
             f32::from(width) * scale_factor,
             f32::from(height) * scale_factor,
         );
+        // Hover, status and other UI-only updates re-render the window without
+        // changing the map; skip the GPU pass and the CPU readback for those.
+        let key = map_render_key(
+            &self.project.viewport,
+            self.vector_render_cache.layer_key(),
+            u64::from(self.project.crs),
+            &callback,
+        );
         let target = self.target.as_mut().expect("map target created");
+        if self.last_render_key == Some(key) && target.image.is_some() {
+            return;
+        }
+        self.last_render_key = Some(key);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rgis-map-encoder"),
         });
